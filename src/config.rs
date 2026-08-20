@@ -32,7 +32,7 @@ pub struct Config {
 
 /// Defaults used when the variable is missing from `.env`.
 const DEFAULT_MAX_ROUNDS: u32 = 5;
-const DEFAULT_GEMINI_MODEL: &str = "gemini-3.7-flash";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";

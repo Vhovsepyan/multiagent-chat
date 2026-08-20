@@ -77,7 +77,7 @@ All settings live in `.env`. See `.env.example` for the annotated version.
 | `ANTHROPIC_API_KEY` | — | required |
 | `WORKSPACE_ROOT` | — | required; folder holding your projects |
 | `MAX_ROUNDS` | `5` | debate rounds before giving up on approval |
-| `GEMINI_MODEL` | `gemini-3.7-flash` | the Proposer |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | the Proposer |
 | `CRITIC_MODEL` | `claude-sonnet-4-6` | the Critic, and the spec checker |
 | `IMPLEMENTER_MODEL` | `claude-opus-4-8` | the model Claude Code builds with |
 | `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | see the warning below |
@@ -117,8 +117,10 @@ A few decisions worth knowing, with the reasoning kept in `PROGRESS.md`:
   missing verdict counts as `NEEDS_WORK`, never as approval.
 - **The spec is drafted by the Proposer and checked by the Critic**, which
   catches a proposal quietly dropping a concession it made under review.
-- **Retries** cover 429, 5xx and network failures with 1s/2s/4s backoff. A 400
-  or 401 fails immediately, because it will fail identically forever.
+- **Retries** cover 429, 5xx and network failures across 5 attempts with
+  1s/2s/4s/8s backoff. A 400 or 401 fails immediately, because it will fail
+  identically forever. The budget is that large because Gemini returns 503
+  "high demand" in bursts and its 429 bodies ask for a ~9 second wait.
 - **API keys never reach the terminal.** `Config`'s `Debug` prints `<redacted>`,
   and no error message includes request headers.
 

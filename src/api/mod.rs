@@ -50,9 +50,14 @@ impl Message {
 // ---------------------------------------------------------------------------
 
 /// How many times one API call is attempted in total.
-pub const MAX_ATTEMPTS: u32 = 3;
+///
+/// Five rather than three because live runs showed Gemini returning 503
+/// "experiencing high demand" in bursts, and its own 429 bodies ask for a
+/// ~9 second wait — a 1s/2s pair of retries gives up well before the provider
+/// expects you to.
+pub const MAX_ATTEMPTS: u32 = 5;
 
-/// How long to wait before the next attempt: 1s, then 2s, then 4s.
+/// How long to wait before the next attempt: 1s, 2s, 4s, then 8s.
 ///
 /// `attempt` is 1-based, so this doubles each time. Backing off matters for a
 /// 429: hammering a rate limit immediately just earns another one.
@@ -139,6 +144,15 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_secs(1));
         assert_eq!(backoff(2), Duration::from_secs(2));
         assert_eq!(backoff(3), Duration::from_secs(4));
+        assert_eq!(backoff(4), Duration::from_secs(8));
+    }
+
+    /// The provider's own 429 bodies ask for roughly nine seconds. Whatever
+    /// MAX_ATTEMPTS is, the total wait has to comfortably exceed that.
+    #[test]
+    fn total_backoff_outlasts_a_rate_limit_window() {
+        let total: u64 = (1..MAX_ATTEMPTS).map(|a| backoff(a).as_secs()).sum();
+        assert!(total >= 10, "total backoff was only {total}s");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 # Progress
 
 ## Current status
-All six phases of plan.md are written, and the first live run happened
-(2026-08-20). The Gemini half is proven end to end; the Anthropic half is
-blocked on account credit, not on code. `cargo run` now walks the whole pipeline up to Gate 1: read
+All six phases of plan.md are written and PROVEN LIVE end to end, up to Gate 2
+(2026-08-20): a real two-round debate reached VERDICT: APPROVED, the spec was
+drafted and checked, and SPEC.md landed in the target repo with all six required
+sections in order. Only the implementer (Phase 5) has still never executed —
+Gate 2 was deliberately answered `n`. `cargo run` now walks the whole pipeline up to Gate 1: read
 topic, resolve the target repo, run the Proposer/Critic debate live in color
 until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
 stop at the human y/n gate, then launch Claude Code in the target repo to
@@ -15,12 +17,9 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Top up the Anthropic account, then re-run. The Critic, the spec stage and
-  Gate 2 have still never executed.
-- The scratch repo `C:/Users/vaheh/RustroverProjects/spec-scratch` exists (empty
-  + .git) and is a good target for the next attempt.
-- Only after a clean full run: decide whether v2 (web UI, axum + SSE) is worth
-  starting.
+- Answer `y` at Gate 2 once, interactively, to prove Phase 5. That is the only
+  untested stage. `spec-scratch` already holds a valid SPEC.md to build from.
+- Only after that: decide whether v2 (web UI, axum + SSE) is worth starting.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -107,9 +106,10 @@ yet — Vahe asked to skip that to save tokens.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
-- Anthropic API returns 400 "credit balance is too low". Not a bug: the client
-  parsed the error correctly, surfaced the provider's own message, and treated
-  it as permanent so it did not retry. Needs credit on the account.
+- Gemini free tier is flaky: gemini-3.7-flash returns 503 "high demand" in
+  bursts (it failed a whole run twice), gemini-3.1-pro-preview is 429 with quota
+  limit 0 (paid only), gemini-2.5-pro is 404 for new users. gemini-3.6-flash was
+  reliable and is now the default. If a run dies on 503, just re-run it.
 - Windows toolchain workaround (personal laptop, 2026-08-20): security software
   deletes `wasm-component-ld.exe` the instant it is written, so every
   `rustup toolchain install` rolls back and leaves no toolchain. Confirmed by
@@ -124,6 +124,14 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 8): FULL LIVE RUN SUCCEEDED to Gate 2. Two rounds, real
+  NEEDS_WORK then APPROVED, spec drafted + checked, SPEC.md written with all six
+  sections and no stray code fences. Round 2 visibly answered round 1's
+  critique, which proves both transcript views (DP-1) carry history correctly.
+  Findings folded back in: MAX_ATTEMPTS raised 3 -> 5 with 1/2/4/8s backoff
+  (Gemini's own 429 asks for ~9s, so the old budget gave up too early), and the
+  default Proposer switched to gemini-3.6-flash after 3.7-flash killed two runs.
+  Implementer still unproven — Gate 2 answered `n` on purpose.
 - 2026-08-20 (cont. 7): .env fixed and FIRST LIVE RUN attempted with
   MAX_ROUNDS=2. Proven live: config load, target repo creation + git init, the
   Gemini client (a real proposal came back), and DP-4 in both directions — a
