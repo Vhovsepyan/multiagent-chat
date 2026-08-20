@@ -110,6 +110,13 @@ yet — Vahe asked to skip that to save tokens.
   bursts (it failed a whole run twice), gemini-3.1-pro-preview is 429 with quota
   limit 0 (paid only), gemini-2.5-pro is 404 for new users. gemini-3.6-flash was
   reliable and is now the default. If a run dies on 503, just re-run it.
+- Cheap testing pair (Vahe's .env, 2026-08-20): GEMINI_MODEL=gemini-3.5-flash-lite
+  + CRITIC_MODEL=claude-haiku-4-5. Verified working: Haiku emits the VERDICT
+  line correctly, so DP-2 detection is fine. But Haiku is a stricter reviewer
+  and did not approve within 2 rounds where Sonnet did — raise MAX_ROUNDS when
+  testing with it, and do not read a NEEDS_WORK as a bug. The committed
+  defaults in .env.example stay on the better models; the cheap pair is
+  documented there as a commented testing block.
 - Windows toolchain workaround (personal laptop, 2026-08-20): security software
   deletes `wasm-component-ld.exe` the instant it is written, so every
   `rustup toolchain install` rolls back and leaves no toolchain. Confirmed by
@@ -124,6 +131,10 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 9): switched the local .env to the cheap pair for testing
+  and confirmed the whole pipeline still runs to Gate 2 on it. Also proved the
+  max-rounds-without-approval path for the first time (Gate 1's warning branch)
+  and fixed "stopped after 1 rounds" -> "1 round".
 - 2026-08-20 (cont. 8): FULL LIVE RUN SUCCEEDED to Gate 2. Two rounds, real
   NEEDS_WORK then APPROVED, spec drafted + checked, SPEC.md written with all six
   sections and no stray code fences. Round 2 visibly answered round 1's

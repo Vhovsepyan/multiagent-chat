@@ -228,8 +228,9 @@ pub async fn run(
     }
 
     if !approved {
+        let rounds = if rounds_used == 1 { "round" } else { "rounds" };
         ui::warn(&format!(
-            "stopped after {rounds_used} rounds without an APPROVED verdict — the state below is the latest, not an agreed design"
+            "stopped after {rounds_used} {rounds} without an APPROVED verdict — the state below is the latest, not an agreed design"
         ));
     }
 
