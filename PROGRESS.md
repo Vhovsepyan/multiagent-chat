@@ -1,15 +1,18 @@
 # Progress
 
 ## Current status
-Phase 0 done. `cargo run` prints the colored hello line and loads config from
-the environment / `.env`; `cargo fmt` and `cargo clippy -- -D warnings` are
-clean. Next up is Phase 1 (Anthropic client).
+Phase 0 done and committed (58bb438). On top of it, the target repo is now
+resolved per run (DP-6) in `src/target.rs`: type a topic, get a suggested
+project name, and the app offers to create the repo + `git init` if it is new.
+`cargo test` (3 tests), `cargo fmt` and `cargo clippy -- -D warnings` are clean.
 
 ## Next steps
+- Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
+  `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes).
+- Commit the DP-6 work.
 - Phase 1: `src/api/claude.rs` — POST to `https://api.anthropic.com/v1/messages`
   with headers `x-api-key` and `anthropic-version: 2023-06-01`; request/response
   serde types; test with a real "pong" call.
-- Vahe still needs to create his own `.env` from `.env.example` (real keys).
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -24,6 +27,17 @@ clean. Next up is Phase 1 (Anthropic client).
   `gemini-3.1-pro-preview` is preview-only, so not a default. Revisit once we
   see how good the proposals actually are.
 - Rust edition 2024, toolchain 1.97.1.
+- DP-6 (new, decided 2026-08-20): the target repo is *per-run input*, not
+  configuration. plan.md had `TARGET_REPO_PATH` as a static env var, but the
+  topic changes every run (credit applications today, a messenger tomorrow) and
+  the repo may not exist yet. So `.env` now holds `WORKSPACE_ROOT` (the folder
+  all projects live in) and `target.rs` asks for a project name after the topic,
+  suggesting a slug derived from it. If the folder is missing, the app shows the
+  resolved path and asks y/n before `mkdir` + `git init`. Project names are
+  rejected if they contain a slash or `..`, so a typo cannot escape the
+  workspace root.
+- SPEC.md location: the root of whichever repo that run resolves to
+  (`<workspace>/<project>/SPEC.md`), overwritten each run.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -41,6 +55,14 @@ clean. Next up is Phase 1 (Anthropic client).
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont.): DP-6 decided and implemented — `src/target.rs` with slug
+  derivation + unit tests, `ui::prompt`/`ui::confirm` stdin helpers,
+  `TARGET_REPO_PATH` replaced by `WORKSPACE_ROOT` in config and .env.example.
+  Also improved the .env parse error: dotenvy chokes on Windows backslash paths
+  (a backslash starts an escape sequence), and the old message did not say so.
+  Watch out: .env and .env.example look identical in an editor — real values
+  went into the tracked template twice by mistake. Nothing leaked; the commit
+  only ever had placeholders.
 - 2026-08-20: Phase 0 complete. Wrote Cargo.toml, .gitignore, .env.example,
   CLAUDE.md, src/main.rs, src/config.rs, src/ui.rs. Verified API details against
   live docs (Gemini `v1beta/models/{model}:generateContent` + `x-goog-api-key`;

@@ -1,9 +1,10 @@
 //! multiagent-chat — Gemini proposes, Claude critiques, Claude Code implements.
 //!
-//! See plan.md for the full pipeline. Right now this is Phase 0: it only proves
-//! that the config loads and the terminal colors work.
+//! See plan.md for the full pipeline. Implemented so far: config loading and
+//! choosing the target repo for this run.
 
 mod config;
+mod target;
 mod ui;
 
 use anyhow::Result;
@@ -15,15 +16,23 @@ async fn main() -> Result<()> {
     ui::header("multiagent-chat v0.1.0");
 
     let config = Config::load()?;
-
-    ui::system(&format!("proposer model : {}", config.gemini_model));
-    ui::system(&format!("critic model   : {}", config.critic_model));
-    ui::system(&format!("max rounds     : {}", config.max_rounds));
     ui::system(&format!(
-        "target repo    : {}",
-        config.target_repo_path.display()
+        "proposer {} | critic {} | max {} rounds",
+        config.gemini_model, config.critic_model, config.max_rounds
+    ));
+    ui::system(&format!("workspace: {}", config.workspace_root.display()));
+    println!();
+
+    let topic = ui::prompt("Topic", "")?;
+    let target_repo = target::resolve(&config, &topic)?;
+
+    println!();
+    ui::success("ready.");
+    ui::system(&format!("topic : {topic}"));
+    ui::system(&format!(
+        "spec  : {}",
+        target_repo.join("SPEC.md").display()
     ));
 
-    ui::success("\nconfig loaded — ready for Phase 1.");
     Ok(())
 }

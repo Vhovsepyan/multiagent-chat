@@ -17,7 +17,9 @@ use anyhow::{Context, Result, bail};
 pub struct Config {
     pub gemini_api_key: String,
     pub anthropic_api_key: String,
-    pub target_repo_path: PathBuf,
+    /// Folder that holds all of Vahe's projects. The repo for one run is
+    /// chosen inside this folder at runtime — see `target.rs`.
+    pub workspace_root: PathBuf,
     pub max_rounds: u32,
     pub gemini_model: String,
     pub critic_model: String,
@@ -39,14 +41,20 @@ impl Config {
         match dotenvy::dotenv() {
             Ok(_) => {}
             Err(e) if e.not_found() => {}
-            Err(e) => return Err(e).context("failed to read .env"),
+            Err(e) => {
+                return Err(e).context(
+                    "failed to read .env — a Windows path written with backslashes breaks \
+                     the parser, because a backslash starts an escape sequence. Use \
+                     forward slashes (C:/Users/you/repo), or wrap the value in single quotes.",
+                );
+            }
         }
 
-        let target_repo_path = PathBuf::from(required("TARGET_REPO_PATH")?);
-        if !target_repo_path.is_dir() {
+        let workspace_root = PathBuf::from(required("WORKSPACE_ROOT")?);
+        if !workspace_root.is_dir() {
             bail!(
-                "TARGET_REPO_PATH does not point at an existing directory: {}",
-                target_repo_path.display()
+                "WORKSPACE_ROOT does not point at an existing directory: {}",
+                workspace_root.display()
             );
         }
 
@@ -64,7 +72,7 @@ impl Config {
         Ok(Config {
             gemini_api_key: required("GEMINI_API_KEY")?,
             anthropic_api_key: required("ANTHROPIC_API_KEY")?,
-            target_repo_path,
+            workspace_root,
             max_rounds,
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
@@ -99,7 +107,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("gemini_api_key", &"<redacted>")
             .field("anthropic_api_key", &"<redacted>")
-            .field("target_repo_path", &self.target_repo_path)
+            .field("workspace_root", &self.workspace_root)
             .field("max_rounds", &self.max_rounds)
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)
