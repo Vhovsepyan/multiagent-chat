@@ -1,9 +1,10 @@
 # Progress
 
 ## Current status
-Phases 0-3 written. `cargo run` now walks the whole pipeline up to Gate 1: read
-topic, resolve the target repo, then run the Proposer/Critic debate live in
-color until APPROVED or max rounds. 24 unit tests pass; `cargo fmt` and
+Phases 0-4 written. `cargo run` now walks the whole pipeline up to Gate 1: read
+topic, resolve the target repo, run the Proposer/Critic debate live in color
+until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
+stop at the human y/n gate. 33 unit tests pass; `cargo fmt` and
 `cargo clippy -- -D warnings` clean. Nothing has been run against the live APIs
 yet — Vahe asked to skip that to save tokens.
 
@@ -11,7 +12,7 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Phase 4: `spec.rs` (DP-3 — who writes the spec) + `approve.rs` (Gate 2).
+- Phase 5: `implementer.rs` (DP-5 — how to launch Claude Code).
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -62,6 +63,17 @@ yet — Vahe asked to skip that to save tokens.
   so `**VERDICT: APPROVED**` still matches. A missing verdict is treated as
   NEEDS_WORK, never as approval — ending a debate on a formatting slip would be
   the worse failure.
+- DP-3 (decided 2026-08-20): the Proposer drafts SPEC.md, then the Critic checks
+  it against the debate and returns a corrected full document. Two extra calls,
+  chosen over a single call because it catches a Proposer quietly dropping a
+  concession it made under review. The checking call reuses CRITIC_MODEL, so no
+  new .env variable.
+- Gate 2 defaults to NO: anything that is not an explicit y stops the run. The
+  spec is written to disk BEFORE the prompt (plan.md's order), so declining
+  still leaves SPEC.md there to edit and re-run.
+- `push_user` in `api/mod.rs` merges into a trailing user message instead of
+  appending, because a transcript ends on the Critic's review — which is a user
+  message from the Proposer's side — and two user messages in a row are a 400.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -79,6 +91,9 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 4): Phase 4 done. `spec.rs` (draft + check, code-fence
+  unwrapping that preserves inner code blocks) and `approve.rs` (Gate 2).
+  33 tests. Next: DP-5 and the implementer.
 - 2026-08-20 (cont. 3): Phase 3 done. `debate.rs` holds the shared transcript,
   both per-model views, verdict detection and the round loop; `main.rs` now runs
   topic -> target repo -> debate. 24 tests. Still not exercised against the real
