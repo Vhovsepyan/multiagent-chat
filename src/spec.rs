@@ -58,6 +58,7 @@ pub async fn build(
     proposer: &GeminiClient,
     critic: &ClaudeClient,
     transcript: &Transcript,
+    approved: bool,
 ) -> Result<String> {
     let request = format!(
         "The design is settled. Write the specification document now.\n\n\
@@ -72,6 +73,17 @@ pub async fn build(
         .await
         .context("the Proposer failed to draft the spec")?;
 
+    // If the debate never reached APPROVED, the objections the Critic raised
+    // are still live. They must survive into the document rather than being
+    // silently dropped, or the implementer will build a design nobody agreed to.
+    let unresolved = if approved {
+        ""
+    } else {
+        "\n\nIMPORTANT: this discussion ended WITHOUT agreement. Every objection \
+         you raised that was not resolved must appear explicitly under \
+         'Open risks', worded so an implementer knows it is unsettled."
+    };
+
     ui::system("checking SPEC.md against the debate (Critic)...");
     let mut messages = transcript.for_critic();
     push_user(
@@ -79,7 +91,7 @@ pub async fn build(
         format!(
             "Here is the specification drafted from our discussion. Check it \
              and output the corrected version in full.\n\n\
-             Required sections:\n\n{SECTIONS}\n\n---\n\n{draft}"
+             Required sections:\n\n{SECTIONS}{unresolved}\n\n---\n\n{draft}"
         ),
     );
     let checked = critic

@@ -39,10 +39,15 @@ Do not rewrite the proposal yourself.
 If the proposal is genuinely good enough to build from, approve it. Do not \
 demand perfection or invent work.
 
-End your reply with exactly one of these lines, on its own line, and nothing \
-after it:
+End every reply with exactly these two lines, in this order, each on its own \
+line, with nothing after them:
+REASON: <one sentence, under 20 words, naming the single most important thing \
+driving your verdict>
 VERDICT: APPROVED
-VERDICT: NEEDS_WORK";
+(or VERDICT: NEEDS_WORK)
+
+The REASON must be specific. \"Several issues remain\" is useless; \"the swap \
+case still corrupts files when two names trade places\" is useful.";
 
 /// The first thing the Proposer is asked.
 const PROPOSER_TASK: &str = "Write a solution proposal for this topic.";
@@ -152,6 +157,25 @@ fn normalize(line: &str) -> String {
         .to_string()
 }
 
+/// Pull out the Critic's one-line justification, if it gave one.
+///
+/// Without this, the progress line just says "NEEDS_WORK" and you have to
+/// re-read the whole review to find out what is actually blocking approval.
+pub fn find_reason(critique: &str) -> Option<String> {
+    for line in critique.lines().rev() {
+        if let Some(rest) = normalize(line).strip_prefix("REASON:") {
+            let reason = rest
+                .trim()
+                .trim_matches(|c: char| c == '*' || c == '`' || c == '_')
+                .trim();
+            if !reason.is_empty() {
+                return Some(reason.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Scan from the bottom for the verdict line. Returns `None` if the Critic
 /// forgot to include one.
 pub fn find_verdict(critique: &str) -> Option<Verdict> {
@@ -176,6 +200,9 @@ pub struct Outcome {
     pub transcript: Transcript,
     pub approved: bool,
     pub rounds_used: u32,
+    /// The Critic's one-line justification from its final review. When the
+    /// debate ended unapproved, this is what is still blocking it.
+    pub last_reason: Option<String>,
 }
 
 /// Run the debate until the Critic approves or `max_rounds` is reached.
@@ -191,6 +218,7 @@ pub async fn run(
     let mut transcript = Transcript::new(topic);
     let mut approved = false;
     let mut rounds_used = 0;
+    let mut last_reason: Option<String> = None;
 
     for round in 1..=max_rounds {
         rounds_used = round;
@@ -210,14 +238,19 @@ pub async fn run(
         ui::critic(&critique);
         transcript.push(Speaker::Critic, &critique);
 
+        last_reason = find_reason(&critique);
+        // Fall back to a stable phrase so the summary is never blank.
+        let reason = last_reason.as_deref().unwrap_or("no reason given");
+
         match find_verdict(&critique) {
             Some(Verdict::Approved) => {
-                ui::success("VERDICT: APPROVED");
+                ui::success(&format!("VERDICT: APPROVED — {reason}"));
                 approved = true;
                 break;
             }
             Some(Verdict::NeedsWork) => {
-                ui::system("verdict: NEEDS_WORK — sending the review back to the Proposer");
+                ui::system(&format!("verdict: NEEDS_WORK — {reason}"));
+                ui::system("sending the review back to the Proposer");
             }
             None => {
                 // Treating a missing verdict as approval would end the debate on
@@ -232,12 +265,16 @@ pub async fn run(
         ui::warn(&format!(
             "stopped after {rounds_used} {rounds} without an APPROVED verdict — the state below is the latest, not an agreed design"
         ));
+        if let Some(reason) = &last_reason {
+            ui::warn(&format!("still unresolved: {reason}"));
+        }
     }
 
     Ok(Outcome {
         transcript,
         approved,
         rounds_used,
+        last_reason,
     })
 }
 
@@ -293,6 +330,56 @@ mod tests {
                         The schema is wrong.\n\
                         VERDICT: NEEDS_WORK";
         assert_eq!(find_verdict(critique), Some(Verdict::NeedsWork));
+    }
+
+    // --- the Critic's stated reason ---------------------------------------
+
+    #[test]
+    fn finds_the_reason_line() {
+        let critique = "Long review here.
+
+REASON: the swap case still corrupts files
+VERDICT: NEEDS_WORK";
+        assert_eq!(
+            find_reason(critique).as_deref(),
+            Some("the swap case still corrupts files")
+        );
+    }
+
+    #[test]
+    fn finds_a_decorated_reason_line() {
+        assert_eq!(
+            find_reason(
+                "**REASON:** cycles are undefined
+VERDICT: NEEDS_WORK"
+            )
+            .as_deref(),
+            Some("cycles are undefined")
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_or_empty_reason() {
+        assert_eq!(find_reason("VERDICT: APPROVED"), None);
+        assert_eq!(
+            find_reason(
+                "REASON:   
+VERDICT: APPROVED"
+            ),
+            None
+        );
+    }
+
+    /// The reason must not swallow the verdict that follows it.
+    #[test]
+    fn reason_and_verdict_are_read_independently() {
+        let critique = "REASON: the schema is wrong
+VERDICT: NEEDS_WORK";
+        assert_eq!(find_verdict(critique), Some(Verdict::NeedsWork));
+        assert_eq!(
+            find_reason(critique).as_deref(),
+            Some("the schema is wrong")
+        );
     }
 
     #[test]

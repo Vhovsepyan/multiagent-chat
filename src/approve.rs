@@ -14,7 +14,12 @@ use crate::ui;
 ///
 /// Returns `false` when the user declines — the caller should stop, not
 /// continue with a warning.
-pub fn ask(spec: &str, spec_path: &Path, approved_by_critic: bool) -> Result<bool> {
+pub fn ask(
+    spec: &str,
+    spec_path: &Path,
+    approved_by_critic: bool,
+    reason: Option<&str>,
+) -> Result<bool> {
     ui::header("SPEC.md");
     println!("{}", spec.trim());
 
@@ -25,6 +30,13 @@ pub fn ask(spec: &str, spec_path: &Path, approved_by_critic: bool) -> Result<boo
         ui::warn(
             "the debate ended WITHOUT an APPROVED verdict — this spec is the latest state, not an agreed design",
         );
+        // The blocking objection is the single most useful thing to see right
+        // before deciding whether to let an agent build from this.
+        if let Some(reason) = reason {
+            ui::warn(&format!("the Critic's last objection: {reason}"));
+        }
+    } else if let Some(reason) = reason {
+        ui::system(&format!("approved because: {reason}"));
     }
 
     ui::confirm("Implement this spec with Claude Code?")

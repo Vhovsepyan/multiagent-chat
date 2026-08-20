@@ -110,11 +110,19 @@ yet — Vahe asked to skip that to save tokens.
   bursts (it failed a whole run twice), gemini-3.1-pro-preview is 429 with quota
   limit 0 (paid only), gemini-2.5-pro is 404 for new users. gemini-3.6-flash was
   reliable and is now the default. If a run dies on 503, just re-run it.
+- The Critic must end every review with a REASON line above the VERDICT line
+  (Vahe's request, 2026-08-20). A bare NEEDS_WORK forced you to re-read the
+  whole review to learn what was blocking it. The reason is now shown on the
+  progress line each round, repeated at Gate 2, and — when the debate ends
+  unapproved — the spec-check call is explicitly told to carry every unresolved
+  objection into 'Open risks' so the implementer cannot build a design nobody
+  agreed to.
 - Cheap testing pair (Vahe's .env, 2026-08-20): GEMINI_MODEL=gemini-3.5-flash-lite
   + CRITIC_MODEL=claude-haiku-4-5. Verified working: Haiku emits the VERDICT
   line correctly, so DP-2 detection is fine. But Haiku is a stricter reviewer
   and did not approve within 2 rounds where Sonnet did — raise MAX_ROUNDS when
-  testing with it, and do not read a NEEDS_WORK as a bug. The committed
+  testing with it, and do not read a NEEDS_WORK as a bug. Confirmed at
+  MAX_ROUNDS=5: Haiku approved on round 3, so it is strict, not broken. The committed
   defaults in .env.example stay on the better models; the cheap pair is
   documented there as a commented testing block.
 - Windows toolchain workaround (personal laptop, 2026-08-20): security software
@@ -131,6 +139,12 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 10): added the REASON line to the Critic contract and
+  surfaced it everywhere. Ran the full 5-round pipeline on the cheap pair:
+  NEEDS_WORK (rollback promise unfeasible) -> NEEDS_WORK (nested-directory
+  scanner scope undefined) -> APPROVED on round 3, spec written with all six
+  sections, 11KB. Gate 2 again answered `n`; the implementer is STILL the only
+  stage never executed.
 - 2026-08-20 (cont. 9): switched the local .env to the cheap pair for testing
   and confirmed the whole pipeline still runs to Gate 2 on it. Also proved the
   max-rounds-without-approval path for the first time (Gate 1's warning branch)

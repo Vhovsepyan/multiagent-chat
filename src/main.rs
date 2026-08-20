@@ -59,11 +59,16 @@ async fn main() -> Result<()> {
 
     // The spec is built from the transcript either way; `approved` only changes
     // how loudly we warn about it.
-    let document = spec::build(&proposer, &critic, &outcome.transcript).await?;
+    let document = spec::build(&proposer, &critic, &outcome.transcript, outcome.approved).await?;
     let spec_path = spec::write_to(&target_repo, &document)?;
 
     // Gate 2: nothing touches the repo unless a human says yes.
-    if !approve::ask(&document, &spec_path, outcome.approved)? {
+    if !approve::ask(
+        &document,
+        &spec_path,
+        outcome.approved,
+        outcome.last_reason.as_deref(),
+    )? {
         ui::system("stopped. SPEC.md is on disk if you want to edit it and re-run.");
         return Ok(());
     }

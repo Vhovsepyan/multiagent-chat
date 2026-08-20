@@ -115,6 +115,10 @@ A few decisions worth knowing, with the reasoning kept in `PROGRESS.md`:
 - **The verdict is found by scanning upward** for `VERDICT: APPROVED`, ignoring
   markdown decoration, so a trailing "Hope this helps!" cannot break a run. A
   missing verdict counts as `NEEDS_WORK`, never as approval.
+- **Every review carries a one-line `REASON`**, shown next to the verdict each
+  round and again at the approval gate, so you never have to re-read a review to
+  learn what is blocking it. If the debate ends unapproved, the unresolved
+  objections are pushed into the spec's Open risks.
 - **The spec is drafted by the Proposer and checked by the Critic**, which
   catches a proposal quietly dropping a concession it made under review.
 - **Retries** cover 429, 5xx and network failures across 5 attempts with
