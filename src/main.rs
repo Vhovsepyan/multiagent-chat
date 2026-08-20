@@ -8,6 +8,7 @@ mod api;
 mod approve;
 mod config;
 mod debate;
+mod implementer;
 mod spec;
 mod target;
 mod ui;
@@ -56,7 +57,9 @@ async fn main() -> Result<()> {
     }
 
     ui::success("approved.");
-    ui::system("Phase 5 will launch Claude Code here.");
+
+    // Phase 5: hand it to Claude Code inside the target repo.
+    implementer::run(&config, &target_repo).await?;
 
     Ok(())
 }

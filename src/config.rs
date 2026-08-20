@@ -23,12 +23,19 @@ pub struct Config {
     pub max_rounds: u32,
     pub gemini_model: String,
     pub critic_model: String,
+    /// Model Claude Code runs the implementation with.
+    pub implementer_model: String,
+    /// Permission mode passed to Claude Code. See `implementer.rs` for why the
+    /// default is the permissive one.
+    pub permission_mode: String,
 }
 
 /// Defaults used when the variable is missing from `.env`.
 const DEFAULT_MAX_ROUNDS: u32 = 5;
 const DEFAULT_GEMINI_MODEL: &str = "gemini-3.7-flash";
 const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
+const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 
 impl Config {
     /// Load `.env` (if present) and build a `Config`.
@@ -76,6 +83,8 @@ impl Config {
             max_rounds,
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
+            implementer_model: optional("IMPLEMENTER_MODEL", DEFAULT_IMPLEMENTER_MODEL),
+            permission_mode: optional("CLAUDE_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
         })
     }
 }
@@ -111,6 +120,8 @@ impl fmt::Debug for Config {
             .field("max_rounds", &self.max_rounds)
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)
+            .field("implementer_model", &self.implementer_model)
+            .field("permission_mode", &self.permission_mode)
             .finish()
     }
 }

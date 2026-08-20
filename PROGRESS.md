@@ -1,10 +1,11 @@
 # Progress
 
 ## Current status
-Phases 0-4 written. `cargo run` now walks the whole pipeline up to Gate 1: read
+Phases 0-5 written. `cargo run` now walks the whole pipeline up to Gate 1: read
 topic, resolve the target repo, run the Proposer/Critic debate live in color
 until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
-stop at the human y/n gate. 33 unit tests pass; `cargo fmt` and
+stop at the human y/n gate, then launch Claude Code in the target repo to
+implement it. 34 unit tests pass; `cargo fmt` and
 `cargo clippy -- -D warnings` clean. Nothing has been run against the live APIs
 yet — Vahe asked to skip that to save tokens.
 
@@ -12,7 +13,9 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Phase 5: `implementer.rs` (DP-5 — how to launch Claude Code).
+- Phase 6: DP-4 (retry/backoff on API calls), `--topic` CLI argument, README.
+- Nothing has been run against the live APIs yet, so the first real `cargo run`
+  is still unproven end to end.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -74,6 +77,18 @@ yet — Vahe asked to skip that to save tokens.
 - `push_user` in `api/mod.rs` merges into a trailing user message instead of
   appending, because a transcript ends on the Critic's review — which is a user
   message from the Proposer's side — and two user messages in a row are a 400.
+- DP-5 (decided 2026-08-20): launch the `claude` CLI headless with `-p`, cwd set
+  to the target repo, `--model` from IMPLEMENTER_MODEL (default
+  claude-opus-4-8, Vahe's choice) and `--permission-mode` from
+  CLAUDE_PERMISSION_MODE (default bypassPermissions). Flags verified against
+  Claude Code 2.1.237. The permissive default is forced by headless mode: `-p`
+  has nobody to answer a permission prompt, so acceptEdits would let it write
+  code but not run tests or install anything. Output is plain stdout/stderr
+  inheritance rather than parsing --output-format stream-json, so it streams
+  live and cannot break when the CLI's event shape changes.
+- On Windows a bare `claude` does resolve from PATH via Rust's `Command`
+  (the launcher is a real .exe, not a .cmd shim) — verified by an ignored test,
+  `cargo test -- --ignored the_cli_is_reachable`.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -91,6 +106,10 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 5): Phase 5 done. `implementer.rs` spawns Claude Code in the
+  target repo and streams its output; two new .env knobs (IMPLEMENTER_MODEL,
+  CLAUDE_PERMISSION_MODE). Verified the CLI flags against 2.1.237 and that Rust
+  can spawn it on Windows. Next: Phase 6 (DP-4 retries, --topic arg, README).
 - 2026-08-20 (cont. 4): Phase 4 done. `spec.rs` (draft + check, code-fence
   unwrapping that preserves inner code blocks) and `approve.rs` (Gate 2).
   33 tests. Next: DP-5 and the implementer.
