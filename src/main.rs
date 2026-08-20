@@ -1,15 +1,18 @@
 //! multiagent-chat — Gemini proposes, Claude critiques, Claude Code implements.
 //!
-//! See plan.md for the full pipeline. Implemented so far: config loading and
-//! choosing the target repo for this run.
+//! See plan.md for the full pipeline. Implemented so far: config, choosing the
+//! target repo for this run, and the Proposer/Critic debate (Gate 1).
 
 mod api;
 mod config;
+mod debate;
 mod target;
 mod ui;
 
 use anyhow::Result;
 
+use crate::api::claude::ClaudeClient;
+use crate::api::gemini::GeminiClient;
 use crate::config::Config;
 
 #[tokio::main]
@@ -27,11 +30,23 @@ async fn main() -> Result<()> {
     let topic = ui::prompt("Topic", "")?;
     let target_repo = target::resolve(&config, &topic)?;
 
-    println!();
-    ui::success("ready.");
-    ui::system(&format!("topic : {topic}"));
+    let proposer = GeminiClient::new(&config)?;
+    let critic = ClaudeClient::new(&config)?;
+
+    let outcome = debate::run(&proposer, &critic, &topic, config.max_rounds).await?;
+
+    ui::header("Debate finished");
     ui::system(&format!(
-        "spec  : {}",
+        "{} rounds, {}",
+        outcome.rounds_used,
+        if outcome.approved {
+            "approved"
+        } else {
+            "no approval"
+        }
+    ));
+    ui::system(&format!(
+        "spec will be written to {}",
         target_repo.join("SPEC.md").display()
     ));
 

@@ -1,17 +1,17 @@
 # Progress
 
 ## Current status
-Phases 0, 1 and 2 are written. Both API clients exist (`src/api/claude.rs` =
-Critic, `src/api/gemini.rs` = Proposer) with full request/response serde types
-and 15 passing unit tests; `cargo fmt` and `cargo clippy -- -D warnings` clean.
-Next is Phase 3, the debate loop, which starts with DP-1 and DP-2.
+Phases 0-3 written. `cargo run` now walks the whole pipeline up to Gate 1: read
+topic, resolve the target repo, then run the Proposer/Critic debate live in
+color until APPROVED or max rounds. 24 unit tests pass; `cargo fmt` and
+`cargo clippy -- -D warnings` clean. Nothing has been run against the live APIs
+yet — Vahe asked to skip that to save tokens.
 
 ## Next steps
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Phase 3: `debate.rs` — ask DP-1 (conversation state) and DP-2 (verdict
-  detection) before writing the loop.
+- Phase 4: `spec.rs` (DP-3 — who writes the spec) + `approve.rs` (Gate 2).
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -47,6 +47,21 @@ Next is Phase 3, the debate loop, which starts with DP-1 and DP-2.
   is tested against captured JSON, including a real 401 body from the Anthropic
   API.
 - Both clients cap output at 16k tokens and time out after 120s.
+- DP-1 (decided 2026-08-20): ONE shared `Transcript` of `Turn { speaker, text }`
+  is the source of truth. Each model's view is rebuilt from it per call
+  (`for_proposer` / `for_critic`), flipping which side counts as the assistant.
+  Chosen over per-model histories because the same text is never stored twice,
+  so the two views cannot drift, and SPEC.md later reads the same one object.
+  A test asserts both views start with a user message and strictly alternate,
+  since a drift there would only show up as a 400 at runtime.
+- DP-2 (decided 2026-08-20): scan the critique's lines from the BOTTOM for
+  `VERDICT: APPROVED` / `VERDICT: NEEDS_WORK`. Chosen over "must be the last
+  line" so a trailing "Hope this helps!" cannot break a run, and over asking for
+  JSON so the critique stays plain prose we can print live in color. Hardened
+  beyond the plain rule: each line is stripped of `*`, `` ` ``, `#`, `_` first,
+  so `**VERDICT: APPROVED**` still matches. A missing verdict is treated as
+  NEEDS_WORK, never as approval — ending a debate on a formatting slip would be
+  the worse failure.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -64,6 +79,10 @@ Next is Phase 3, the debate loop, which starts with DP-1 and DP-2.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 3): Phase 3 done. `debate.rs` holds the shared transcript,
+  both per-model views, verdict detection and the round loop; `main.rs` now runs
+  topic -> target repo -> debate. 24 tests. Still not exercised against the real
+  APIs. Next: DP-3, then spec.rs + approve.rs.
 - 2026-08-20 (cont. 2): Phases 1 and 2 written. `api/claude.rs` (Messages API,
   x-api-key + anthropic-version) and `api/gemini.rs`
   (v1beta/models/{model}:generateContent, x-goog-api-key header rather than
