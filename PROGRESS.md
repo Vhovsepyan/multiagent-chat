@@ -1,11 +1,10 @@
 # Progress
 
 ## Current status
-All six phases of plan.md are written and PROVEN LIVE end to end, up to Gate 2
-(2026-08-20): a real two-round debate reached VERDICT: APPROVED, the spec was
-drafted and checked, and SPEC.md landed in the target repo with all six required
-sections in order. Only the implementer (Phase 5) has still never executed —
-Gate 2 was deliberately answered `n`. `cargo run` now walks the whole pipeline up to Gate 1: read
+v1 IS DONE. plan.md's definition of done was met on 2026-08-20: a real run took
+a typed topic through a 3-round Gemini/Claude debate to VERDICT: APPROVED,
+generated SPEC.md, took `y` at Gate 2, and Claude Code implemented a working
+Rust CLI in the target repo — with no source edited by hand at any point. `cargo run` now walks the whole pipeline up to Gate 1: read
 topic, resolve the target repo, run the Proposer/Critic debate live in color
 until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
 stop at the human y/n gate, then launch Claude Code in the target repo to
@@ -17,9 +16,11 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Answer `y` at Gate 2 once, interactively, to prove Phase 5. That is the only
-  untested stage. `spec-scratch` already holds a valid SPEC.md to build from.
-- Only after that: decide whether v2 (web UI, axum + SSE) is worth starting.
+- Nothing is outstanding for v1. Every stage has now executed against live APIs.
+- Decide whether v2 (web UI, axum + SSE) is worth starting.
+- Optional polish if v1 gets more use: the debate re-runs from scratch every
+  time, so there is no way to implement an existing SPEC.md without paying for
+  a fresh debate. A `--implement-only` flag would fix that.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -139,6 +140,14 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 11): PHASE 5 PROVEN — full pipeline run answering `y` at
+  Gate 2. Debate went NEEDS_WORK (collision behaviour under --force undefined)
+  -> NEEDS_WORK (cycle detection outline missing) -> APPROVED on round 3.
+  Claude Code (claude-opus-4-8, bypassPermissions) then built a real Rust CLI
+  `rnm` in spec-scratch: args.rs/scanner.rs/engine.rs/lib.rs/main.rs, a README,
+  and 16 tests. Verified independently rather than trusting its summary —
+  `cargo test` passes 16, and a manual smoke test renamed IMG_*.txt to
+  Photo_*.txt while leaving other.md alone. Exit code 0.
 - 2026-08-20 (cont. 10): added the REASON line to the Critic contract and
   surfaced it everywhere. Ran the full 5-round pipeline on the cheap pair:
   NEEDS_WORK (rollback promise unfeasible) -> NEEDS_WORK (nested-directory
