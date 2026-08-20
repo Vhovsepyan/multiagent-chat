@@ -1,11 +1,11 @@
 # Progress
 
 ## Current status
-Phases 0-5 written. `cargo run` now walks the whole pipeline up to Gate 1: read
+All six phases of plan.md are written. `cargo run` now walks the whole pipeline up to Gate 1: read
 topic, resolve the target repo, run the Proposer/Critic debate live in color
 until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
 stop at the human y/n gate, then launch Claude Code in the target repo to
-implement it. 34 unit tests pass; `cargo fmt` and
+implement it, with retries, a `--topic` flag and a README. 44 unit tests pass; `cargo fmt` and
 `cargo clippy -- -D warnings` clean. Nothing has been run against the live APIs
 yet — Vahe asked to skip that to save tokens.
 
@@ -13,9 +13,10 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- Phase 6: DP-4 (retry/backoff on API calls), `--topic` CLI argument, README.
-- Nothing has been run against the live APIs yet, so the first real `cargo run`
-  is still unproven end to end.
+- FIRST LIVE RUN. Nothing has ever touched the real APIs, so the pipeline is
+  unproven end to end. Fix `.env` first (WORKSPACE_ROOT, forward slashes), then
+  try a small topic against a scratch project.
+- Only after that: decide whether v2 (web UI, axum + SSE) is worth starting.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -89,6 +90,16 @@ yet — Vahe asked to skip that to save tokens.
 - On Windows a bare `claude` does resolve from PATH via Rust's `Command`
   (the launcher is a real .exe, not a .cmd shim) — verified by an ignored test,
   `cargo test -- --ignored the_cli_is_reachable`.
+- DP-4 (decided 2026-08-20): retry 429, 5xx and transport failures up to 3
+  attempts with 1s/2s/4s backoff; fail immediately on every other status,
+  because a 400 or 401 fails identically forever and waiting only burns time.
+  The policy (`MAX_ATTEMPTS`, `backoff`, `is_retryable`, `Failure`) lives in
+  `api/mod.rs`; each client keeps its own small loop around a private
+  `send_once`. A generic async retry helper was tried first and rejected —
+  a closure returning a future that borrows `self` needs higher-ranked
+  lifetimes, which is a lot of machinery for a 15-line loop.
+- CLI args are hand-rolled in `cli.rs` rather than pulling in `clap`: there is
+  one real flag. Swap to `clap` derive if it ever passes three.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -106,6 +117,11 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 6): Phase 6 done, so plan.md is fully implemented. Added
+  DP-4 retries to both clients, `cli.rs` (--topic/--help/--version, parsed
+  before config so --help works without a .env), and README.md. 44 tests.
+  Everything is still untested against live APIs — that is the next session's
+  first job.
 - 2026-08-20 (cont. 5): Phase 5 done. `implementer.rs` spawns Claude Code in the
   target repo and streams its output; two new .env knobs (IMPLEMENTER_MODEL,
   CLAUDE_PERMISSION_MODE). Verified the CLI flags against 2.1.237 and that Rust

@@ -11,6 +11,8 @@
 pub mod claude;
 pub mod gemini;
 
+use std::time::Duration;
+
 /// Who said a given message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -39,6 +41,54 @@ impl Message {
         Message {
             role: Role::Assistant,
             content: content.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy (DP-4)
+// ---------------------------------------------------------------------------
+
+/// How many times one API call is attempted in total.
+pub const MAX_ATTEMPTS: u32 = 3;
+
+/// How long to wait before the next attempt: 1s, then 2s, then 4s.
+///
+/// `attempt` is 1-based, so this doubles each time. Backing off matters for a
+/// 429: hammering a rate limit immediately just earns another one.
+pub fn backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << (attempt - 1))
+}
+
+/// Which HTTP failures are worth trying again.
+///
+/// 429 (rate limited) and 5xx (the provider is having a bad time) usually clear
+/// on their own. A 400 or 401 means the request or the key is wrong, and will
+/// fail identically forever — retrying only wastes time.
+pub fn is_retryable(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
+}
+
+/// One failed API attempt, tagged with whether trying again could help.
+pub struct Failure {
+    pub error: anyhow::Error,
+    pub retryable: bool,
+}
+
+impl Failure {
+    /// Worth another attempt: rate limits, provider outages, timeouts.
+    pub fn transient(error: anyhow::Error) -> Self {
+        Failure {
+            error,
+            retryable: true,
+        }
+    }
+
+    /// Will fail the same way every time: bad key, bad request, bad model name.
+    pub fn permanent(error: anyhow::Error) -> Self {
+        Failure {
+            error,
+            retryable: false,
         }
     }
 }
@@ -82,6 +132,35 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].role, Role::User);
         assert_eq!(messages[2].content, "next");
+    }
+
+    #[test]
+    fn backoff_doubles_each_attempt() {
+        assert_eq!(backoff(1), Duration::from_secs(1));
+        assert_eq!(backoff(2), Duration::from_secs(2));
+        assert_eq!(backoff(3), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_are_retryable() {
+        use reqwest::StatusCode;
+
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable(StatusCode::BAD_GATEWAY));
+    }
+
+    /// A bad key or a malformed request fails identically forever — waiting
+    /// four seconds to find that out twice more helps nobody.
+    #[test]
+    fn client_errors_are_not_retryable() {
+        use reqwest::StatusCode;
+
+        assert!(!is_retryable(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable(StatusCode::FORBIDDEN));
+        assert!(!is_retryable(StatusCode::NOT_FOUND));
     }
 
     #[test]

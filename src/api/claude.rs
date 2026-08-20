@@ -10,11 +10,12 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{Message, Role};
+use crate::api::{Failure, MAX_ATTEMPTS, Message, Role, backoff, is_retryable};
 use crate::config::Config;
+use crate::ui;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -115,11 +116,40 @@ impl ClaudeClient {
     }
 
     /// Send the conversation and return the reply as plain text.
+    ///
+    /// Retries rate limits, provider errors and timeouts with backoff (DP-4);
+    /// anything else fails on the first attempt.
     pub async fn send(&self, system: Option<&str>, messages: &[Message]) -> Result<String> {
         if messages.is_empty() {
             bail!("cannot send an empty conversation");
         }
 
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.send_once(system, messages).await {
+                Ok(text) => return Ok(text),
+                Err(failure) if failure.retryable && attempt < MAX_ATTEMPTS => {
+                    let wait = backoff(attempt);
+                    ui::warn(&format!(
+                        "{} — retrying in {}s ({}/{})",
+                        failure.error,
+                        wait.as_secs(),
+                        attempt,
+                        MAX_ATTEMPTS - 1
+                    ));
+                    tokio::time::sleep(wait).await;
+                }
+                Err(failure) => return Err(failure.error),
+            }
+        }
+        unreachable!("the loop either returns or exhausts MAX_ATTEMPTS")
+    }
+
+    /// One attempt, with no retry logic.
+    async fn send_once(
+        &self,
+        system: Option<&str>,
+        messages: &[Message],
+    ) -> std::result::Result<String, Failure> {
         let body = Request {
             model: &self.model,
             max_tokens: MAX_TOKENS,
@@ -133,6 +163,8 @@ impl ClaudeClient {
                 .collect(),
         };
 
+        // A transport failure (timeout, DNS, connection reset) is worth another
+        // attempt.
         let response = self
             .http
             .post(API_URL)
@@ -141,32 +173,45 @@ impl ClaudeClient {
             .json(&body)
             .send()
             .await
-            .context("request to the Anthropic API failed")?;
+            .map_err(|e| {
+                Failure::transient(
+                    anyhow::Error::new(e).context("request to the Anthropic API failed"),
+                )
+            })?;
 
         let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .context("could not read the Anthropic API response")?;
+        let raw = response.text().await.map_err(|e| {
+            Failure::transient(
+                anyhow::Error::new(e).context("could not read the Anthropic API response"),
+            )
+        })?;
 
         if !status.is_success() {
             // Prefer the API's own error message, fall back to the raw body.
             // Never include the request headers here — they hold the key.
-            match serde_json::from_str::<ErrorResponse>(&raw) {
-                Ok(e) => bail!(
+            let message = match serde_json::from_str::<ErrorResponse>(&raw) {
+                Ok(e) => anyhow!(
                     "Anthropic API {} ({}): {}",
                     status,
                     e.error.kind,
                     e.error.message
                 ),
-                Err(_) => bail!("Anthropic API {}: {}", status, raw.trim()),
+                Err(_) => anyhow!("Anthropic API {}: {}", status, raw.trim()),
             };
+            return Err(if is_retryable(status) {
+                Failure::transient(message)
+            } else {
+                Failure::permanent(message)
+            });
         }
 
-        let parsed: Response =
-            serde_json::from_str(&raw).context("could not parse the Anthropic response as JSON")?;
+        let parsed: Response = serde_json::from_str(&raw).map_err(|e| {
+            Failure::permanent(
+                anyhow::Error::new(e).context("could not parse the Anthropic response as JSON"),
+            )
+        })?;
 
-        text_of(&parsed)
+        text_of(&parsed).map_err(Failure::permanent)
     }
 }
 

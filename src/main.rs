@@ -6,6 +6,7 @@
 
 mod api;
 mod approve;
+mod cli;
 mod config;
 mod debate;
 mod implementer;
@@ -21,7 +22,12 @@ use crate::config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    ui::header("multiagent-chat v0.1.0");
+    // --help / --version print and exit before anything else happens.
+    let Some(args) = cli::parse()? else {
+        return Ok(());
+    };
+
+    ui::header(concat!("multiagent-chat v", env!("CARGO_PKG_VERSION")));
 
     let config = Config::load()?;
     ui::system(&format!(
@@ -31,7 +37,13 @@ async fn main() -> Result<()> {
     ui::system(&format!("workspace: {}", config.workspace_root.display()));
     println!();
 
-    let topic = ui::prompt("Topic", "")?;
+    let topic = match args.topic {
+        Some(topic) => {
+            ui::system(&format!("Topic: {topic}"));
+            topic
+        }
+        None => ui::prompt("Topic", "")?,
+    };
     let target_repo = target::resolve(&config, &topic)?;
 
     let proposer = GeminiClient::new(&config)?;

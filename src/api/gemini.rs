@@ -16,11 +16,12 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{Message, Role};
+use crate::api::{Failure, MAX_ATTEMPTS, Message, Role, backoff, is_retryable};
 use crate::config::Config;
+use crate::ui;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -153,11 +154,40 @@ impl GeminiClient {
     }
 
     /// Send the conversation and return the reply as plain text.
+    ///
+    /// Retries rate limits, provider errors and timeouts with backoff (DP-4);
+    /// anything else fails on the first attempt.
     pub async fn send(&self, system: Option<&str>, messages: &[Message]) -> Result<String> {
         if messages.is_empty() {
             bail!("cannot send an empty conversation");
         }
 
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.send_once(system, messages).await {
+                Ok(text) => return Ok(text),
+                Err(failure) if failure.retryable && attempt < MAX_ATTEMPTS => {
+                    let wait = backoff(attempt);
+                    ui::warn(&format!(
+                        "{} — retrying in {}s ({}/{})",
+                        failure.error,
+                        wait.as_secs(),
+                        attempt,
+                        MAX_ATTEMPTS - 1
+                    ));
+                    tokio::time::sleep(wait).await;
+                }
+                Err(failure) => return Err(failure.error),
+            }
+        }
+        unreachable!("the loop either returns or exhausts MAX_ATTEMPTS")
+    }
+
+    /// One attempt, with no retry logic.
+    async fn send_once(
+        &self,
+        system: Option<&str>,
+        messages: &[Message],
+    ) -> std::result::Result<String, Failure> {
         let body = Request {
             system_instruction: system.map(|text| Content {
                 role: None,
@@ -179,6 +209,8 @@ impl GeminiClient {
 
         let url = format!("{API_BASE}/{}:generateContent", self.model);
 
+        // A transport failure (timeout, DNS, connection reset) is worth another
+        // attempt.
         let response = self
             .http
             .post(&url)
@@ -186,31 +218,44 @@ impl GeminiClient {
             .json(&body)
             .send()
             .await
-            .context("request to the Gemini API failed")?;
+            .map_err(|e| {
+                Failure::transient(
+                    anyhow::Error::new(e).context("request to the Gemini API failed"),
+                )
+            })?;
 
         let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .context("could not read the Gemini API response")?;
+        let raw = response.text().await.map_err(|e| {
+            Failure::transient(
+                anyhow::Error::new(e).context("could not read the Gemini API response"),
+            )
+        })?;
 
         if !status.is_success() {
             // Never include the request headers here — they hold the key.
-            match serde_json::from_str::<ErrorResponse>(&raw) {
-                Ok(e) => bail!(
+            let message = match serde_json::from_str::<ErrorResponse>(&raw) {
+                Ok(e) => anyhow!(
                     "Gemini API {} ({}): {}",
                     status,
                     e.error.status,
                     e.error.message
                 ),
-                Err(_) => bail!("Gemini API {}: {}", status, raw.trim()),
+                Err(_) => anyhow!("Gemini API {}: {}", status, raw.trim()),
             };
+            return Err(if is_retryable(status) {
+                Failure::transient(message)
+            } else {
+                Failure::permanent(message)
+            });
         }
 
-        let parsed: Response =
-            serde_json::from_str(&raw).context("could not parse the Gemini response as JSON")?;
+        let parsed: Response = serde_json::from_str(&raw).map_err(|e| {
+            Failure::permanent(
+                anyhow::Error::new(e).context("could not parse the Gemini response as JSON"),
+            )
+        })?;
 
-        text_of(&parsed)
+        text_of(&parsed).map_err(Failure::permanent)
     }
 }
 

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # async runtime — every API call in this app is async
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
 # HTTP client, with JSON body/response support
 reqwest = { version = "0.12", features = ["json"] }
 # turn Rust structs into JSON and back
