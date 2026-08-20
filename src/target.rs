@@ -18,7 +18,7 @@ use crate::ui;
 /// "I need credit applications" suggests "credit-applications".
 const FILLER: &[&str] = &[
     "i", "we", "need", "needs", "want", "wants", "a", "an", "the", "to", "build", "create", "make",
-    "please", "some", "new", "for", "my", "our",
+    "please", "some", "new", "for", "my", "our", "that", "which", "with", "using",
 ];
 
 /// How many words of the topic to keep in the suggested name.
@@ -70,28 +70,22 @@ fn validate_name(name: &str) -> Result<&str> {
 
 /// Turn a free-text topic into a plausible folder name.
 fn slug_from_topic(topic: &str) -> String {
-    let words: Vec<&str> = topic
+    // Drop filler wherever it appears, not just at the front: the first live
+    // run produced "small-cli-tool-that" from "a small CLI tool that renames
+    // files", and a connective can sit in the middle too ("server with rate
+    // limiting").
+    let kept: Vec<String> = topic
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .filter(|w| !FILLER.contains(&w.as_str()))
+        .take(MAX_SLUG_WORDS)
         .collect();
 
-    // Skip leading filler, but never skip everything.
-    let start = words
-        .iter()
-        .position(|w| !FILLER.contains(&w.to_lowercase().as_str()))
-        .unwrap_or(0);
-
-    let slug = words[start..]
-        .iter()
-        .take(MAX_SLUG_WORDS)
-        .map(|w| w.to_lowercase())
-        .collect::<Vec<_>>()
-        .join("-");
-
-    if slug.is_empty() {
+    if kept.is_empty() {
         "project".to_string()
     } else {
-        slug
+        kept.join("-")
     }
 }
 
@@ -139,9 +133,22 @@ mod tests {
         );
     }
 
+    /// Caught by the first live run, which suggested "small-cli-tool-that".
+    #[test]
+    fn drops_filler_anywhere_not_just_at_the_front() {
+        assert_eq!(
+            slug_from_topic("a small CLI tool that renames files in a folder"),
+            "small-cli-tool-renames"
+        );
+        assert_eq!(
+            slug_from_topic("an API server with rate limiting"),
+            "api-server-rate-limiting"
+        );
+    }
+
     #[test]
     fn never_returns_empty() {
-        assert_eq!(slug_from_topic("the a an"), "the-a-an");
+        assert_eq!(slug_from_topic("the a an"), "project");
         assert_eq!(slug_from_topic("!!!"), "project");
     }
 }

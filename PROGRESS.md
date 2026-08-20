@@ -1,7 +1,9 @@
 # Progress
 
 ## Current status
-All six phases of plan.md are written. `cargo run` now walks the whole pipeline up to Gate 1: read
+All six phases of plan.md are written, and the first live run happened
+(2026-08-20). The Gemini half is proven end to end; the Anthropic half is
+blocked on account credit, not on code. `cargo run` now walks the whole pipeline up to Gate 1: read
 topic, resolve the target repo, run the Proposer/Critic debate live in color
 until APPROVED or max rounds, build SPEC.md, write it into the target repo, and
 stop at the human y/n gate, then launch Claude Code in the target repo to
@@ -13,10 +15,12 @@ yet — Vahe asked to skip that to save tokens.
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
   `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
   runs end to end until that is done.
-- FIRST LIVE RUN. Nothing has ever touched the real APIs, so the pipeline is
-  unproven end to end. Fix `.env` first (WORKSPACE_ROOT, forward slashes), then
-  try a small topic against a scratch project.
-- Only after that: decide whether v2 (web UI, axum + SSE) is worth starting.
+- Top up the Anthropic account, then re-run. The Critic, the spec stage and
+  Gate 2 have still never executed.
+- The scratch repo `C:/Users/vaheh/RustroverProjects/spec-scratch` exists (empty
+  + .git) and is a good target for the next attempt.
+- Only after a clean full run: decide whether v2 (web UI, axum + SSE) is worth
+  starting.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -103,6 +107,9 @@ yet — Vahe asked to skip that to save tokens.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
+- Anthropic API returns 400 "credit balance is too low". Not a bug: the client
+  parsed the error correctly, surfaced the provider's own message, and treated
+  it as permanent so it did not retry. Needs credit on the account.
 - Windows toolchain workaround (personal laptop, 2026-08-20): security software
   deletes `wasm-component-ld.exe` the instant it is written, so every
   `rustup toolchain install` rolls back and leaves no toolchain. Confirmed by
@@ -117,6 +124,14 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 7): .env fixed and FIRST LIVE RUN attempted with
+  MAX_ROUNDS=2. Proven live: config load, target repo creation + git init, the
+  Gemini client (a real proposal came back), and DP-4 in both directions — a
+  genuine Gemini 503 was retried after 1s and succeeded, while the Anthropic 400
+  failed fast without pointless backoff. Blocked at the Critic by low account
+  credit. Gate 2 was deliberately answered `n`; the implementer has still never
+  run. Live run also exposed a slug bug ("small-cli-tool-that"): filler is now
+  filtered anywhere in the topic, not just at the front.
 - 2026-08-20 (cont. 6): Phase 6 done, so plan.md is fully implemented. Added
   DP-4 retries to both clients, `cli.rs` (--topic/--help/--version, parsed
   before config so --help works without a .env), and README.md. 44 tests.
