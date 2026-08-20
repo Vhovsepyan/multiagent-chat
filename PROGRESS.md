@@ -1,18 +1,17 @@
 # Progress
 
 ## Current status
-Phase 0 done and committed (58bb438). On top of it, the target repo is now
-resolved per run (DP-6) in `src/target.rs`: type a topic, get a suggested
-project name, and the app offers to create the repo + `git init` if it is new.
-`cargo test` (3 tests), `cargo fmt` and `cargo clippy -- -D warnings` are clean.
+Phases 0, 1 and 2 are written. Both API clients exist (`src/api/claude.rs` =
+Critic, `src/api/gemini.rs` = Proposer) with full request/response serde types
+and 15 passing unit tests; `cargo fmt` and `cargo clippy -- -D warnings` clean.
+Next is Phase 3, the debate loop, which starts with DP-1 and DP-2.
 
 ## Next steps
 - Vahe must update his `.env`: replace `TARGET_REPO_PATH` with
-  `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes).
-- Commit the DP-6 work.
-- Phase 1: `src/api/claude.rs` — POST to `https://api.anthropic.com/v1/messages`
-  with headers `x-api-key` and `anthropic-version: 2023-06-01`; request/response
-  serde types; test with a real "pong" call.
+  `WORKSPACE_ROOT=C:/Users/vaheh/RustroverProjects` (forward slashes). Nothing
+  runs end to end until that is done.
+- Phase 3: `debate.rs` — ask DP-1 (conversation state) and DP-2 (verdict
+  detection) before writing the loop.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -38,6 +37,16 @@ project name, and the app offers to create the repo + `git init` if it is new.
   workspace root.
 - SPEC.md location: the root of whichever repo that run resolves to
   (`<workspace>/<project>/SPEC.md`), overwritten each run.
+- `Message`/`Role` live in `src/api/mod.rs`, shared by both clients, because the
+  two APIs disagree on names: Anthropic sends `{role, content}` with the model
+  turn called "assistant", Google sends `{role, parts:[{text}]}` with it called
+  "model". Each client converts the shared type to its own wire structs, so the
+  debate loop never has to know which model it is talking to.
+- Live API tests are `#[ignore]`d on purpose (Vahe's call, 2026-08-20): they
+  cost tokens, so they only run with `cargo test -- --ignored`. Everything else
+  is tested against captured JSON, including a real 401 body from the Anthropic
+  API.
+- Both clients cap output at 16k tokens and time out after 120s.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -55,6 +64,13 @@ project name, and the app offers to create the repo + `git init` if it is new.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 2): Phases 1 and 2 written. `api/claude.rs` (Messages API,
+  x-api-key + anthropic-version) and `api/gemini.rs`
+  (v1beta/models/{model}:generateContent, x-goog-api-key header rather than
+  ?key= so the key stays out of logs). Verified the Anthropic error path for
+  real against a deliberately invalid key: 401 parses into a clean message with
+  no key leaked. The live "pong" tests are written but not run — Vahe asked to
+  skip them to save tokens. Next: DP-1 and DP-2, then the debate loop.
 - 2026-08-20 (cont.): DP-6 decided and implemented — `src/target.rs` with slug
   derivation + unit tests, `ui::prompt`/`ui::confirm` stdin helpers,
   `TARGET_REPO_PATH` replaced by `WORKSPACE_ROOT` in config and .env.example.

@@ -3,6 +3,7 @@
 //! See plan.md for the full pipeline. Implemented so far: config loading and
 //! choosing the target repo for this run.
 
+mod api;
 mod config;
 mod target;
 mod ui;
