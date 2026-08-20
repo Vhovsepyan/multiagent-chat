@@ -143,6 +143,18 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 13): `--implement-only` proven live against spec-scratch,
+  answering `y`. The log contains no Round / "waiting for the Proposer" lines,
+  confirming zero debate API calls — the only spend was Claude Code itself.
+  Claude Code recognised the spec was already implemented, audited it instead of
+  churning, and left `git diff` EMPTY against the baseline commit (1aff11c in
+  spec-scratch, made as a restore point before the run). Re-verified
+  independently: 16/16 tests still pass.
+  Finding worth remembering: the implementer reported that SPEC.md's wording on
+  the default execution mode was ambiguous ("defaults to dry-run style OR
+  requires explicit execution confirmation"). That ambiguity survived three
+  debate rounds AND the Critic's spec check, and only surfaced at implementation
+  time — a real limit of the two-gate design, not a bug in the code.
 - 2026-08-20 (cont. 12): added `--implement-only` with `target::resolve_existing`
   and `spec::read_from`; both routes converge on one Gate 2 so approval cannot
   be skipped. 56 tests. Verified all three paths (missing project, missing
