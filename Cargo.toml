@@ -1,0 +1,19 @@
+[package]
+name = "multiagent-chat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# async runtime — every API call in this app is async
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+# HTTP client, with JSON body/response support
+reqwest = { version = "0.12", features = ["json"] }
+# turn Rust structs into JSON and back
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# load the .env file into environment variables at startup
+dotenvy = "0.15"
+# terminal colors
+owo-colors = "4"
+# error plumbing: one error type that anything can convert into, plus .context()
+anyhow = "1"

@@ -1,0 +1,8 @@
+# Rust build output
+/target
+
+# secrets — never commit real API keys
+.env
+
+# IDE
+/.idea/
