@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::api::{claude::ClaudeClient, gemini::GeminiClient, push_user};
 use crate::debate::Transcript;
@@ -102,6 +102,22 @@ pub async fn build(
     Ok(strip_code_fence(&checked))
 }
 
+/// Read the spec already sitting in the target repo (`--implement-only`).
+pub fn read_from(repo: &Path) -> Result<String> {
+    let path = repo.join(SPEC_FILENAME);
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "could not read {} — run without --implement-only to generate one",
+            path.display()
+        )
+    })?;
+
+    if text.trim().is_empty() {
+        bail!("{} is empty — nothing to implement", path.display());
+    }
+    Ok(text)
+}
+
 /// Write the spec into the target repo, returning where it landed.
 pub fn write_to(repo: &Path, spec: &str) -> Result<PathBuf> {
     let path = repo.join(SPEC_FILENAME);
@@ -166,6 +182,54 @@ mod tests {
     fn does_not_eat_a_document_that_merely_starts_with_a_code_block() {
         let raw = "```rust\nfn main() {}\n```\n\n## Steps\n1. go";
         assert_eq!(strip_code_fence(raw), raw);
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mac-spec-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_back_a_written_spec() {
+        let dir = scratch_dir("roundtrip");
+        write_to(
+            &dir,
+            "## Problem
+something",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_from(&dir).unwrap(),
+            "## Problem
+something"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_spec_says_how_to_make_one() {
+        let dir = scratch_dir("missing");
+        let err = read_from(&dir).unwrap_err().to_string();
+
+        assert!(err.contains("--implement-only"), "unexpected: {err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_spec_is_rejected() {
+        let dir = scratch_dir("empty");
+        write_to(
+            &dir, "   
+
+",
+        )
+        .unwrap();
+
+        let err = read_from(&dir).unwrap_err().to_string();
+        assert!(err.contains("empty"), "unexpected: {err}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

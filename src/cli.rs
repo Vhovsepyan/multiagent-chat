@@ -1,8 +1,8 @@
 //! Command-line arguments.
 //!
-//! Hand-rolled rather than pulling in `clap`: there is one real flag, and a
+//! Hand-rolled rather than pulling in `clap`: there are two real flags, and a
 //! dependency that compiles a whole parser generator is not worth it yet. If
-//! this grows past three flags, swap in `clap` with its derive feature.
+//! this grows past three, swap in `clap` with its derive feature.
 
 use anyhow::{Result, bail};
 
@@ -11,10 +11,15 @@ multiagent-chat — Gemini proposes, Claude critiques, Claude Code implements.
 
 USAGE:
     multiagent-chat [--topic <TEXT>]
+    multiagent-chat --implement-only [--topic <TEXT>]
 
 OPTIONS:
     --topic <TEXT>    The problem to design a solution for. If omitted, you are
-                      asked for it interactively.
+                      asked for it interactively. With --implement-only it is
+                      only used to suggest the project name.
+    --implement-only  Skip the debate and use the SPEC.md already in the chosen
+                      project. Costs no debate tokens. You are still shown the
+                      spec and asked to approve before anything is built.
     -h, --help        Show this help and exit.
     -V, --version     Show the version and exit.
 
@@ -27,6 +32,8 @@ CONFIGURATION:
 pub struct Args {
     /// `None` means "ask me interactively".
     pub topic: Option<String>,
+    /// Skip straight to implementing the SPEC.md that is already there.
+    pub implement_only: bool,
 }
 
 /// Parse the real process arguments.
@@ -54,6 +61,7 @@ fn parse_from(raw: &[String]) -> Result<Option<Args>> {
                 println!("multiagent-chat {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            "--implement-only" => args.implement_only = true,
             "--topic" => match iter.next() {
                 Some(value) => args.topic = Some(value.clone()),
                 None => bail!("--topic needs a value, e.g. --topic \"credit applications\""),
@@ -103,6 +111,32 @@ mod tests {
         let parsed = parse_from(&args_of(&["--topic=a messenger"]))
             .unwrap()
             .unwrap();
+        assert_eq!(parsed.topic.as_deref(), Some("a messenger"));
+    }
+
+    #[test]
+    fn implement_only_defaults_to_off() {
+        let parsed = parse_from(&[]).unwrap().unwrap();
+        assert!(!parsed.implement_only);
+    }
+
+    #[test]
+    fn reads_the_implement_only_flag() {
+        let parsed = parse_from(&args_of(&["--implement-only"]))
+            .unwrap()
+            .unwrap();
+        assert!(parsed.implement_only);
+        assert_eq!(parsed.topic, None);
+    }
+
+    /// --topic is still allowed alongside it, where it only seeds the
+    /// suggested project name.
+    #[test]
+    fn implement_only_combines_with_topic() {
+        let parsed = parse_from(&args_of(&["--implement-only", "--topic", "a messenger"]))
+            .unwrap()
+            .unwrap();
+        assert!(parsed.implement_only);
         assert_eq!(parsed.topic.as_deref(), Some("a messenger"));
     }
 

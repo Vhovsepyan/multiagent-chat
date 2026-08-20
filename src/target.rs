@@ -53,6 +53,28 @@ pub fn resolve(config: &Config, topic: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Ask which existing repo to use, for `--implement-only`.
+///
+/// Unlike `resolve`, this never offers to create anything: the whole point is
+/// to build from a spec that is already there, so a missing folder means the
+/// name was wrong.
+pub fn resolve_existing(config: &Config, topic: Option<&str>) -> Result<PathBuf> {
+    let suggestion = topic.map(slug_from_topic).unwrap_or_default();
+    let name = ui::prompt("Project", &suggestion)?;
+    let name = validate_name(&name)?;
+
+    let path = config.workspace_root.join(name);
+    if !path.is_dir() {
+        bail!(
+            "{} does not exist — --implement-only needs a project that already holds a SPEC.md",
+            path.display()
+        );
+    }
+
+    ui::system(&format!("  -> {}", path.display()));
+    Ok(path)
+}
+
 /// Reject anything that would escape `WORKSPACE_ROOT`.
 ///
 /// Without this, typing `../../Windows` would happily resolve to somewhere

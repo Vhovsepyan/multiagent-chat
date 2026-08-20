@@ -18,9 +18,7 @@ yet — Vahe asked to skip that to save tokens.
   runs end to end until that is done.
 - Nothing is outstanding for v1. Every stage has now executed against live APIs.
 - Decide whether v2 (web UI, axum + SSE) is worth starting.
-- Optional polish if v1 gets more use: the debate re-runs from scratch every
-  time, so there is no way to implement an existing SPEC.md without paying for
-  a fresh debate. A `--implement-only` flag would fix that.
+- Nothing outstanding.
 
 ## Decisions made
 - Terminal color crate: `owo-colors` over `colored` — it adds no allocation and
@@ -102,8 +100,13 @@ yet — Vahe asked to skip that to save tokens.
   `send_once`. A generic async retry helper was tried first and rejected —
   a closure returning a future that borrows `self` needs higher-ranked
   lifetimes, which is a lot of machinery for a 15-line loop.
-- CLI args are hand-rolled in `cli.rs` rather than pulling in `clap`: there is
-  one real flag. Swap to `clap` derive if it ever passes three.
+- CLI args are hand-rolled in `cli.rs` rather than pulling in `clap`: there are
+  two real flags. Swap to `clap` derive if it ever passes three.
+- `--implement-only` (added 2026-08-20) skips the debate and builds from the
+  SPEC.md already in the chosen project. It makes NO API calls, so re-running an
+  implementation or building from a hand-edited spec costs nothing. It still
+  goes through Gate 2, and it refuses to create a missing project — the whole
+  point is that the spec is already there.
 - DP-1..DP-5 from plan.md are all still open.
 
 ## Open questions / problems
@@ -140,6 +143,11 @@ yet — Vahe asked to skip that to save tokens.
   problem — try a plain `rustup default stable` there first.
 
 ## Session log
+- 2026-08-20 (cont. 12): added `--implement-only` with `target::resolve_existing`
+  and `spec::read_from`; both routes converge on one Gate 2 so approval cannot
+  be skipped. 56 tests. Verified all three paths (missing project, missing
+  SPEC.md, real project) with zero API calls. Fixed Gate 2 claiming "written to"
+  when in this mode the spec was read, not written.
 - 2026-08-20 (cont. 11): PHASE 5 PROVEN — full pipeline run answering `y` at
   Gate 2. Debate went NEEDS_WORK (collision behaviour under --force undefined)
   -> NEEDS_WORK (cycle detection outline missing) -> APPROVED on round 3.

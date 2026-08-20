@@ -48,8 +48,14 @@ Then open `.env` and fill in the three blanks: `GEMINI_API_KEY`,
 ```bash
 cargo run                                  # asks for the topic
 cargo run -- --topic "I need credit applications"
+cargo run -- --implement-only              # build an existing SPEC.md
 cargo run -- --help
 ```
+
+`--implement-only` skips the debate entirely and builds from the `SPEC.md`
+already in the project you pick. It makes **no API calls** to Gemini or Claude,
+so re-running an implementation, or building from a spec you edited by hand,
+costs no debate tokens. You are still shown the spec and asked to approve it.
 
 The target repo is chosen per run, not fixed in config. After the topic, you are
 asked for a project name inside `WORKSPACE_ROOT`, with a suggestion derived from

@@ -24,7 +24,9 @@ pub fn ask(
     println!("{}", spec.trim());
 
     println!();
-    ui::system(&format!("written to {}", spec_path.display()));
+    // Deliberately neutral: with --implement-only this spec was read, not
+    // written, and claiming otherwise would be a lie about what just happened.
+    ui::system(&format!("spec: {}", spec_path.display()));
 
     if !approved_by_critic {
         ui::warn(
