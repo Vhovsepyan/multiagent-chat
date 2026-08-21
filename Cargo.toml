@@ -17,3 +17,5 @@ dotenvy = "0.15"
 owo-colors = "4"
 # error plumbing: one error type that anything can convert into, plus .context()
 anyhow = "1"
+# stable ids for web tasks
+uuid = { version = "1", features = ["v4", "serde"] }

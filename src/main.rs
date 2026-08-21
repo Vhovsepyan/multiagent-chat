@@ -12,6 +12,7 @@ mod debate;
 mod implementer;
 mod spec;
 mod target;
+mod task;
 mod ui;
 
 use anyhow::Result;

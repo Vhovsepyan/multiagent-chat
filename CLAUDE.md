@@ -1,14 +1,15 @@
 # multiagent-chat
 
-Terminal Rust app: Gemini proposes a solution, Claude Sonnet critiques it,
-they iterate until APPROVED (max rounds limit), a clean SPEC.md is produced,
-Vahe approves it, then Claude Code (Opus) implements the spec in a target repo.
+Multiagent chat & coding orchestrator in Rust: Gemini proposes, Claude Sonnet critiques,
+they iterate until APPROVED, generate SPEC.md, Vahe approves via Web UI, and Claude Code
+implements the spec in the target repository.
 
-Master plan: see plan.md. Session state: see PROGRESS.md.
+Master plan: see plan_v2.md (v1, shipped: plan.md).
+Session state: see PROGRESS_V2.md (v1 history: PROGRESS.md).
 
 ## Rules
-- Read PROGRESS.md at the start of every session, before anything else.
-- When Vahe says "wrap up", update PROGRESS.md, then suggest a single-line
+- Read PROGRESS_V2.md at the start of every session, before anything else.
+- When Vahe says "wrap up", update PROGRESS_V2.md, then suggest a single-line
   commit message as plain text (never multi-line).
 - Vahe is learning Rust. Boilerplate: write it ready to use. Logical/important
   parts: STOP and ask Vahe first with 2-3 concrete options, then discuss.
@@ -17,6 +18,10 @@ Master plan: see plan.md. Session state: see PROGRESS.md.
 - Rust stable only. Run `cargo fmt` and `cargo clippy` before finishing a phase.
 
 ## Commands
-- Run: `cargo run`
+- Run: `cargo run` (CLI pipeline — this is still v1 behaviour)
 - Test: `cargo test`
 - Lint: `cargo clippy -- -D warnings`
+
+Planned for v2, NOT built yet — do not document these as working until they are:
+- Web server on http://127.0.0.1:3000 (Phase 8)
+- `cargo run -- --cli` to opt back into the terminal pipeline (Phase 8)
