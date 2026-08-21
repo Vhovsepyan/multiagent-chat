@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 pub struct Config {
     pub gemini_api_key: String,
     pub anthropic_api_key: String,
-    /// Folder that holds all of Vahe's projects. The repo for one run is
+    /// Folder that holds all of the user's projects. The repo for one run is
     /// chosen inside this folder at runtime — see `target.rs`.
     pub workspace_root: PathBuf,
     pub max_rounds: u32,

@@ -19,7 +19,7 @@ v1 terminal pipeline. 106 tests, clippy clean.
 - DP-1..DP-6: (Retained from v1 CLI milestone).
 - DP-7 (2026-08-21): Adopted a unified `Task` state machine (`Created` -> `Debating` -> `SpecReady` -> `WaitingForApproval` -> `Implementing` -> `Completed` / `Failed`) driven by background Tokio tasks communicating via `tokio::sync::broadcast`.
 - DP-8 (2026-08-21): UI separation: `Title` (concise identifier) and `Description` (detailed context) split at input, concatenated cleanly for agent prompt ingestion. Implemented as `Task::topic()`, which falls back to the title alone when the description is blank.
-- DP-7 AMENDED (2026-08-21, approved by Vahe): `SpecReady` renamed to
+- DP-7 AMENDED (2026-08-21, approved by the user): `SpecReady` renamed to
   `GeneratingSpec`, because drafting the spec is two API calls and without it the
   timeline would still read "Debating" while the spec is being written; and
   `SpecReady` would have fired microseconds before `WaitingForApproval` anyway.
@@ -92,7 +92,7 @@ v1 terminal pipeline. 106 tests, clippy clean.
   updated CLAUDE.md in the same commit. 106 tests. Proven by driving the actual
   browser endpoints: form POST returned HX-Redirect, the HTML stream delivered
   status/debate/spec/build/done events, approve came back 200, and the built
-  `greet.py` prints "Hello, Vahe!". The two throwaway projects used for those
+  `greet.py` greets by name correctly. The two throwaway projects used for those
   runs (sse-probe, ui-probe) were deleted afterwards; spec-scratch stays, since
   it holds the working `rnm` tool from v1.
 - 2026-08-21 (cont. 2): Phase 9 done. SSE at GET /api/tasks/{id}/events via

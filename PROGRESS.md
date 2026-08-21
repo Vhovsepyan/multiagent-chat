@@ -41,7 +41,7 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   tried and rejected — a closure returning a future that borrows `self` needs
   higher-ranked lifetimes, too much machinery for a 15-line loop.
 - DP-5 (2026-08-20): launch the `claude` CLI headless with `-p`, cwd set to the
-  target repo, `--model` from IMPLEMENTER_MODEL (default claude-opus-4-8, Vahe's
+  target repo, `--model` from IMPLEMENTER_MODEL (default claude-opus-4-8, the user's
   choice) and `--permission-mode` from CLAUDE_PERMISSION_MODE (default
   bypassPermissions). Flags verified against Claude Code 2.1.237. The permissive
   default is forced by headless mode: `-p` has nobody to answer a prompt, so
@@ -56,7 +56,7 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   offers `mkdir` + `git init` when it is missing. Names containing a slash or
   `..` are rejected so a typo cannot escape the workspace root.
 - The Critic must end every review with a REASON line above the VERDICT line
-  (Vahe's request). A bare NEEDS_WORK forced you to re-read the whole review to
+  (the user's request). A bare NEEDS_WORK forced you to re-read the whole review to
   learn what was blocking it. The reason is shown each round, repeated at Gate 2,
   and when the debate ends unapproved the spec-check call is told to carry every
   unresolved objection into "Open risks".
@@ -81,7 +81,7 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   print or log can leak one. Config also validates eagerly at startup: missing or
   empty required vars, a `WORKSPACE_ROOT` that is not a real directory, and a
   non-numeric or zero `MAX_ROUNDS` all fail before any API call.
-- Live API tests are `#[ignore]`d on purpose (Vahe's call): they cost tokens, so
+- Live API tests are `#[ignore]`d on purpose (the user's call): they cost tokens, so
   they only run with `cargo test -- --ignored`. Everything else is tested against
   captured JSON, including a real 401 body from the Anthropic API.
 - Terminal colors: `owo-colors` over `colored` — no allocation, and `.blue()`
@@ -103,7 +103,7 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   bursts (it killed two whole runs), `gemini-3.1-pro-preview` is 429 with quota
   limit 0 (paid only), `gemini-2.5-pro` is 404 for new users. `gemini-3.6-flash`
   is reliable and is the default. If a run dies on 503, just run it again.
-- Cheap testing pair (Vahe's local .env): `GEMINI_MODEL=gemini-3.5-flash-lite` +
+- Cheap testing pair (the local .env): `GEMINI_MODEL=gemini-3.5-flash-lite` +
   `CRITIC_MODEL=claude-haiku-4-5`. Haiku emits the VERDICT line correctly, so
   DP-2 detection is fine, but it is a stricter reviewer — it did not approve in
   2 rounds where Sonnet did, and approved on round 3 at MAX_ROUNDS=5. Strict, not
@@ -114,10 +114,10 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   hand: tar exits 0, the neighbouring `.pdb` survives, only that one `.exe`
   vanishes; rustc, cargo, rustdoc and rust-lld are all fine. Worked around by
   extracting the cached tarballs from `~/.rustup/downloads` into
-  `C:\Users\vaheh\rust-1.97.1` and registering it with
+  `C:\Users\you\rust-1.97.1` and registering it with
   `rustup toolchain link stable-manual <dir>` + `rustup default stable-manual`.
   The missing binary is only the wasm32 linker, which this project never uses.
-  Proper fix: an antivirus allowlist for `C:\Users\vaheh\.rustup` (needs admin).
+  Proper fix: an antivirus allowlist for `C:\Users\you\.rustup` (needs admin).
   Try a plain `rustup default stable` on the office laptop first.
 
 ## Distribution
@@ -125,12 +125,12 @@ in the target repo with no source edited by hand. 56 tests, clippy clean.
   `vcruntime140.dll` on their machine:
       RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
   Verified the result references only Windows system DLLs.
-- Never ship `.env` — it holds keys that bill Vahe's accounts. Ship
+- Never ship `.env` — it holds keys that bill the user's accounts. Ship
   `.env.example` only. The recipient needs their own Gemini and Anthropic keys
   AND the Claude Code CLI installed and signed in.
 - `.env` is read from the WORKING DIRECTORY, not from beside the exe, so the
   recipient must run it from the folder holding their `.env`.
-- Built 2026-08-20 at `C:\Users\vaheh\RustroverProjects\multiagent-chat-v0.1.0-windows-x64.zip`
+- Built 2026-08-20 at `C:\Users\you\RustroverProjects\multiagent-chat-v0.1.0-windows-x64.zip`
   (exe + .env.example + README.txt, 1.36 MB). Unsigned, so SmartScreen warns.
 
 ## Session log

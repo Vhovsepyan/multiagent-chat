@@ -24,7 +24,7 @@ A web-based interface for `multiagent-chat` powered by `axum` and Server-Sent Ev
 ---
 
 ## 2. Working Rules & Rust Mentorship
-- **Vahe is learning Rust:** Boilerplate is written ready-to-use. For core architectural decisions, STOP and provide 2–3 concrete options.
+- **The user is learning Rust:** Boilerplate is written ready-to-use. For core architectural decisions, STOP and provide 2–3 concrete options.
 - **Explain concepts simply:** 2–3 sentence explanations when introducing web/async patterns (e.g., `axum::extract::State`, `broadcast::channel`, SSE streams).
 - **Single-line commit messages:** Always plain text.
 

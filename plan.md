@@ -10,13 +10,13 @@ A terminal application in Rust called `multiagent-chat`. It runs a debate betwee
 
 **The pipeline:**
 
-1. Vahe types a topic (e.g. "I need credit applications").
+1. The user types a topic (e.g. "I need credit applications").
 2. **Proposer** (Gemini, via Google AI API) writes a solution proposal.
 3. **Critic** (Claude Sonnet 4.6, via Anthropic API) reviews it and ends every review with a verdict line: `VERDICT: APPROVED` or `VERDICT: NEEDS_WORK`.
 4. If `NEEDS_WORK` → the critique goes back to the Proposer, which revises. Loop continues.
 5. **Gate 1 (automatic):** loop ends on `VERDICT: APPROVED`, or after `MAX_ROUNDS` (default 5). If max rounds is reached without approval, show the latest state with a warning.
 6. A clean **`SPEC.md`** is generated from the aligned discussion and written into the target repo.
-7. **Gate 2 (human):** the spec is shown in the terminal. Vahe types `y` to continue or `n` to abort.
+7. **Gate 2 (human):** the spec is shown in the terminal. The user types `y` to continue or `n` to abort.
 8. **Implementer:** the app launches Claude Code (Opus) in headless mode inside the target repo to implement `SPEC.md`.
 
 **v1 constraints:**
@@ -25,16 +25,16 @@ A terminal application in Rust called `multiagent-chat`. It runs a debate betwee
 
 ---
 
-## 2. Very important: how to work with Vahe
+## 2. Very important: how to work with the user
 
-Vahe's main goal is to **learn Rust** with this project. Follow these rules strictly:
+The user's main goal is to **learn Rust** with this project. Follow these rules strictly:
 
 - **Boilerplate:** write it fully, ready to paste/apply (Cargo.toml, module skeletons, structs, API request/response types, terminal colors, error plumbing).
-- **Logical / important parts:** do NOT write them immediately. Stop and ask Vahe first, always offering **2–3 concrete options** to choose from (never an open question, never just a hint). Discuss his choice, then implement together.
+- **Logical / important parts:** do NOT write them immediately. Stop and ask the user first, always offering **2–3 concrete options** to choose from (never an open question, never just a hint). Discuss the choice, then implement together.
 - Explain Rust concepts in **simple English** (intermediate level). When a new concept appears (ownership, `Result`, traits, async), give a 2–3 sentence explanation the first time.
 - Commit messages: **single line, plain text** (multi-line blocks break his paste).
 
-**Pre-marked decision points** (ask Vahe when you reach them; you may find more):
+**Pre-marked decision points** (ask the user when you reach them; you may find more):
 - DP-1: How to store the debate conversation state (one shared transcript vs per-model histories).
 - DP-2: How to detect the verdict robustly (exact line match vs parse last line vs ask model for JSON).
 - DP-3: Who writes the final spec (Critic alone / Proposer writes + Critic checks / one extra "summarizer" call).
@@ -93,7 +93,7 @@ Work phase by phase. Finish, test, and commit each phase before moving on. One p
 - ✅ Done when: a proposer-style call works end to end.
 
 **Phase 3 — The debate loop (core of the project)**
-- `debate.rs` + `ui.rs`. This phase contains DP-1 and DP-2 — ask Vahe before coding those parts.
+- `debate.rs` + `ui.rs`. This phase contains DP-1 and DP-2 — ask the user before coding those parts.
 - Live colored output of every message as it arrives.
 - ✅ Done when: a full debate runs on a test topic and stops on APPROVED or max rounds.
 
@@ -113,15 +113,15 @@ Work phase by phase. Finish, test, and commit each phase before moving on. One p
 
 ## 5. Working flow (two laptops)
 
-Vahe works on an **office laptop** and a **personal laptop**. Continuity lives in the repo, not in local chat history.
+The user works on an **office laptop** and a **personal laptop**. Continuity lives in the repo, not in local chat history.
 
 **Every session, in order:**
 1. `git pull`.
 2. Claude reads `CLAUDE.md`, `PROGRESS.md`, and this `plan.md`.
-3. Claude states in 2–3 sentences: where we are, what today's step is. Vahe confirms or redirects.
+3. Claude states in 2–3 sentences: where we are, what today's step is. The user confirms or redirects.
 4. Work.
-5. When Vahe says **"wrap up"** (or the session is ending): Claude updates `PROGRESS.md` (see rules in section 7), suggests a single-line commit message.
-6. Vahe commits and pushes.
+5. When the user says **"wrap up"** (or the session is ending): Claude updates `PROGRESS.md` (see rules in section 7), suggests a single-line commit message.
+6. The user commits and pushes.
 
 If `PROGRESS.md` and reality disagree (e.g. code is ahead of the notes), trust the code, then fix `PROGRESS.md`.
 
@@ -134,16 +134,16 @@ If `PROGRESS.md` and reality disagree (e.g. code is ahead of the notes), trust t
 
 Terminal Rust app: Gemini proposes a solution, Claude Sonnet critiques it,
 they iterate until APPROVED (max rounds limit), a clean SPEC.md is produced,
-Vahe approves it, then Claude Code (Opus) implements the spec in a target repo.
+the user approves it, then Claude Code (Opus) implements the spec in a target repo.
 
 Master plan: see plan.md. Session state: see PROGRESS.md.
 
 ## Rules
 - Read PROGRESS.md at the start of every session, before anything else.
-- When Vahe says "wrap up", update PROGRESS.md, then suggest a single-line
+- When the user says "wrap up", update PROGRESS.md, then suggest a single-line
   commit message as plain text (never multi-line).
-- Vahe is learning Rust. Boilerplate: write it ready to use. Logical/important
-  parts: STOP and ask Vahe first with 2-3 concrete options, then discuss.
+- The user is learning Rust. Boilerplate: write it ready to use. Logical/important
+  parts: STOP and ask the user first with 2-3 concrete options, then discuss.
 - Explain new Rust concepts briefly, in simple English.
 - Never touch .env. Never print API keys.
 - Rust stable only. Run `cargo fmt` and `cargo clippy` before finishing a phase.
@@ -189,4 +189,4 @@ Phase 0 — project setup. Nothing implemented yet.
 
 ## 8. Definition of done (v1)
 
-Vahe runs `cargo run`, types a real topic, watches a colored Gemini↔Claude debate live, gets a SPEC.md, approves it with `y`, and Claude Code implements it in the target repo — all without editing any source code manually.
+The user runs `cargo run`, types a real topic, watches a colored Gemini↔Claude debate live, gets a SPEC.md, approves it with `y`, and Claude Code implements it in the target repo — all without editing any source code manually.
