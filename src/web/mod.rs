@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks", post(handlers::create_task))
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
+        .route("/api/tasks/{id}/events", get(handlers::task_events))
         // The frontend is served from this same origin in Phase 10, so CORS is
         // only here to keep a separately-served dev page working.
         .layer(CorsLayer::permissive())

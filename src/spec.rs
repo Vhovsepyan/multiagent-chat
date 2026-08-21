@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::api::{claude::ClaudeClient, gemini::GeminiClient, push_user};
 use crate::debate::Transcript;
+use crate::task::Emitter;
 use crate::ui;
 
 /// The file the implementer will read.
@@ -59,6 +60,7 @@ pub async fn build(
     critic: &ClaudeClient,
     transcript: &Transcript,
     approved: bool,
+    emitter: &Emitter,
 ) -> Result<String> {
     let request = format!(
         "The design is settled. Write the specification document now.\n\n\
@@ -66,6 +68,7 @@ pub async fn build(
     );
 
     ui::system("drafting SPEC.md (Proposer)...");
+    emitter.notice("drafting SPEC.md (Proposer)...");
     let mut messages = transcript.for_proposer();
     push_user(&mut messages, request);
     let draft = proposer
@@ -85,6 +88,7 @@ pub async fn build(
     };
 
     ui::system("checking SPEC.md against the debate (Critic)...");
+    emitter.notice("checking SPEC.md against the debate (Critic)...");
     let mut messages = transcript.for_critic();
     push_user(
         &mut messages,

@@ -1,10 +1,9 @@
 //! Runs the v1 pipeline in the background on behalf of a web task.
 //!
-//! Phase 8 reports coarse progress: the status transitions, the spec, and the
-//! outcome. The turn-by-turn `Proposal` / `Critique` / `Build` events arrive in
-//! Phase 9, when `debate.rs`, `spec.rs` and `implementer.rs` are handed the
-//! `Emitter` (DP-9). Until then those stages still print to the terminal, which
-//! is harmless — it just means the server console shows the debate.
+//! Since Phase 9 the stages themselves publish their turn-by-turn events: this
+//! module only drives the sequence, owns the status transitions, and handles
+//! Gate 2. The stages still print to the terminal as well, so a `--web` run
+//! shows the debate in the server console too.
 
 use std::path::{Path, PathBuf};
 
@@ -48,18 +47,19 @@ async fn run(state: &AppState, id: TaskId, repo: &Path, emitter: &Emitter) -> Re
 
     // --- Gate 1: the debate ------------------------------------------------
     emitter.status(TaskStatus::Debating);
-    let outcome = crate::debate::run(&proposer, &critic, &topic, config.max_rounds).await?;
-
-    if !outcome.approved {
-        emitter.warn("the debate ended without an APPROVED verdict");
-        if let Some(reason) = &outcome.last_reason {
-            emitter.warn(format!("still unresolved: {reason}"));
-        }
-    }
+    let outcome =
+        crate::debate::run(&proposer, &critic, &topic, config.max_rounds, emitter).await?;
 
     // --- The spec ----------------------------------------------------------
     emitter.status(TaskStatus::GeneratingSpec);
-    let document = spec::build(&proposer, &critic, &outcome.transcript, outcome.approved).await?;
+    let document = spec::build(
+        &proposer,
+        &critic,
+        &outcome.transcript,
+        outcome.approved,
+        emitter,
+    )
+    .await?;
     let path = spec::write_to(repo, &document)?;
     emitter.emit(TaskEvent::Spec {
         markdown: document,
@@ -90,7 +90,7 @@ async fn run(state: &AppState, id: TaskId, repo: &Path, emitter: &Emitter) -> Re
 
     // --- The build ---------------------------------------------------------
     emitter.status(TaskStatus::Implementing);
-    crate::implementer::run(config, repo).await?;
+    crate::implementer::run(config, repo, emitter).await?;
 
     emitter.emit(TaskEvent::Finished {
         status: TaskStatus::Completed,

@@ -49,6 +49,10 @@ async fn main() -> Result<()> {
     ui::system(&format!("workspace: {}", config.workspace_root.display()));
     println!();
 
+    // The CLI has no web watchers, so every stage gets an emitter wired to
+    // nothing (DP-9). The terminal output is unchanged from v1.
+    let emitter = task::Emitter::detached();
+
     // Both routes have to end up with a repo, the spec text, and how much we
     // trust it, so that Gate 2 below is identical either way.
     let (target_repo, document, approved, reason) = if args.implement_only {
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
         let critic = ClaudeClient::new(&config)?;
 
         // Gate 1: the debate runs until APPROVED or max rounds.
-        let outcome = debate::run(&proposer, &critic, &topic, config.max_rounds).await?;
+        let outcome = debate::run(&proposer, &critic, &topic, config.max_rounds, &emitter).await?;
         ui::system(&format!(
             "debate finished after {} round(s)",
             outcome.rounds_used
@@ -78,8 +82,14 @@ async fn main() -> Result<()> {
 
         // The spec is built from the transcript either way; `approved` only
         // changes how loudly we warn about it.
-        let document =
-            spec::build(&proposer, &critic, &outcome.transcript, outcome.approved).await?;
+        let document = spec::build(
+            &proposer,
+            &critic,
+            &outcome.transcript,
+            outcome.approved,
+            &emitter,
+        )
+        .await?;
         spec::write_to(&repo, &document)?;
 
         (repo, document, outcome.approved, outcome.last_reason)
@@ -96,7 +106,7 @@ async fn main() -> Result<()> {
     ui::success("approved.");
 
     // Phase 5: hand it to Claude Code inside the target repo.
-    implementer::run(&config, &target_repo).await?;
+    implementer::run(&config, &target_repo, &emitter).await?;
 
     Ok(())
 }

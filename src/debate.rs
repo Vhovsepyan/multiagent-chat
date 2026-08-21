@@ -12,6 +12,7 @@
 use anyhow::Result;
 
 use crate::api::{Message, claude::ClaudeClient, gemini::GeminiClient};
+use crate::task::{Emitter, TaskEvent};
 use crate::ui;
 
 // ---------------------------------------------------------------------------
@@ -209,11 +210,15 @@ pub struct Outcome {
 ///
 /// Gate 1 from plan.md: this returns either way; it is the caller's job to warn
 /// the user when `approved` is false.
+/// `emitter` mirrors everything to any web watcher (DP-9). The terminal output
+/// stays exactly as v1 had it, so the CLI is unchanged; a CLI run just passes
+/// `Emitter::detached()` and nothing is published.
 pub async fn run(
     proposer: &GeminiClient,
     critic: &ClaudeClient,
     topic: &str,
     max_rounds: u32,
+    emitter: &Emitter,
 ) -> Result<Outcome> {
     let mut transcript = Transcript::new(topic);
     let mut approved = false;
@@ -223,12 +228,20 @@ pub async fn run(
     for round in 1..=max_rounds {
         rounds_used = round;
         ui::header(&format!("Round {round} of {max_rounds}"));
+        emitter.emit(TaskEvent::RoundStarted {
+            round,
+            of: max_rounds,
+        });
 
         ui::system("waiting for the Proposer...");
         let proposal = proposer
             .send(Some(PROPOSER_SYSTEM), &transcript.for_proposer())
             .await?;
         ui::proposer(&proposal);
+        emitter.emit(TaskEvent::Proposal {
+            round,
+            text: proposal.clone(),
+        });
         transcript.push(Speaker::Proposer, proposal);
 
         ui::system("waiting for the Critic...");
@@ -239,6 +252,15 @@ pub async fn run(
         transcript.push(Speaker::Critic, &critique);
 
         last_reason = find_reason(&critique);
+        emitter.emit(TaskEvent::Critique {
+            round,
+            text: critique.clone(),
+            verdict: find_verdict(&critique).map(|v| match v {
+                Verdict::Approved => "approved".to_string(),
+                Verdict::NeedsWork => "needs_work".to_string(),
+            }),
+            reason: last_reason.clone(),
+        });
         // Fall back to a stable phrase so the summary is never blank.
         let reason = last_reason.as_deref().unwrap_or("no reason given");
 
@@ -265,8 +287,12 @@ pub async fn run(
         ui::warn(&format!(
             "stopped after {rounds_used} {rounds} without an APPROVED verdict — the state below is the latest, not an agreed design"
         ));
+        emitter.warn(format!(
+            "stopped after {rounds_used} {rounds} without an APPROVED verdict"
+        ));
         if let Some(reason) = &last_reason {
             ui::warn(&format!("still unresolved: {reason}"));
+            emitter.warn(format!("still unresolved: {reason}"));
         }
     }
 

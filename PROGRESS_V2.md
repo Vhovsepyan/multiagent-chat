@@ -1,18 +1,20 @@
 # Progress
 
 ## Current status
-Phases 7 and 8 are DONE. `src/task.rs` holds the domain model; `src/web/` holds
-an axum 0.8 server with the four REST endpoints plus a health check, and a
-background pipeline that runs the real v1 stages and parks at Gate 2 for an HTTP
-approval. 88 tests. Verified live with curl on a real port, not just in-process.
+Phases 7, 8 and 9 are DONE and proven live end to end over HTTP. A task created
+with curl streamed its debate, spec, HTTP approval and 19 live build chunks over
+SSE, and Claude Code produced a working script in the target project. 91 tests.
 
 ## Next steps
-- Phase 9: SSE endpoint `GET /api/tasks/{id}/events`, and thread the `Emitter`
-  (DP-9) through `debate.rs` / `spec.rs` / `implementer.rs` so the turn-by-turn
-  events actually flow. Phase 8 only emits coarse status transitions.
-- Phase 9 also needs `implementer.rs` changed from INHERITING stdout to piping
-  it, so build output can become `TaskEvent::Build` chunks. v1 inherits the
-  terminal deliberately (DP-5), so that is a real change to a proven module.
+- Phase 10: the browser UI. Serve static assets from `src/web/static/`, build the
+  four screens, and flip `cargo run` to default to the web server (DP-12) with
+  CLAUDE.md updated in the same commit.
+- Known limitation to solve in the UI: SSE streams from the moment you connect,
+  so the client MUST fetch `GET /api/tasks/{id}` first and render `history`,
+  then subscribe. Proven in the live run — attaching curl a second after
+  creating the task missed `round_started` and `proposal`, both of which were
+  present in the snapshot. There is still a tiny race between the two calls;
+  closing it properly would need sequence numbers on events.
 
 ## Decisions made
 - DP-1..DP-6: (Retained from v1 CLI milestone).
@@ -53,10 +55,28 @@ approval. 88 tests. Verified live with curl on a real port, not just in-process.
   with no port to bind and no chance of two test runs colliding.
 - axum 0.8 spells path params `{id}`, not `:id` as older versions did.
 
+- Phase 9 changed `implementer.rs` from INHERITING stdout to PIPING it, so each
+  line can be printed and published as `TaskEvent::Build`. Real tradeoff: Claude
+  Code no longer sees a TTY, so it may drop colour and progress animations that
+  it showed when run directly. Line content is otherwise identical. Both streams
+  are read on their own tasks — reading them in sequence would deadlock as soon
+  as the unread pipe filled.
+- The stages both PRINT and EMIT. v1's terminal behaviour is untouched, so the
+  CLI is unchanged and a `--web` run also shows the debate in the server console.
+  The CLI passes `Emitter::detached()`, so nothing is published.
+
 ## Open questions / problems
 - Spec ambiguity surviving both gates (from v1) — keep Critic spec-checking prompt strict.
 
 ## Session log
+- 2026-08-21 (cont. 2): Phase 9 done. SSE at GET /api/tasks/{id}/events via
+  tokio-stream's BroadcastStream, filtered to one task, with a `lagged` event so
+  a slow client learns it missed data instead of silently showing a debate with
+  holes. Threaded the Emitter (DP-9) through debate/spec/implementer and switched
+  the implementer to piped stdout. Proven end to end with curl -N on port 3111:
+  real critique with verdict+reason extracted, spec, HTTP approve, 19 live build
+  chunks, finished=completed, and a working print_date.py in the sse-probe
+  project. 91 tests.
 - 2026-08-21 (cont.): Phase 8 done. axum 0.8.9 + tower-http 0.7. `src/web/`
   with mod/handlers/pipeline/tests: GET /api/health, GET /api/projects,
   POST /api/tasks (creates the project, spawns the pipeline, 201), GET

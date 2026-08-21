@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::config::Config;
-use crate::task::{Decision, TaskStatus};
+use crate::task::{Decision, TaskEvent, TaskStatus};
 use crate::web::{AppState, router};
 
 /// A config pointing at a throwaway workspace, with fake keys.
@@ -347,5 +347,82 @@ async fn an_answer_before_the_gate_is_not_lost() {
         .await
         .expect("the early answer should still be seen");
     assert!(!decision.approve);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// SSE (Phase 9)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn events_for_an_unknown_task_is_404() {
+    let (state, root) = test_state("sse-missing");
+    let id = uuid::Uuid::new_v4();
+
+    let response = router(state)
+        .oneshot(get(&format!("/api/tasks/{id}/events")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn events_responds_as_an_sse_stream() {
+    let (state, root) = test_state("sse-headers");
+    let task = state.manager.create("t", "d", "p");
+
+    let response = router(state)
+        .oneshot(get(&format!("/api/tasks/{}/events", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type: {content_type}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The stream must carry real events, and only for the task asked for.
+#[tokio::test]
+async fn the_stream_carries_events_for_this_task_only() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("sse-body");
+    let watched = state.manager.create("watched", "d", "p");
+    let other = state.manager.create("other", "d", "p");
+
+    let response = router(state.clone())
+        .oneshot(get(&format!("/api/tasks/{}/events", watched.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    // Noise on a different task must not appear in this stream.
+    state.manager.emitter(other.id).notice("not for you");
+    state.manager.emitter(watched.id).emit(TaskEvent::Proposal {
+        round: 1,
+        text: "use Rust".into(),
+    });
+
+    let frame = body.frame().await.unwrap().unwrap();
+    let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+
+    assert!(chunk.contains("\"type\":\"proposal\""), "got: {chunk}");
+    assert!(chunk.contains("use Rust"), "got: {chunk}");
+    assert!(
+        !chunk.contains("not for you"),
+        "leaked another task: {chunk}"
+    );
+
     std::fs::remove_dir_all(&root).ok();
 }

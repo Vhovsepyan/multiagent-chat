@@ -1,10 +1,16 @@
 //! The four REST endpoints from plan_v2 Phase 8, plus a health check.
 
+use std::convert::Infallible;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::target;
 use crate::task::{Decision, Task, TaskId, TaskStatus};
@@ -152,6 +158,45 @@ pub async fn get_task(
         .get(id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no task {id}")))
+}
+
+/// `GET /api/tasks/{id}/events` — live `TaskEvent`s as Server-Sent Events.
+///
+/// Each message is one JSON-encoded `TaskEvent`, so the browser can
+/// `JSON.parse(e.data)` and switch on `type`.
+///
+/// This streams events from the moment you connect. The full backlog lives on
+/// `GET /api/tasks/{id}` as `history`, so the client fetches the snapshot first
+/// and then subscribes — see the note in `task.rs`.
+pub async fn task_events(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> ApiResult<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+    if state.manager.get(id).is_none() {
+        return Err(ApiError::not_found(format!("no task {id}")));
+    }
+
+    // Subscribe before returning, so nothing emitted while the response is
+    // being set up is lost.
+    let stream = BroadcastStream::new(state.manager.subscribe()).filter_map(move |received| {
+        match received {
+            // Every task shares one channel, so filter to the one asked for.
+            Ok((event_id, event)) if event_id == id => Some(Ok(Event::default()
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().data("{}")))),
+            Ok(_) => None,
+            // The client fell more than EVENT_BUFFER events behind. Say so
+            // rather than silently skipping: the UI should re-fetch the
+            // snapshot instead of showing a debate with holes in it.
+            Err(BroadcastStreamRecvError::Lagged(missed)) => Some(Ok(Event::default()
+                .event("lagged")
+                .data(missed.to_string()))),
+        }
+    });
+
+    // The keep-alive comment stops idle proxies and browsers dropping a
+    // connection during a long silent stretch, such as a slow build.
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// `POST /api/tasks/{id}/approve` — Gate 2 (DP-10).

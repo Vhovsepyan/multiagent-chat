@@ -10,18 +10,21 @@
 //!     install dependencies, or commit — it would write code it cannot verify.
 //!     This is why the target repo should be a project you are happy to let it
 //!     work in unattended;
-//!   - output: the child inherits stdout/stderr, so Claude Code's own progress
-//!     prints straight through, live, with no JSON parsing to break when the
-//!     CLI's event shape changes.
+//!   - output: stdout/stderr are read line by line rather than parsed as
+//!     `--output-format stream-json`, so nothing breaks when the CLI's event
+//!     shape changes. Phase 9 switched these from inherited to piped so each
+//!     line can also be published to the web UI.
 
 use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::config::Config;
 use crate::spec::SPEC_FILENAME;
+use crate::task::{Emitter, TaskEvent};
 use crate::ui;
 
 /// The CLI we shell out to. Resolved from PATH.
@@ -40,7 +43,13 @@ fn prompt() -> String {
 }
 
 /// Launch Claude Code in `repo` and stream its output until it exits.
-pub async fn run(config: &Config, repo: &Path) -> Result<()> {
+///
+/// Phase 9 changed this from inheriting the terminal to PIPING stdout/stderr,
+/// so each line can be both printed and published as `TaskEvent::Build` for the
+/// web UI. The tradeoff is real: Claude Code no longer sees a TTY, so it may
+/// drop colour and progress animations that it would show when run directly.
+/// Line-by-line output is otherwise identical.
+pub async fn run(config: &Config, repo: &Path, emitter: &Emitter) -> Result<()> {
     ui::header("Implementer");
     ui::system(&format!(
         "claude -p --model {} --permission-mode {}",
@@ -53,7 +62,7 @@ pub async fn run(config: &Config, repo: &Path) -> Result<()> {
     }
     println!();
 
-    let status = Command::new(CLAUDE_BIN)
+    let mut child = Command::new(CLAUDE_BIN)
         .current_dir(repo)
         .arg("-p")
         .arg(prompt())
@@ -61,16 +70,34 @@ pub async fn run(config: &Config, repo: &Path) -> Result<()> {
         .arg(&config.implementer_model)
         .arg("--permission-mode")
         .arg(&config.permission_mode)
-        // Inherit the terminal so its output appears live.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
+        // Piped, not inherited, so every line can be forwarded to the web UI.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!(
                 "could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?"
             )
         })?;
+
+    // `take` moves the handles out of the child so they can be read on their
+    // own tasks while we wait for the process itself.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    // Read both streams concurrently. Doing them in sequence would deadlock the
+    // moment Claude Code filled the pipe we were not reading.
+    let out_task = tokio::spawn(forward(stdout, emitter.clone(), false));
+    let err_task = tokio::spawn(forward(stderr, emitter.clone(), true));
+
+    let status = child
+        .wait()
+        .await
+        .context("failed while waiting for Claude Code to finish")?;
+
+    // Drain whatever is still buffered before reporting the exit status.
+    let _ = out_task.await;
+    let _ = err_task.await;
 
     println!();
     match status.code() {
@@ -81,6 +108,22 @@ pub async fn run(config: &Config, repo: &Path) -> Result<()> {
         Some(code) => bail!("Claude Code exited with status {code}"),
         // On Windows this is unusual; on Unix it means a signal killed it.
         None => bail!("Claude Code was terminated before it finished"),
+    }
+}
+
+/// Print each line as it arrives and publish it as a build event.
+async fn forward<R>(reader: R, emitter: Emitter, is_stderr: bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if is_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        emitter.emit(TaskEvent::Build { chunk: line });
     }
 }
 
