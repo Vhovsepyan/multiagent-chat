@@ -1,8 +1,8 @@
 //! Command-line arguments.
 //!
-//! Hand-rolled rather than pulling in `clap`: there are two real flags, and a
-//! dependency that compiles a whole parser generator is not worth it yet. If
-//! this grows past three, swap in `clap` with its derive feature.
+//! Hand-rolled rather than pulling in `clap`. This is now at three real flags,
+//! which was the line I said would trigger a switch — worth revisiting with
+//! `clap` derive if Phase 10 adds more.
 
 use anyhow::{Result, bail};
 
@@ -12,6 +12,7 @@ multiagent-chat — Gemini proposes, Claude critiques, Claude Code implements.
 USAGE:
     multiagent-chat [--topic <TEXT>]
     multiagent-chat --implement-only [--topic <TEXT>]
+    multiagent-chat --web
 
 OPTIONS:
     --topic <TEXT>    The problem to design a solution for. If omitted, you are
@@ -20,6 +21,9 @@ OPTIONS:
     --implement-only  Skip the debate and use the SPEC.md already in the chosen
                       project. Costs no debate tokens. You are still shown the
                       spec and asked to approve before anything is built.
+    --web             Start the web server instead of the terminal pipeline.
+                      Port comes from PORT in .env (default 3000). The browser
+                      UI lands in Phase 10; for now this serves the JSON API.
     -h, --help        Show this help and exit.
     -V, --version     Show the version and exit.
 
@@ -34,6 +38,8 @@ pub struct Args {
     pub topic: Option<String>,
     /// Skip straight to implementing the SPEC.md that is already there.
     pub implement_only: bool,
+    /// Serve the web API instead of running the terminal pipeline (DP-12).
+    pub web: bool,
 }
 
 /// Parse the real process arguments.
@@ -62,6 +68,7 @@ fn parse_from(raw: &[String]) -> Result<Option<Args>> {
                 return Ok(None);
             }
             "--implement-only" => args.implement_only = true,
+            "--web" => args.web = true,
             "--topic" => match iter.next() {
                 Some(value) => args.topic = Some(value.clone()),
                 None => bail!("--topic needs a value, e.g. --topic \"credit applications\""),
@@ -72,6 +79,12 @@ fn parse_from(raw: &[String]) -> Result<Option<Args>> {
             }
             _ => bail!("unknown argument {arg:?} — run with --help to see the options"),
         }
+    }
+
+    // The web server has its own lifecycle; the pipeline flags mean nothing to
+    // it, and silently ignoring them would be confusing.
+    if args.web && (args.implement_only || args.topic.is_some()) {
+        bail!("--web cannot be combined with --topic or --implement-only");
     }
 
     // An empty --topic "" is a mistake, not a request to use an empty topic.

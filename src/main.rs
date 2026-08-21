@@ -14,6 +14,7 @@ mod spec;
 mod target;
 mod task;
 mod ui;
+mod web;
 
 use anyhow::Result;
 
@@ -28,9 +29,15 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
-    ui::header(concat!("multiagent-chat v", env!("CARGO_PKG_VERSION")));
-
     let config = Config::load()?;
+
+    // DP-12: the terminal pipeline stays the default until Phase 10 has a page
+    // worth serving; --web opts in.
+    if args.web {
+        return web::serve(config).await;
+    }
+
+    ui::header(concat!("multiagent-chat v", env!("CARGO_PKG_VERSION")));
     if args.implement_only {
         ui::system(&format!("implementer {}", config.implementer_model));
     } else {

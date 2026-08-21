@@ -75,6 +75,45 @@ pub fn resolve_existing(config: &Config, topic: Option<&str>) -> Result<PathBuf>
     Ok(path)
 }
 
+/// Every project folder inside `WORKSPACE_ROOT`, sorted.
+///
+/// Used by `GET /api/projects` to populate the picker. Hidden folders and
+/// anything that is not a directory are skipped.
+pub fn list_projects(config: &Config) -> Result<Vec<String>> {
+    let entries = fs::read_dir(&config.workspace_root)
+        .with_context(|| format!("could not read {}", config.workspace_root.display()))?;
+
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+
+    names.sort();
+    Ok(names)
+}
+
+/// Resolve a project by name for the web UI, creating it if it is new.
+///
+/// The non-interactive twin of `resolve`: the browser has already asked the
+/// user, so there is nobody here to prompt.
+pub fn ensure_project(config: &Config, name: &str) -> Result<PathBuf> {
+    let name = validate_name(name)?;
+    let path = config.workspace_root.join(name);
+
+    if path.is_dir() {
+        return Ok(path);
+    }
+    if path.exists() {
+        bail!("{} exists but is not a directory", path.display());
+    }
+
+    fs::create_dir_all(&path).with_context(|| format!("could not create {}", path.display()))?;
+    git_init(&path)?;
+    Ok(path)
+}
+
 /// Reject anything that would escape `WORKSPACE_ROOT`.
 ///
 /// Without this, typing `../../Windows` would happily resolve to somewhere

@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use serde::Serialize;
-use tokio::sync::broadcast;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 /// How many events we keep for a subscriber that is briefly behind.
@@ -121,6 +121,17 @@ pub enum TaskEvent {
 // Task
 // ---------------------------------------------------------------------------
 
+/// The human's answer at Gate 2 (DP-10).
+///
+/// `spec` carries an edited document. When present it replaces SPEC.md before
+/// the build starts, so editing and approving are one atomic action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decision {
+    pub approve: bool,
+    #[serde(default)]
+    pub spec: Option<String>,
+}
+
 /// One orchestration run, and enough history to render the page on a fresh
 /// load or a reconnect.
 ///
@@ -138,6 +149,8 @@ pub struct Task {
     pub history: Vec<TaskEvent>,
     pub spec: Option<String>,
     pub error: Option<String>,
+    /// Set once the human answers Gate 2 (DP-11).
+    pub decision: Option<Decision>,
 }
 
 impl Task {
@@ -155,6 +168,7 @@ impl Task {
             history: Vec::new(),
             spec: None,
             error: None,
+            decision: None,
         }
     }
 
@@ -252,6 +266,8 @@ impl Emitter {
 struct Inner {
     tasks: RwLock<HashMap<TaskId, Task>>,
     tx: broadcast::Sender<(TaskId, TaskEvent)>,
+    /// One waker per task, used to unpark a pipeline sitting at Gate 2.
+    gates: RwLock<HashMap<TaskId, Arc<Notify>>>,
 }
 
 impl Inner {
@@ -263,7 +279,14 @@ impl Inner {
         Inner {
             tasks: RwLock::new(HashMap::new()),
             tx,
+            gates: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The waker for a task, created on first use.
+    fn gate(&self, id: TaskId) -> Arc<Notify> {
+        let mut gates = self.gates.write().expect("gate registry lock poisoned");
+        Arc::clone(gates.entry(id).or_insert_with(|| Arc::new(Notify::new())))
     }
 
     /// Fold an event into the stored task, if that task still exists.
@@ -352,6 +375,59 @@ impl TaskManager {
         Emitter {
             id,
             inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Record the human's Gate 2 answer and wake the waiting pipeline (DP-11).
+    ///
+    /// Returns `false` if there is no such task. Answering twice is harmless:
+    /// the second call overwrites, and the pipeline has already moved on.
+    pub fn decide(&self, id: TaskId, decision: Decision) -> bool {
+        {
+            let mut tasks = self
+                .inner
+                .tasks
+                .write()
+                .expect("task registry lock poisoned");
+            match tasks.get_mut(&id) {
+                Some(task) => task.decision = Some(decision),
+                None => return false,
+            }
+        }
+        // notify_one, NOT notify_waiters: notify_one stores a permit if nobody
+        // is parked yet, so an answer that arrives before the pipeline reaches
+        // the gate is still delivered. notify_waiters would drop it silently.
+        self.inner.gate(id).notify_one();
+        true
+    }
+
+    /// The Gate 2 answer, if one has been given.
+    pub fn decision(&self, id: TaskId) -> Option<Decision> {
+        let tasks = self
+            .inner
+            .tasks
+            .read()
+            .expect("task registry lock poisoned");
+        tasks.get(&id).and_then(|task| task.decision.clone())
+    }
+
+    /// Park until the human answers Gate 2.
+    ///
+    /// The state is checked BEFORE awaiting, which together with `notify_one`'s
+    /// stored permit closes the missed-wakeup window in both directions: an
+    /// answer that lands before we park is seen by the check, and one that lands
+    /// between the check and the park is held as a permit.
+    ///
+    /// `None` means the task disappeared, which should not happen in practice.
+    pub async fn await_decision(&self, id: TaskId) -> Option<Decision> {
+        let gate = self.inner.gate(id);
+        loop {
+            if let Some(decision) = self.decision(id) {
+                return Some(decision);
+            }
+            // Bail out if the task disappeared, rather than parking forever.
+            self.get(id)?;
+            gate.notified().await;
         }
     }
 

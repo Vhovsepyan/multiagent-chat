@@ -28,6 +28,8 @@ pub struct Config {
     /// Permission mode passed to Claude Code. See `implementer.rs` for why the
     /// default is the permissive one.
     pub permission_mode: String,
+    /// Port the v2 web server listens on (`--web`).
+    pub port: u16,
 }
 
 /// Defaults used when the variable is missing from `.env`.
@@ -36,6 +38,7 @@ const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
+const DEFAULT_PORT: u16 = 3000;
 
 impl Config {
     /// Load `.env` (if present) and build a `Config`.
@@ -76,6 +79,14 @@ impl Config {
             bail!("MAX_ROUNDS must be at least 1");
         }
 
+        let port = match env::var("PORT") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u16>()
+                .with_context(|| format!("PORT must be a number 1-65535, got {raw:?}"))?,
+            Err(_) => DEFAULT_PORT,
+        };
+
         Ok(Config {
             gemini_api_key: required("GEMINI_API_KEY")?,
             anthropic_api_key: required("ANTHROPIC_API_KEY")?,
@@ -85,6 +96,7 @@ impl Config {
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
             implementer_model: optional("IMPLEMENTER_MODEL", DEFAULT_IMPLEMENTER_MODEL),
             permission_mode: optional("CLAUDE_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
+            port,
         })
     }
 }
@@ -122,6 +134,7 @@ impl fmt::Debug for Config {
             .field("critic_model", &self.critic_model)
             .field("implementer_model", &self.implementer_model)
             .field("permission_mode", &self.permission_mode)
+            .field("port", &self.port)
             .finish()
     }
 }
