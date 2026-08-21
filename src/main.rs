@@ -31,9 +31,9 @@ async fn main() -> Result<()> {
 
     let config = Config::load()?;
 
-    // DP-12: the terminal pipeline stays the default until Phase 10 has a page
-    // worth serving; --web opts in.
-    if args.web {
+    // DP-12: since Phase 10 the browser UI is the default. --cli, --topic and
+    // --implement-only all opt back into the terminal pipeline.
+    if !args.wants_cli() {
         return web::serve(config).await;
     }
 

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>multiagent-chat</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/vendor/htmx.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <h1>multiagent-chat</h1>
+      <span class="sub">Gemini proposes &middot; Claude critiques &middot; Claude Code builds</span>
+    </header>
+
+    <form class="card" hx-post="/ui/tasks" hx-swap="none">
+      <label for="title">Title</label>
+      <input type="text" id="title" name="title" required
+             placeholder="A CLI that renames files by pattern" autofocus>
+
+      <label for="description">Description</label>
+      <textarea id="description" name="description"
+                placeholder="What it must do, any constraints, anything the design should not assume."></textarea>
+      <div class="hint">Title and description are joined into one topic for the models.</div>
+
+      <label for="project">Project</label>
+      <!-- Populated from the server on load; the <select> doubles as a picker
+           for existing projects, and the text box below creates a new one. -->
+      <select id="project" name="project"
+              hx-get="/ui/projects" hx-trigger="load" hx-swap="innerHTML">
+        <option value="">loading projects…</option>
+      </select>
+
+      <label for="new_project">…or a new project</label>
+      <input type="text" id="new_project" name="new_project"
+             placeholder="leave blank to use the one selected above">
+      <div class="hint">Created inside WORKSPACE_ROOT, with <code>git init</code>.</div>
+
+      <button type="submit">Start the debate</button>
+      <div id="create-error"></div>
+    </form>
+  </div>
+</body>
+</html>

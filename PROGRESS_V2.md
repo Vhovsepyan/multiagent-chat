@@ -1,20 +1,19 @@
 # Progress
 
 ## Current status
-Phases 7, 8 and 9 are DONE and proven live end to end over HTTP. A task created
-with curl streamed its debate, spec, HTTP approval and 19 live build chunks over
-SSE, and Claude Code produced a working script in the target project. 91 tests.
+v2 IS DONE. All four phases (7-10) are complete and proven live: a task was
+created through the browser form, streamed its debate and spec as HTML over SSE,
+was approved through the gate panel, streamed 21 build chunks, and Claude Code
+produced a working `greet.py`. `cargo run` now serves the UI; `--cli` runs the
+v1 terminal pipeline. 106 tests, clippy clean.
 
 ## Next steps
-- Phase 10: the browser UI. Serve static assets from `src/web/static/`, build the
-  four screens, and flip `cargo run` to default to the web server (DP-12) with
-  CLAUDE.md updated in the same commit.
-- Known limitation to solve in the UI: SSE streams from the moment you connect,
-  so the client MUST fetch `GET /api/tasks/{id}` first and render `history`,
-  then subscribe. Proven in the live run — attaching curl a second after
-  creating the task missed `round_started` and `proposal`, both of which were
-  present in the snapshot. There is still a tiny race between the two calls;
-  closing it properly would need sequence numbers on events.
+- Nothing outstanding for v2. Possible polish if it gets real use:
+  render the spec as Markdown rather than preformatted text; a task list page
+  (only the create page and one task page exist); persistence, since the task
+  registry is in memory and a restart loses history.
+- Re-package the distributable: the v0.1.0 zip ships a bare .exe, which is no
+  longer enough now that assets come off disk (DP-13). See Distribution.
 
 ## Decisions made
 - DP-1..DP-6: (Retained from v1 CLI milestone).
@@ -65,10 +64,36 @@ SSE, and Claude Code produced a working script in the target project. 91 tests.
   CLI is unchanged and a `--web` run also shows the debate in the server console.
   The CLI passes `Emitter::detached()`, so nothing is published.
 
+- DP-13 (2026-08-21): frontend assets are served from disk with
+  `tower-http::ServeDir`, not embedded, so editing style.css needs only a browser
+  refresh. Cost, accepted knowingly: the .exe is no longer self-contained, and
+  the path is relative to the working directory — `STATIC_DIR` overrides it.
+- DP-14 (2026-08-21): HTMX rather than vanilla JS. htmx and its SSE extension are
+  VENDORED into `src/web/static/vendor/` rather than loaded from a CDN, so the
+  tool still works offline. The predicted cost was real: HTMX swaps HTML but our
+  SSE emits JSON, so `src/web/ui.rs` is a second rendering path serving `/ui/*`
+  and `/task/{id}`. The `/api/*` JSON endpoints are untouched — the API contract
+  was never bent to suit a widget.
+- One SSE stream feeds four page regions by NAMING each event (`status`,
+  `debate`, `spec`, `build`, `done`) and giving each div its own `sse-swap`.
+- The task page renders `history` server-side before attaching the stream, which
+  closes the snapshot-then-subscribe race noted in Phase 9. A page opened
+  mid-debate shows everything that already happened.
+- Everything the models write is HTML-escaped before rendering (`ui::esc`), with
+  a test asserting a `<script>` in a proposal cannot execute.
+
 ## Open questions / problems
 - Spec ambiguity surviving both gates (from v1) — keep Critic spec-checking prompt strict.
 
 ## Session log
+- 2026-08-21 (cont. 3): Phase 10 done, v2 complete. `src/web/ui.rs` renders the
+  UI; `src/web/static/` holds index.html, style.css and vendored htmx. Flipped
+  `cargo run` to the web UI with `--cli` opting back (DP-12 as promised), and
+  updated CLAUDE.md in the same commit. 106 tests. Proven by driving the actual
+  browser endpoints: form POST returned HX-Redirect, the HTML stream delivered
+  status/debate/spec/build/done events, approve came back 200, and the built
+  `greet.py` prints "Hello, Vahe!". Left two throwaway projects behind,
+  sse-probe and ui-probe.
 - 2026-08-21 (cont. 2): Phase 9 done. SSE at GET /api/tasks/{id}/events via
   tokio-stream's BroadcastStream, filtered to one task, with a `lagged` event so
   a slow client learns it missed data instead of silently showing a debate with

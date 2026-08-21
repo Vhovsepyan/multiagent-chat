@@ -46,11 +46,21 @@ Then open `.env` and fill in the three blanks: `GEMINI_API_KEY`,
 ## Usage
 
 ```bash
-cargo run                                  # asks for the topic
-cargo run -- --topic "I need credit applications"
+cargo run                                  # web UI on http://127.0.0.1:3000
+cargo run -- --cli                         # the terminal pipeline
+cargo run -- --topic "I need credit applications"   # implies --cli
 cargo run -- --implement-only              # build an existing SPEC.md
 cargo run -- --help
 ```
+
+**Web UI (v2).** `cargo run` opens a browser interface: fill in a title,
+description and project, then watch the debate stream in live, review the
+generated `SPEC.md`, edit it in place if you want, and click **Approve & Build**
+to turn Claude Code loose. Claude Code's output streams into a terminal pane on
+the same page. Assets are served from `src/web/static/`, so start the server
+from the repo root (or set `STATIC_DIR`).
+
+**Terminal (v1).** Everything below describes `--cli` mode, which is unchanged.
 
 `--implement-only` skips the debate entirely and builds from the `SPEC.md`
 already in the project you pick. It makes **no API calls** to Gemini or Claude,
@@ -87,6 +97,8 @@ All settings live in `.env`. See `.env.example` for the annotated version.
 | `CRITIC_MODEL` | `claude-sonnet-4-6` | the Critic, and the spec checker |
 | `IMPLEMENTER_MODEL` | `claude-opus-4-8` | the model Claude Code builds with |
 | `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | see the warning below |
+| `PORT` | `3000` | web UI port |
+| `STATIC_DIR` | `src/web/static` | frontend assets, relative to the working dir |
 
 > **On `bypassPermissions`:** Claude Code runs headless (`-p`), so there is
 > nobody to answer a permission prompt. The default lets it edit files *and run
@@ -100,7 +112,14 @@ All settings live in `.env`. See `.env.example` for the annotated version.
 ```
 src/
   main.rs          the pipeline, top to bottom
-  cli.rs           --topic / --help / --version
+  cli.rs           --cli / --web / --topic / --help / --version
+  task.rs          Task state machine, TaskEvent, Emitter, TaskManager
+  web/
+    mod.rs         axum router and server
+    handlers.rs    the JSON API under /api
+    ui.rs          the HTML the browser renders, under /ui
+    pipeline.rs    runs a task in the background, parks at Gate 2
+    static/        index.html, style.css, vendored htmx
   config.rs        .env into a Config (keys redacted from Debug)
   api/
     mod.rs         shared Message/Role + the retry policy

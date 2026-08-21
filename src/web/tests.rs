@@ -426,3 +426,241 @@ async fn the_stream_carries_events_for_this_task_only() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// UI (Phase 10)
+// ---------------------------------------------------------------------------
+
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn post_form(uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_index_page_is_served_from_disk() {
+    let (state, root) = test_state("ui-index");
+    let response = router(state).oneshot(get("/")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("multiagent-chat"),
+        "got: {}",
+        &html[..80.min(html.len())]
+    );
+    assert!(
+        html.contains("htmx.min.js"),
+        "htmx should be vendored locally"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_stylesheet_is_served() {
+    let (state, root) = test_state("ui-css");
+    let response = router(state)
+        .oneshot(get("/static/style.css"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_project_picker_lists_projects() {
+    let (state, root) = test_state("ui-projects");
+    std::fs::create_dir_all(root.join("alpha")).unwrap();
+
+    let response = router(state).oneshot(get("/ui/projects")).await.unwrap();
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(r#"<option value="alpha">alpha</option>"#),
+        "got: {html}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_task_page_renders_history_and_attaches_the_stream() {
+    let (state, root) = test_state("ui-page");
+    let task = state.manager.create("Renamer", "d", "p");
+    let emitter = state.manager.emitter(task.id);
+    emitter.emit(TaskEvent::Proposal {
+        round: 1,
+        text: "use Rust".into(),
+    });
+
+    let response = router(state)
+        .oneshot(get(&format!("/task/{}", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // History is rendered inline, which is what closes the subscribe race.
+    assert!(html.contains("use Rust"), "history should be replayed");
+    assert!(html.contains(&format!(r#"sse-connect="/ui/tasks/{}/stream""#, task.id)));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn an_unknown_task_page_is_404() {
+    let (state, root) = test_state("ui-404");
+    let response = router(state)
+        .oneshot(get(&format!("/task/{}", uuid::Uuid::new_v4())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Everything the models write is rendered into HTML, so it must be escaped.
+#[tokio::test]
+async fn model_output_is_escaped_not_executed() {
+    let (state, root) = test_state("ui-escape");
+    let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Proposal {
+        round: 1,
+        text: "<script>alert('xss')</script>".into(),
+    });
+
+    let response = router(state)
+        .oneshot(get(&format!("/task/{}", task.id)))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    assert!(
+        !html.contains("<script>alert"),
+        "raw script tag leaked into the page"
+    );
+    assert!(html.contains("&lt;script&gt;"), "should be escaped: {html}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn creating_from_the_form_redirects_to_the_task() {
+    let (state, root) = test_state("ui-create");
+
+    let response = router(state)
+        .oneshot(post_form(
+            "/ui/tasks",
+            "title=Renamer&description=d&project=&new_project=renamer",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let redirect = response
+        .headers()
+        .get("HX-Redirect")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(redirect.starts_with("/task/"), "got: {redirect}");
+    assert!(root.join("renamer").is_dir());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_form_reports_a_missing_project() {
+    let (state, root) = test_state("ui-noproject");
+    let response = router(state)
+        .oneshot(post_form(
+            "/ui/tasks",
+            "title=T&description=&project=&new_project=",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("Pick a project"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The edited textarea is what gets built (DP-10) when approving from the page.
+#[tokio::test]
+async fn approving_from_the_page_carries_the_edited_spec() {
+    let (state, root) = test_state("ui-approve");
+    let task = state.manager.create("t", "d", "p");
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::WaitingForApproval);
+
+    let response = router(state.clone())
+        .oneshot(post_form(
+            &format!("/ui/tasks/{}/approve", task.id),
+            "approve=true&spec=%23%23%20Problem%0Aedited",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let decision = state.manager.decision(task.id).unwrap();
+    assert!(decision.approve);
+    assert_eq!(decision.spec.as_deref(), Some("## Problem\nedited"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Rejecting must never smuggle the textarea through as an edited spec.
+#[tokio::test]
+async fn rejecting_from_the_page_discards_the_textarea() {
+    let (state, root) = test_state("ui-reject");
+    let task = state.manager.create("t", "d", "p");
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::WaitingForApproval);
+
+    router(state.clone())
+        .oneshot(post_form(
+            &format!("/ui/tasks/{}/approve", task.id),
+            "approve=false&spec=ignored",
+        ))
+        .await
+        .unwrap();
+
+    let decision = state.manager.decision(task.id).unwrap();
+    assert!(!decision.approve);
+    assert!(decision.spec.is_none(), "a rejection must not carry a spec");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_ui_stream_sends_named_html_events() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("ui-stream");
+    let task = state.manager.create("t", "d", "p");
+
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    state.manager.emitter(task.id).emit(TaskEvent::Build {
+        chunk: "compiling".into(),
+    });
+
+    let frame = body.frame().await.unwrap().unwrap();
+    let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+
+    // HTMX routes by the SSE event name, so it must be present.
+    assert!(chunk.contains("event: build"), "got: {chunk}");
+    assert!(chunk.contains("compiling"), "got: {chunk}");
+    std::fs::remove_dir_all(&root).ok();
+}

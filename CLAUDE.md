@@ -18,10 +18,10 @@ Session state: see PROGRESS_V2.md (v1 history: PROGRESS.md).
 - Rust stable only. Run `cargo fmt` and `cargo clippy` before finishing a phase.
 
 ## Commands
-- Run: `cargo run` (CLI pipeline — this is still v1 behaviour)
+- Run Web UI: `cargo run` (http://127.0.0.1:3000, PORT in .env)
+- Run CLI mode: `cargo run -- --cli` (also implied by --topic / --implement-only)
 - Test: `cargo test`
 - Lint: `cargo clippy -- -D warnings`
 
-Planned for v2, NOT built yet — do not document these as working until they are:
-- Web server on http://127.0.0.1:3000 (Phase 8)
-- `cargo run -- --cli` to opt back into the terminal pipeline (Phase 8)
+Frontend assets are served from `src/web/static/` at runtime (DP-13), so the
+server must be started from the repo root, or STATIC_DIR must point at them.

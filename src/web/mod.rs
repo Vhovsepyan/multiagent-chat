@@ -8,6 +8,7 @@
 
 pub mod handlers;
 pub mod pipeline;
+pub mod ui;
 
 #[cfg(test)]
 mod tests;
@@ -19,10 +20,10 @@ use axum::Router;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 
 use crate::config::Config;
 use crate::task::TaskManager;
-use crate::ui;
 
 /// What every handler gets a copy of.
 ///
@@ -43,6 +44,14 @@ impl AppState {
     }
 }
 
+/// Where the frontend assets live, relative to the working directory (DP-13).
+///
+/// Overridable with STATIC_DIR so the binary can be run from somewhere other
+/// than the repo root.
+fn static_dir() -> String {
+    std::env::var("STATIC_DIR").unwrap_or_else(|_| "src/web/static".to_string())
+}
+
 /// Build the API router. No I/O happens here, which is what makes it testable.
 ///
 /// axum 0.8 spells path parameters `{id}`, not the `:id` of earlier versions.
@@ -54,6 +63,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
         .route("/api/tasks/{id}/events", get(handlers::task_events))
+        // --- the browser UI (DP-14: HTMX swaps HTML, so these render HTML) ---
+        .route("/task/{id}", get(ui::task_page))
+        .route("/ui/projects", get(ui::projects))
+        .route("/ui/tasks", post(ui::create))
+        .route("/ui/tasks/{id}/stream", get(ui::stream))
+        .route("/ui/tasks/{id}/approve", post(ui::approve))
+        // DP-13: assets come off disk, so editing style.css needs only a
+        // browser refresh. The path is relative to the working directory.
+        .nest_service("/static", ServeDir::new(static_dir()))
+        .fallback_service(ServeDir::new(static_dir()))
         // The frontend is served from this same origin in Phase 10, so CORS is
         // only here to keep a separately-served dev page working.
         .layer(CorsLayer::permissive())
@@ -71,10 +90,10 @@ pub async fn serve(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("could not bind {address} — is something already using it?"))?;
 
-    ui::header("multiagent-chat — web mode");
-    ui::success(&format!("listening on http://{address}"));
-    ui::system("the browser UI arrives in Phase 10; for now this serves the API");
-    ui::system("stop with Ctrl-C");
+    crate::ui::header("multiagent-chat — web mode");
+    crate::ui::success(&format!("open http://{address}"));
+    crate::ui::system(&format!("serving assets from {}", static_dir()));
+    crate::ui::system("stop with Ctrl-C");
 
     axum::serve(listener, app)
         .await

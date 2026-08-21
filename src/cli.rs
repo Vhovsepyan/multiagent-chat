@@ -1,8 +1,7 @@
 //! Command-line arguments.
 //!
-//! Hand-rolled rather than pulling in `clap`. This is now at three real flags,
-//! which was the line I said would trigger a switch — worth revisiting with
-//! `clap` derive if Phase 10 adds more.
+//! Hand-rolled rather than pulling in `clap`. At four flags this is past the
+//! line I set for switching; `clap` derive is the right move if it grows again.
 
 use anyhow::{Result, bail};
 
@@ -10,9 +9,9 @@ const HELP: &str = "\
 multiagent-chat — Gemini proposes, Claude critiques, Claude Code implements.
 
 USAGE:
-    multiagent-chat [--topic <TEXT>]
-    multiagent-chat --implement-only [--topic <TEXT>]
-    multiagent-chat --web
+    multiagent-chat                       start the web UI (default)
+    multiagent-chat --cli [--topic <TEXT>]
+    multiagent-chat --cli --implement-only [--topic <TEXT>]
 
 OPTIONS:
     --topic <TEXT>    The problem to design a solution for. If omitted, you are
@@ -21,9 +20,11 @@ OPTIONS:
     --implement-only  Skip the debate and use the SPEC.md already in the chosen
                       project. Costs no debate tokens. You are still shown the
                       spec and asked to approve before anything is built.
-    --web             Start the web server instead of the terminal pipeline.
-                      Port comes from PORT in .env (default 3000). The browser
-                      UI lands in Phase 10; for now this serves the JSON API.
+    --web             Start the web UI. This is the default, so the flag is only
+                      needed for clarity. Port comes from PORT in .env
+                      (default 3000).
+    --cli             Run the original terminal pipeline instead of the server.
+                      Implied by --topic and --implement-only.
     -h, --help        Show this help and exit.
     -V, --version     Show the version and exit.
 
@@ -38,8 +39,20 @@ pub struct Args {
     pub topic: Option<String>,
     /// Skip straight to implementing the SPEC.md that is already there.
     pub implement_only: bool,
-    /// Serve the web API instead of running the terminal pipeline (DP-12).
+    /// Serve the web UI. The default since Phase 10 (DP-12).
     pub web: bool,
+    /// Force the terminal pipeline.
+    pub cli: bool,
+}
+
+impl Args {
+    /// True when the terminal pipeline should run instead of the server.
+    ///
+    /// `--topic` and `--implement-only` only mean anything to the CLI, so
+    /// passing either implies it — typing `--cli` as well would be noise.
+    pub fn wants_cli(&self) -> bool {
+        self.cli || self.implement_only || self.topic.is_some()
+    }
 }
 
 /// Parse the real process arguments.
@@ -69,6 +82,7 @@ fn parse_from(raw: &[String]) -> Result<Option<Args>> {
             }
             "--implement-only" => args.implement_only = true,
             "--web" => args.web = true,
+            "--cli" => args.cli = true,
             "--topic" => match iter.next() {
                 Some(value) => args.topic = Some(value.clone()),
                 None => bail!("--topic needs a value, e.g. --topic \"credit applications\""),
@@ -83,8 +97,8 @@ fn parse_from(raw: &[String]) -> Result<Option<Args>> {
 
     // The web server has its own lifecycle; the pipeline flags mean nothing to
     // it, and silently ignoring them would be confusing.
-    if args.web && (args.implement_only || args.topic.is_some()) {
-        bail!("--web cannot be combined with --topic or --implement-only");
+    if args.web && (args.cli || args.implement_only || args.topic.is_some()) {
+        bail!("--web cannot be combined with --cli, --topic or --implement-only");
     }
 
     // An empty --topic "" is a mistake, not a request to use an empty topic.
@@ -151,6 +165,43 @@ mod tests {
             .unwrap();
         assert!(parsed.implement_only);
         assert_eq!(parsed.topic.as_deref(), Some("a messenger"));
+    }
+
+    #[test]
+    fn no_arguments_means_the_web_ui() {
+        let parsed = parse_from(&[]).unwrap().unwrap();
+        assert!(!parsed.wants_cli(), "web is the default since Phase 10");
+    }
+
+    #[test]
+    fn the_cli_flag_forces_the_terminal_pipeline() {
+        let parsed = parse_from(&args_of(&["--cli"])).unwrap().unwrap();
+        assert!(parsed.wants_cli());
+    }
+
+    /// Typing --cli alongside these would be noise, so they imply it.
+    #[test]
+    fn topic_and_implement_only_imply_cli() {
+        assert!(
+            parse_from(&args_of(&["--topic", "x"]))
+                .unwrap()
+                .unwrap()
+                .wants_cli()
+        );
+        assert!(
+            parse_from(&args_of(&["--implement-only"]))
+                .unwrap()
+                .unwrap()
+                .wants_cli()
+        );
+    }
+
+    #[test]
+    fn web_conflicts_with_the_cli_flags() {
+        let err = parse_from(&args_of(&["--web", "--cli"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be combined"), "unexpected: {err}");
     }
 
     #[test]
