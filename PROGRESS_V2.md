@@ -92,8 +92,9 @@ v1 terminal pipeline. 106 tests, clippy clean.
   updated CLAUDE.md in the same commit. 106 tests. Proven by driving the actual
   browser endpoints: form POST returned HX-Redirect, the HTML stream delivered
   status/debate/spec/build/done events, approve came back 200, and the built
-  `greet.py` prints "Hello, Vahe!". Left two throwaway projects behind,
-  sse-probe and ui-probe.
+  `greet.py` prints "Hello, Vahe!". The two throwaway projects used for those
+  runs (sse-probe, ui-probe) were deleted afterwards; spec-scratch stays, since
+  it holds the working `rnm` tool from v1.
 - 2026-08-21 (cont. 2): Phase 9 done. SSE at GET /api/tasks/{id}/events via
   tokio-stream's BroadcastStream, filtered to one task, with a `lagged` event so
   a slow client learns it missed data instead of silently showing a debate with
