@@ -190,6 +190,35 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
     }
 }
 
+/// A single domain event may affect several independent live UI regions.
+fn event_updates(
+    id: TaskId,
+    event: &TaskEvent,
+    current_spec: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let Some((name, html)) = event_html(id, event) else {
+        return Vec::new();
+    };
+    if let TaskEvent::Finished { status, .. } = event {
+        let mut updates = vec![("status", timeline_html(*status)), (name, html)];
+        updates.push(("spec", spec_readonly_html(current_spec)));
+        updates
+    } else {
+        vec![(name, html)]
+    }
+}
+
+fn live_event(updates: Vec<(&'static str, String)>) -> Option<Event> {
+    let mut updates = updates.into_iter();
+    let (name, mut html) = updates.next()?;
+    for (target, fragment) in updates {
+        html.push_str(&format!(
+            r#"<div id="{target}" hx-swap-oob="innerHTML">{fragment}</div>"#
+        ));
+    }
+    Some(Event::default().event(name).data(html))
+}
+
 pub async fn projects(State(state): State<AppState>) -> Html<String> {
     let projects = state.projects.list();
     let mut html = String::new();
@@ -298,7 +327,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     let mut build = String::new();
     let mut done = String::new();
     for event in &task.history {
-        if let Some((slot, html)) = event_html(id, event) {
+        for (slot, html) in event_updates(id, event, task.spec.as_deref()) {
             match slot {
                 "debate" => debate.push_str(&html),
                 "spec" => spec = html,
@@ -328,7 +357,11 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
 }
 
 fn spec_readonly(task: &Task) -> String {
-    task.spec.as_ref().map(|spec| format!(r#"<div class="card"><h2 class="section">SPEC.md</h2><div class="spec-body">{}</div></div>"#, esc(spec))).unwrap_or_default()
+    spec_readonly_html(task.spec.as_deref())
+}
+
+fn spec_readonly_html(spec: Option<&str>) -> String {
+    spec.map(|spec| format!(r#"<div class="card"><h2 class="section">SPEC.md</h2><div class="spec-body">{}</div></div>"#, esc(spec))).unwrap_or_default()
 }
 
 fn page_html(
@@ -353,10 +386,25 @@ pub async fn stream(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
-    let events = BroadcastStream::new(state.manager.subscribe()).filter_map(move |received| match received {
-        Ok((event_id, event)) if event_id == id => event_html(id, &event).map(|(name, html)| Ok(Event::default().event(name).data(html))),
-        Ok(_) => None,
-        Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(Event::default().event("debate").data(r#"<div class="notice warn">Some output was dropped — reload to catch up.</div>"#))),
+    let manager = state.manager.clone();
+    let events = BroadcastStream::new(state.manager.subscribe()).filter_map(move |received| {
+        let updates = match received {
+            Ok((event_id, event)) if event_id == id => {
+                let task = manager.get(id);
+                event_updates(
+                    id,
+                    &event,
+                    task.as_ref().and_then(|task| task.spec.as_deref()),
+                )
+            }
+            Ok(_) => return None,
+            Err(BroadcastStreamRecvError::Lagged(_)) => vec![(
+                "debate",
+                r#"<div class="notice warn">Some output was dropped — reload to catch up.</div>"#
+                    .into(),
+            )],
+        };
+        live_event(updates).map(Ok)
     });
     Sse::new(events).keep_alive(KeepAlive::default())
 }

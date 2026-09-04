@@ -758,3 +758,70 @@ async fn the_ui_stream_sends_named_html_events() {
     assert!(chunk.contains("compiling"), "got: {chunk}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[tokio::test]
+async fn successful_finished_event_updates_all_live_terminal_fragments() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("ui-finished-success");
+    let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "approved spec".into(),
+        path: "SPEC.md".into(),
+    });
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::Implementing);
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    state.manager.emitter(task.id).emit(TaskEvent::Finished {
+        status: TaskStatus::Completed,
+        error: None,
+    });
+
+    let frame = body.frame().await.unwrap().unwrap();
+    let output = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+    assert!(output.contains("event: status"), "got: {output}");
+    assert!(output.contains(">Completed<"), "got: {output}");
+    assert!(output.contains(r#"id="done" hx-swap-oob="innerHTML""#));
+    assert!(output.contains("implementation and verification finished"));
+    assert!(output.contains(r#"id="spec" hx-swap-oob="innerHTML""#));
+    assert!(!output.contains(r#"class="step active">Build"#));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn failed_finished_event_replaces_the_live_implementing_status() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("ui-finished-failed");
+    let task = state.manager.create("t", "d", "p");
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::Implementing);
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    state.manager.emitter(task.id).emit(TaskEvent::Finished {
+        status: TaskStatus::Failed,
+        error: Some("verification failed".into()),
+    });
+
+    let frame = body.frame().await.unwrap().unwrap();
+    let output = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+    assert!(output.contains("event: status"), "got: {output}");
+    assert!(output.contains(">Failed<"), "got: {output}");
+    assert!(output.contains(r#"id="done" hx-swap-oob="innerHTML""#));
+    assert!(output.contains("Failed: verification failed"));
+    assert!(!output.contains(r#"class="step active">Build"#));
+    std::fs::remove_dir_all(&root).ok();
+}
