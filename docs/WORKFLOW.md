@@ -1,6 +1,81 @@
 # Development Workflow
 
-This file defines reusable execution flows for different software-development task types. Select the workflow that matches the task rather than applying one process to every request.
+This file defines reusable execution flows for different software-development task types in the production web application. Select the workflow that matches the task.
+
+The production model is:
+
+```text
+User
+  ↓
+Register/connect project source
+  ↓
+Create task
+  ↓
+Task type
+  New Project / Feature / Bug Fix
+  ↓
+Prepare isolated task workspace
+  ↓
+Inspect repository/project
+  ↓
+Agents collaborate
+  ↓
+Specification
+  ↓
+User approval
+  ↓
+Implementation
+  ↓
+Build/tests
+  ↓
+Diff/result
+  ↓
+User review
+```
+
+---
+
+# Project Source
+
+An existing project normally comes from a source repository. GitHub is the primary source for the initial production design; GitLab and uploaded archives may be supported later.
+
+A Project represents repository source metadata, not a persistent filesystem directory:
+
+```text
+Project
+- id
+- name
+- source/provider
+- repository identifier or URL
+- default branch
+- detected technology profile
+```
+
+Users register or connect a source. They do not select local IDE workspaces, arbitrary server directories, or operating-system paths.
+
+---
+
+# Task Workspace
+
+Each task operates in its own isolated, temporary server-side workspace. For an existing project:
+
+```text
+repository
+  ↓
+prepare isolated workspace
+  ↓
+checkout requested branch/commit
+  ↓
+inspect
+  ↓
+implement
+  ↓
+verify
+  ↓
+produce diff/result
+```
+
+The workspace is disposable execution state, not permanent application state. Persistent project and task state must eventually live in durable services such as a database or object storage.
 
 ---
 
@@ -15,24 +90,29 @@ Technology / stack selection
     ↓
 Architecture proposal
     ↓
-Critique / review
+Critique
     ↓
 Specification
     ↓
 User approval
     ↓
+Create isolated workspace
+    ↓
 Implementation
     ↓
-Build / tests
+Build/tests
     ↓
 Verification
+    ↓
+Publish result
 ```
 
 Rules:
 
 - The user may choose the technology stack; do not assume Rust.
-- The destination directory must be explicitly known.
-- The implementation may initialize a new application structure.
+- The user selects an output target, not a local operating-system directory.
+- Future output targets may include creating a GitHub repository, pushing to an existing empty repository, or providing a downloadable project archive.
+- The implementation may initialize a new application structure inside the isolated workspace.
 - Build and verification commands must depend on the selected stack.
 - Do not create unrelated infrastructure unless required by the specification.
 
@@ -43,19 +123,21 @@ Rules:
 Use this workflow when adding functionality to an existing project.
 
 ```text
-Existing repository
+Select Project
+    ↓
+Prepare repository workspace
     ↓
 Inspect architecture
     ↓
-Understand relevant code
+Inspect task-relevant code
     ↓
-Identify affected components
+Detect project technology
     ↓
-Propose the smallest reasonable change
+Propose minimal change
     ↓
-Critique / review
+Critique
     ↓
-Implementation plan
+Specification
     ↓
 User approval
     ↓
@@ -64,15 +146,18 @@ Implementation
 Regression tests
     ↓
 Verification
+    ↓
+Show diff/result
 ```
 
 Rules:
 
 - Do not recreate the application or redesign unrelated parts of the system.
-- Follow existing architecture and coding conventions.
+- Respect the existing architecture and follow established coding conventions.
+- Minimize the blast radius and modify only relevant components.
 - Reuse existing abstractions where practical.
-- Modify only components relevant to the requested feature.
-- Preserve existing public behavior unless the feature explicitly changes it.
+- Preserve unrelated behavior and public behavior unless the feature explicitly changes it.
+- Follow repository instructions such as `AGENTS.md` and `CLAUDE.md` when present.
 - Add or update tests for the new behavior.
 
 ---
@@ -82,17 +167,19 @@ Rules:
 Use this workflow when repairing incorrect behavior in an existing project.
 
 ```text
-Bug description
+Select Project
     ↓
-Inspect relevant code
+Prepare repository workspace
     ↓
-Understand or reproduce the failure
+Inspect relevant code/tests
+    ↓
+Understand or reproduce failure
     ↓
 Identify root cause
     ↓
 Evaluate blast radius
     ↓
-Propose the smallest correct fix
+Propose smallest correct fix
     ↓
 User approval
     ↓
@@ -101,25 +188,32 @@ Implementation
 Regression test
     ↓
 Verification
+    ↓
+Show diff/result
 ```
 
 Rules:
 
-- Fix the root cause, not only the visible symptom.
+- Fix the root cause rather than hiding the visible symptom.
 - Avoid unrelated refactoring.
-- Preserve existing behavior that is not part of the bug.
+- Preserve behavior that is not part of the bug.
 - Add a regression test when practical.
-- Check whether the fix can affect nearby code paths.
+- Check whether the fix affects nearby code paths.
+- Follow repository instructions when present.
 - Do not redesign the whole component unless the root cause requires an architectural change.
 
 ---
 
 # 4. Refactor
 
-Use this supported workflow for refactoring tasks, even if the application does not implement this task type yet.
+Use this reusable workflow for refactoring tasks, even if the application does not implement this task type yet.
 
 ```text
-Refactor goal
+Select Project
+    ↓
+Prepare repository workspace
+    ↓
+Define refactor goal
     ↓
 Inspect current design
     ↓
@@ -136,21 +230,28 @@ Implementation
 Regression tests
     ↓
 Verification
+    ↓
+Show diff/result
 ```
 
 Rules:
 
 - Behavior should remain unchanged unless explicitly requested.
 - Avoid mixing refactoring with unrelated feature work.
+- Follow repository instructions and conventions.
 - Prefer measurable reasons for refactoring, such as duplication, coupling, testability, maintainability, or performance.
 
 ---
 
 # 5. Investigation
 
-Use this workflow for diagnostic and read-only tasks.
+Use this workflow for diagnostic and read-only tasks against an isolated repository workspace.
 
 ```text
+Select Project
+    ↓
+Prepare repository workspace
+    ↓
 Question / problem
     ↓
 Inspect repository and runtime evidence
@@ -169,12 +270,13 @@ Rules:
 - Do not modify code unless the user explicitly converts the investigation into an implementation task.
 - Clearly separate confirmed findings from hypotheses.
 - Reference relevant files, modules, logs, or tests.
+- Treat the prepared workspace as disposable after findings are reported.
 
 ---
 
 # Existing Project Inspection
 
-Before proposing changes to an existing repository, inspect enough context to understand how the project works.
+Before proposing changes, prepare the isolated repository workspace and inspect enough context to understand the project.
 
 Potential project metadata:
 
@@ -204,13 +306,13 @@ plan*.md
 PROGRESS*.md
 ```
 
-Inspect relevant source code and tests. Do not dump the entire repository into an agent prompt; prefer task-relevant context. Do not modify files during the inspection stage.
+Inspect relevant source code and tests. Do not dump the entire repository into an agent prompt; prefer task-relevant context. Do not modify files during inspection.
 
 ---
 
 # Technology Detection
 
-For existing projects, technology should normally be detected automatically.
+For existing repositories, detect technology automatically from repository evidence.
 
 ```text
 Cargo.toml
@@ -229,7 +331,7 @@ pyproject.toml
 → Python
 ```
 
-Also detect framework and infrastructure when practical. For example:
+Detect frameworks and infrastructure when evidence exists. For example:
 
 ```text
 Language: Java 21
@@ -241,22 +343,22 @@ Containers: Docker
 Tests: JUnit / Testcontainers
 ```
 
-Detection must be evidence-based. Do not claim a technology is used only because it appears in documentation when the repository structure contradicts it. Allow manual override when automatic detection is incomplete.
+Detection must be evidence-based. Do not claim a technology is used only because documentation mentions it when repository structure contradicts that claim. Allow manual override when automatic detection is incomplete.
 
 ---
 
 # Context Selection
 
-For feature and bug-fix tasks, gather only context relevant to the requested change. Useful context may include:
+For existing-project tasks, gather only context relevant to the requested change. Useful context may include:
 
-- Project tree.
+- Repository tree.
 - Build files.
 - Relevant modules.
 - Configuration.
 - Interfaces.
 - Tests.
-- Git status.
-- Relevant documentation.
+- Git status within the task workspace.
+- Relevant documentation and repository instructions.
 
 Avoid unnecessary token usage by loading the whole repository. Prefer targeted inspection.
 
@@ -264,7 +366,7 @@ Avoid unnecessary token usage by loading the whole repository. Prefer targeted i
 
 # Verification
 
-Verification must depend on the project stack. Use repository-defined commands when available.
+Verification must depend on the detected or selected technology stack. Prefer repository-defined commands.
 
 ## Rust
 
@@ -280,7 +382,7 @@ cargo test
 ./gradlew test
 ```
 
-On Windows, use the repository's appropriate wrapper if needed.
+Use the repository's appropriate wrapper on the task execution platform.
 
 ## Maven
 
@@ -332,9 +434,24 @@ If build, lint, or tests fail:
 
 ---
 
+# Production Considerations
+
+- Browser users never provide arbitrary server filesystem paths.
+- Project source and task workspace are separate concepts.
+- Each task gets an isolated workspace.
+- Workspace data is disposable.
+- Persistent state must not depend on local container disk.
+- Credentials must never be stored in task specifications.
+- Repository credentials should eventually use secure secret storage.
+- Application behavior should remain compatible with stateless, cloud-based execution.
+
+These principles are application-level requirements. Detailed Google Cloud infrastructure is intentionally out of scope for this workflow.
+
+---
+
 # Scope Discipline
 
-Every task should follow its task-specific specification under `docs/tasks/`. Do not add unrelated features or broaden the implementation because another improvement seems useful. If something important is discovered outside the current task scope, report it as a recommendation instead of implementing it.
+Every task should follow its task-specific specification under `docs/tasks/`. Do not add unrelated features or broaden the implementation because another improvement seems useful. Report important out-of-scope discoveries as recommendations instead of implementing them.
 
 ---
 
@@ -350,4 +467,4 @@ At the end of an implementation task, provide:
 6. Known limitations.
 7. Recommended next step.
 
-Keep this file reusable. Do not include details that belong only to one specific task.
+Keep this file application-level and reusable. Do not include details that belong only to one specific task.
