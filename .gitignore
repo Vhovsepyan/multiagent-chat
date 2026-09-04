@@ -3,6 +3,7 @@
 
 # secrets — never commit real API keys
 .env
+env
 
 # IDE
 /.idea/
