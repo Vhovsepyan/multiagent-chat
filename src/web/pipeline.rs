@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::api::claude::ClaudeClient;
 use crate::api::gemini::GeminiClient;
-use crate::inspection::inspect;
+use crate::inspection::{InspectionRequest, inspect};
 use crate::project::Project;
 use crate::spec;
 use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskResult, TaskStatus};
@@ -70,7 +70,14 @@ async fn run(
                 .as_ref()
                 .expect("validated existing task has project");
             let prepared = prepare_existing(state, id, project)?;
-            let inspection = inspect(&prepared.path)?;
+            let inspection = inspect(
+                &prepared.path,
+                InspectionRequest {
+                    kind: task.kind,
+                    title: &task.title,
+                    description: &task.description,
+                },
+            )?;
             let profile = inspection.profile.clone();
             state.projects.set_profile(project.id, profile.clone());
             let context = inspection.prompt_context();
