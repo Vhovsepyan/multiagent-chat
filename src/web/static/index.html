@@ -11,35 +11,73 @@
   <div class="wrap">
     <header class="top">
       <h1>multiagent-chat</h1>
-      <span class="sub">Gemini proposes &middot; Claude critiques &middot; Claude Code builds</span>
+      <span class="sub">Repository-backed multi-agent software engineering</span>
     </header>
 
+    <form class="card" hx-post="/ui/projects" hx-target="#project-registration">
+      <h2 class="section">Register a GitHub project</h2>
+      <label for="project_name">Project name</label>
+      <input type="text" id="project_name" name="name" placeholder="Payments service">
+      <label for="repository">GitHub repository</label>
+      <input type="text" id="repository" name="repository" placeholder="owner/repository">
+      <label for="default_branch">Default branch</label>
+      <input type="text" id="default_branch" name="default_branch" value="main">
+      <button type="submit" class="ghost">Register repository</button>
+      <div id="project-registration"></div>
+    </form>
+
     <form class="card" hx-post="/ui/tasks" hx-swap="none">
-      <label for="title">Title</label>
-      <input type="text" id="title" name="title" required
-             placeholder="A CLI that renames files by pattern" autofocus>
-
-      <label for="description">Description</label>
-      <textarea id="description" name="description"
-                placeholder="What it must do, any constraints, anything the design should not assume."></textarea>
-      <div class="hint">Title and description are joined into one topic for the models.</div>
-
-      <label for="project">Project</label>
-      <!-- Populated from the server on load; the <select> doubles as a picker
-           for existing projects, and the text box below creates a new one. -->
-      <select id="project" name="project"
-              hx-get="/ui/projects" hx-trigger="load" hx-swap="innerHTML">
-        <option value="">loading projects…</option>
+      <h2 class="section">Create task</h2>
+      <label for="kind">Task type</label>
+      <select id="kind" name="kind" onchange="syncTaskFields()">
+        <option value="new_project">New Project</option>
+        <option value="feature">Feature</option>
+        <option value="bug_fix">Bug Fix</option>
       </select>
 
-      <label for="new_project">…or a new project</label>
-      <input type="text" id="new_project" name="new_project"
-             placeholder="leave blank to use the one selected above">
-      <div class="hint">Created inside WORKSPACE_ROOT, with <code>git init</code>.</div>
+      <div id="existing-fields" hidden>
+        <label for="project_id">Registered project</label>
+        <select id="project_id" name="project_id" disabled
+                hx-get="/ui/projects" hx-trigger="load" hx-swap="innerHTML">
+          <option value="">loading projects…</option>
+        </select>
+      </div>
 
-      <button type="submit">Start the debate</button>
+      <div id="new-fields">
+        <label for="technology">Technology</label>
+        <select id="technology" name="technology">
+          <option value="rust">Rust</option>
+          <option value="java_spring_boot">Java / Spring Boot</option>
+          <option value="python">Python</option>
+          <option value="type_script_node">TypeScript / Node.js</option>
+          <option value="custom">Other</option>
+        </select>
+        <input type="hidden" id="output" name="output" value="reviewable_result">
+        <div class="hint">This phase produces a reviewable result from an isolated server workspace.</div>
+      </div>
+
+      <label for="title">Title</label>
+      <input type="text" id="title" name="title" required placeholder="Add idempotency to payment creation">
+      <label for="description">Description</label>
+      <textarea id="description" name="description" required
+                placeholder="Describe the required behavior, constraints, and acceptance expectations."></textarea>
+
+      <button type="submit">Start collaboration</button>
       <div id="create-error"></div>
     </form>
   </div>
+  <script>
+    function syncTaskFields() {
+      const isNew = document.getElementById('kind').value === 'new_project';
+      const existing = document.getElementById('existing-fields');
+      const fresh = document.getElementById('new-fields');
+      existing.hidden = isNew;
+      fresh.hidden = !isNew;
+      document.getElementById('project_id').disabled = isNew;
+      document.getElementById('technology').disabled = !isNew;
+      document.getElementById('output').disabled = !isNew;
+    }
+    syncTaskFields();
+  </script>
 </body>
 </html>

@@ -23,7 +23,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::config::Config;
+use crate::project::ProjectStore;
 use crate::task::TaskManager;
+use crate::workspace::{LocalWorkspaceProvider, WorkspaceProvider};
 
 /// What every handler gets a copy of.
 ///
@@ -32,6 +34,8 @@ use crate::task::TaskManager;
 #[derive(Clone)]
 pub struct AppState {
     pub manager: TaskManager,
+    pub projects: ProjectStore,
+    pub workspaces: Arc<dyn WorkspaceProvider>,
     pub config: Arc<Config>,
 }
 
@@ -39,6 +43,21 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         AppState {
             manager: TaskManager::new(),
+            projects: ProjectStore::default(),
+            workspaces: Arc::new(
+                LocalWorkspaceProvider::temporary()
+                    .expect("temporary workspace root should be available"),
+            ),
+            config: Arc::new(config),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_workspace(config: Config, workspaces: Arc<dyn WorkspaceProvider>) -> Self {
+        AppState {
+            manager: TaskManager::new(),
+            projects: ProjectStore::default(),
+            workspaces,
             config: Arc::new(config),
         }
     }
@@ -59,6 +78,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(handlers::health))
         .route("/api/projects", get(handlers::list_projects))
+        .route("/api/projects", post(handlers::register_project))
         .route("/api/tasks", post(handlers::create_task))
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
@@ -66,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         // --- the browser UI (DP-14: HTMX swaps HTML, so these render HTML) ---
         .route("/task/{id}", get(ui::task_page))
         .route("/ui/projects", get(ui::projects))
+        .route("/ui/projects", post(ui::register_project))
         .route("/ui/tasks", post(ui::create))
         .route("/ui/tasks/{id}/stream", get(ui::stream))
         .route("/ui/tasks/{id}/approve", post(ui::approve))

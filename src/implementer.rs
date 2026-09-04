@@ -50,6 +50,17 @@ fn prompt() -> String {
 /// drop colour and progress animations that it would show when run directly.
 /// Line-by-line output is otherwise identical.
 pub async fn run(config: &Config, repo: &Path, emitter: &Emitter) -> Result<()> {
+    run_with_prompt(config, repo, emitter, &prompt()).await
+}
+
+/// Launch Claude Code with task-kind-specific instructions prepared by the
+/// workflow module. Common process and streaming behavior stays here.
+pub async fn run_with_prompt(
+    config: &Config,
+    repo: &Path,
+    emitter: &Emitter,
+    task_prompt: &str,
+) -> Result<()> {
     ui::header("Implementer");
     ui::system(&format!(
         "claude -p --model {} --permission-mode {}",
@@ -65,7 +76,7 @@ pub async fn run(config: &Config, repo: &Path, emitter: &Emitter) -> Result<()> 
     let mut child = Command::new(CLAUDE_BIN)
         .current_dir(repo)
         .arg("-p")
-        .arg(prompt())
+        .arg(task_prompt)
         .arg("--model")
         .arg(&config.implementer_model)
         .arg("--permission-mode")

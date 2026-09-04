@@ -1,9 +1,7 @@
-//! Picks the repo that this run will write SPEC.md into.
+//! Legacy CLI adapter for selecting a local repository.
 //!
-//! The target repo is *per-run input*, not configuration: today the topic is
-//! credit applications, tomorrow a messenger. `.env` only says where projects
-//! live (`WORKSPACE_ROOT`); the project itself is chosen here, and created on
-//! the spot if it does not exist yet.
+//! The production web application uses registered Projects and
+//! `WorkspaceProvider`. This module preserves the original `--cli` behavior.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +11,12 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::ui;
+
+fn workspace_root(config: &Config) -> Result<&Path> {
+    config.workspace_root.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("WORKSPACE_ROOT is required only for the legacy CLI workflow")
+    })
+}
 
 /// Words that carry no meaning in a project name, so a topic like
 /// "I need credit applications" suggests "credit-applications".
@@ -30,7 +34,7 @@ pub fn resolve(config: &Config, topic: &str) -> Result<PathBuf> {
     let name = ui::prompt("Project", &suggestion)?;
     let name = validate_name(&name)?;
 
-    let path = config.workspace_root.join(name);
+    let path = workspace_root(config)?.join(name);
 
     if path.is_dir() {
         ui::system(&format!("  -> {}", path.display()));
@@ -63,7 +67,7 @@ pub fn resolve_existing(config: &Config, topic: Option<&str>) -> Result<PathBuf>
     let name = ui::prompt("Project", &suggestion)?;
     let name = validate_name(&name)?;
 
-    let path = config.workspace_root.join(name);
+    let path = workspace_root(config)?.join(name);
     if !path.is_dir() {
         bail!(
             "{} does not exist — --implement-only needs a project that already holds a SPEC.md",
@@ -79,9 +83,11 @@ pub fn resolve_existing(config: &Config, topic: Option<&str>) -> Result<PathBuf>
 ///
 /// Used by `GET /api/projects` to populate the picker. Hidden folders and
 /// anything that is not a directory are skipped.
+#[allow(dead_code)] // legacy CLI compatibility; production web uses ProjectStore
 pub fn list_projects(config: &Config) -> Result<Vec<String>> {
-    let entries = fs::read_dir(&config.workspace_root)
-        .with_context(|| format!("could not read {}", config.workspace_root.display()))?;
+    let root = workspace_root(config)?;
+    let entries =
+        fs::read_dir(root).with_context(|| format!("could not read {}", root.display()))?;
 
     let mut names: Vec<String> = entries
         .filter_map(|entry| entry.ok())
@@ -98,9 +104,10 @@ pub fn list_projects(config: &Config) -> Result<Vec<String>> {
 ///
 /// The non-interactive twin of `resolve`: the browser has already asked the
 /// user, so there is nobody here to prompt.
+#[allow(dead_code)] // legacy CLI compatibility; production web uses WorkspaceProvider
 pub fn ensure_project(config: &Config, name: &str) -> Result<PathBuf> {
     let name = validate_name(name)?;
-    let path = config.workspace_root.join(name);
+    let path = workspace_root(config)?.join(name);
 
     if path.is_dir() {
         return Ok(path);

@@ -1,30 +1,21 @@
 # multiagent-chat
 
-A terminal app that runs a design debate between two AI models, then hands the
-agreed design to Claude Code to build.
+A Rust web application for repository-backed, multi-agent software engineering. Gemini proposes a solution, Claude critiques it, the application produces an editable specification, and Claude Code implements the user-approved result in an isolated task workspace.
 
-You type a topic. Gemini proposes a solution, Claude Sonnet reviews it, and they
-iterate until the reviewer approves. The agreed design becomes a `SPEC.md` in
-your target repo. You approve it with `y`, and Claude Code implements it there.
+Multiagent Chat supports three task kinds:
 
-```
-Topic  ──►  Proposer (Gemini)  ──►  Critic (Claude Sonnet)  ──┐
-              ▲                                               │
-              └────────── NEEDS_WORK ◄──────────────────────  │
-                                                         APPROVED
-                                                              │
-                          SPEC.md  ◄──────────────────────────┘
-                             │
-                        your y/n
-                             │
-                          Claude Code (Opus)  ──►  code in the target repo
-```
+- New Project for a selected technology stack.
+- Feature for a registered repository.
+- Bug Fix for a registered repository.
+
+GitHub public repositories are the initial existing-project source. Each task uses a separate disposable server-side workspace; a Project never represents a persistent local directory.
 
 ## Requirements
 
-- Rust (stable) with `cargo`
-- The [Claude Code CLI](https://claude.com/claude-code) on your `PATH`
-- A Google AI Studio API key and an Anthropic API key
+- Rust stable with `cargo`.
+- Git on `PATH` for repository-backed tasks.
+- Claude Code CLI on `PATH` for implementation.
+- Google AI Studio and Anthropic API keys.
 
 ## Setup
 
@@ -34,134 +25,138 @@ cd multiagent-chat
 cp .env.example .env
 ```
 
-Then open `.env` and fill in the three blanks: `GEMINI_API_KEY`,
-`ANTHROPIC_API_KEY`, and `WORKSPACE_ROOT`.
+Set `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` in `.env`. Do not commit this file or expose its values.
 
-> **Windows:** write paths with **forward slashes** — `C:/Users/you/projects`.
-> A backslash starts an escape sequence and the `.env` parser will reject the
-> whole file.
-
-`.env` is gitignored. Do not put real keys in `.env.example`, which is tracked.
+`WORKSPACE_ROOT` is no longer required by the web application. It remains an optional compatibility setting for the original CLI workflow.
 
 ## Usage
 
 ```bash
-cargo run                                  # web UI on http://127.0.0.1:3000
-cargo run -- --cli                         # the terminal pipeline
-cargo run -- --topic "I need credit applications"   # implies --cli
-cargo run -- --implement-only              # build an existing SPEC.md
+cargo run                  # web UI at http://127.0.0.1:3000
+cargo run -- --cli         # legacy local terminal workflow
 cargo run -- --help
 ```
 
-**Web UI (v2).** `cargo run` opens a browser interface: fill in a title,
-description and project, then watch the debate stream in live, review the
-generated `SPEC.md`, edit it in place if you want, and click **Approve & Build**
-to turn Claude Code loose. Claude Code's output streams into a terminal pane on
-the same page. Assets are served from `src/web/static/`, so start the server
-from the repo root (or set `STATIC_DIR`).
+In the web UI:
 
-**Terminal (v1).** Everything below describes `--cli` mode, which is unchanged.
+1. Register a public GitHub repository using `owner/repository` or its HTTPS URL when working on existing code.
+2. Create a New Project, Feature, or Bug Fix task.
+3. Watch repository inspection and the proposer/critic debate through SSE.
+4. Review or edit the generated specification.
+5. Approve implementation.
+6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
 
-`--implement-only` skips the debate entirely and builds from the `SPEC.md`
-already in the project you pick. It makes **no API calls** to Gemini or Claude,
-so re-running an implementation, or building from a spec you edited by hand,
-costs no debate tokens. You are still shown the spec and asked to approve it.
+Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output configuration. The initial output is a reviewable task result; repository publishing is intentionally deferred.
 
-The target repo is chosen per run, not fixed in config. After the topic, you are
-asked for a project name inside `WORKSPACE_ROOT`, with a suggestion derived from
-the topic:
+## Supported technology profiles
 
+The application currently detects or accepts:
+
+- Rust/Cargo.
+- Java/Spring Boot with Maven or Gradle.
+- Python.
+- TypeScript/JavaScript with Node.js.
+- Custom/other repositories.
+
+Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build files, `package.json`, `pyproject.toml`, requirements files, Dockerfiles, and Compose files. Verification prefers repository wrappers and scripts and is selected from the detected profile rather than always using Cargo.
+
+## API overview
+
+- `GET /api/health` — service health.
+- `GET /api/projects` — registered Projects.
+- `POST /api/projects` — register a GitHub Project.
+- `POST /api/tasks` — create a typed task.
+- `GET /api/tasks/{id}` — task snapshot and history.
+- `GET /api/tasks/{id}/events` — live JSON SSE events.
+- `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
+
+Example Project registration:
+
+```json
+{
+  "name": "Example service",
+  "repository": "owner/example-service",
+  "default_branch": "main"
+}
 ```
-Topic: I need credit applications
-Project [credit-applications]:
-  -> C:/Users/you/projects/credit-applications
-     that project does not exist yet.
-Create it and run git init? [y/n]:
+
+Example New Project task:
+
+```json
+{
+  "kind": "new_project",
+  "title": "Create an event processor",
+  "description": "Process events idempotently and expose health checks.",
+  "technology": "rust",
+  "output": "reviewable_result"
+}
 ```
 
-There are two gates. **Gate 1** is automatic: the debate ends when the Critic
-writes `VERDICT: APPROVED`, or after `MAX_ROUNDS` with a warning. **Gate 2** is
-you: the spec is printed and nothing touches the repo until you type `y`.
+Example Feature task:
 
-## Configuration
-
-All settings live in `.env`. See `.env.example` for the annotated version.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `GEMINI_API_KEY` | — | required |
-| `ANTHROPIC_API_KEY` | — | required |
-| `WORKSPACE_ROOT` | — | required; folder holding your projects |
-| `MAX_ROUNDS` | `5` | debate rounds before giving up on approval |
-| `GEMINI_MODEL` | `gemini-3.6-flash` | the Proposer |
-| `CRITIC_MODEL` | `claude-sonnet-4-6` | the Critic, and the spec checker |
-| `IMPLEMENTER_MODEL` | `claude-opus-4-8` | the model Claude Code builds with |
-| `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | see the warning below |
-| `PORT` | `3000` | web UI port |
-| `STATIC_DIR` | `src/web/static` | frontend assets, relative to the working dir |
-
-> **On `bypassPermissions`:** Claude Code runs headless (`-p`), so there is
-> nobody to answer a permission prompt. The default lets it edit files *and run
-> commands* unattended in the target repo — which is what it needs to install
-> dependencies and run your tests. Point `WORKSPACE_ROOT` at projects you are
-> happy to let it work in. Use `acceptEdits` to restrict it to file edits, but
-> expect it to fail on anything it needs to run.
-
-## How it is put together
-
+```json
+{
+  "kind": "feature",
+  "project_id": "PROJECT_UUID",
+  "title": "Add idempotency",
+  "description": "Reject duplicate request keys without changing existing responses."
+}
 ```
+
+## Architecture
+
+```text
+Project / ProjectSource
+        ↓
+WorkspaceProvider
+        ↓
+Temporary TaskWorkspace
+        ↓
+Repository inspection + technology profile
+        ↓
+TaskKind-specific workflow and agent prompts
+        ↓
+Specification + user approval
+        ↓
+Implementation + profile-aware verification
+        ↓
+Task result/diff + workspace cleanup
+```
+
+Core modules:
+
+```text
 src/
-  main.rs          the pipeline, top to bottom
-  cli.rs           --cli / --web / --topic / --help / --version
-  task.rs          Task state machine, TaskEvent, Emitter, TaskManager
-  web/
-    mod.rs         axum router and server
-    handlers.rs    the JSON API under /api
-    ui.rs          the HTML the browser renders, under /ui
-    pipeline.rs    runs a task in the background, parks at Gate 2
-    static/        index.html, style.css, vendored htmx
-  config.rs        .env into a Config (keys redacted from Debug)
-  api/
-    mod.rs         shared Message/Role + the retry policy
-    claude.rs      Anthropic Messages API — the Critic
-    gemini.rs      Gemini generateContent — the Proposer
-  debate.rs        the transcript, both model views, the round loop
-  spec.rs          draft the spec, check it, write SPEC.md
-  approve.rs       Gate 2
-  implementer.rs   spawn Claude Code in the target repo
-  ui.rs            colors and prompts
+  project.rs       repository-backed Project domain and store boundary
+  workspace.rs     isolated task workspace provider and result diff
+  inspection.rs    bounded metadata and instruction discovery
+  technology.rs    evidence-based technology profiles
+  workflow.rs      task-kind-specific agent instructions
+  verification.rs profile-aware command planning and execution
+  task.rs          task state, validation, history, and result model
+  debate.rs        proposer/critic collaboration
+  spec.rs          specification drafting and checking
+  implementer.rs   Claude Code process and streamed output
+  web/             axum API, pipeline, SSE, and production UI
 ```
 
-A few decisions worth knowing, with the reasoning kept in `PROGRESS.md`:
+Project/task stores remain in memory in this phase. The boundaries are designed for later external persistence and separate task execution; local container disk is not treated as durable application state.
 
-- **One shared transcript.** Each model's view is rebuilt from it per call, with
-  that model's own turns as the assistant. The same text is never stored twice,
-  so the two views cannot drift.
-- **The verdict is found by scanning upward** for `VERDICT: APPROVED`, ignoring
-  markdown decoration, so a trailing "Hope this helps!" cannot break a run. A
-  missing verdict counts as `NEEDS_WORK`, never as approval.
-- **Every review carries a one-line `REASON`**, shown next to the verdict each
-  round and again at the approval gate, so you never have to re-read a review to
-  learn what is blocking it. If the debate ends unapproved, the unresolved
-  objections are pushed into the spec's Open risks.
-- **The spec is drafted by the Proposer and checked by the Critic**, which
-  catches a proposal quietly dropping a concession it made under review.
-- **Retries** cover 429, 5xx and network failures across 5 attempts with
-  1s/2s/4s/8s backoff. A 400 or 401 fails immediately, because it will fail
-  identically forever. The budget is that large because Gemini returns 503
-  "high demand" in bursts and its 429 bodies ask for a ~9 second wait.
-- **API keys never reach the terminal.** `Config`'s `Debug` prints `<redacted>`,
-  and no error message includes request headers.
+## Current limitations
+
+- Only public GitHub repositories are supported; no OAuth or GitHub App authentication exists yet.
+- Projects and task history are lost when the process restarts.
+- The initial New Project output is a reviewable result, not a downloadable archive or pushed repository.
+- Workspaces use the server's temporary directory and are cleaned after execution.
+- Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
+- The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
 
 ## Development
 
 ```bash
-cargo test                  # unit tests, no network
-cargo test -- --ignored     # the live API calls; these cost tokens
-cargo fmt
-cargo clippy -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 ```
 
-The tests that hit real APIs are `#[ignore]`d on purpose, so a normal
-`cargo test` costs nothing. Everything else is checked against captured JSON
-response bodies.
+Normal tests do not call live AI or GitHub services. Live API checks remain ignored and cost tokens when explicitly enabled.

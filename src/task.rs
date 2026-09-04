@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
+use crate::project::ProjectId;
+use crate::technology::{ProjectProfile, TechStack};
+use crate::verification::VerificationResult;
+
 /// How many events we keep for a subscriber that is briefly behind.
 ///
 /// A browser reconnecting mid-debate should not miss turns. If a subscriber
@@ -28,6 +32,89 @@ pub const EVENT_BUFFER: usize = 256;
 
 /// Identifies one task. `Uuid` so the browser can hold it in a URL.
 pub type TaskId = Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    NewProject,
+    Feature,
+    BugFix,
+}
+
+impl TaskKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NewProject => "new project",
+            Self::Feature => "feature",
+            Self::BugFix => "bug fix",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTarget {
+    ReviewableResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRequest {
+    pub kind: TaskKind,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub technology: Option<TechStack>,
+    #[serde(default)]
+    pub output: Option<OutputTarget>,
+}
+
+impl TaskRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.title.trim().is_empty() {
+            return Err("title cannot be empty".into());
+        }
+        if self.description.trim().is_empty() {
+            return Err("description cannot be empty".into());
+        }
+        match self.kind {
+            TaskKind::NewProject => {
+                if self.project_id.is_some() {
+                    return Err("new_project must not reference an existing project".into());
+                }
+                if self.technology.is_none() {
+                    return Err("new_project requires a technology".into());
+                }
+                if self.output.is_none() {
+                    return Err("new_project requires output configuration".into());
+                }
+            }
+            TaskKind::Feature | TaskKind::BugFix => {
+                if self.project_id.is_none() {
+                    return Err(format!(
+                        "{} requires a registered project",
+                        self.kind.label()
+                    ));
+                }
+                if self.technology.is_some() || self.output.is_some() {
+                    return Err(format!(
+                        "{} uses the registered project's detected technology and output",
+                        self.kind.label()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub source_revision: Option<String>,
+    pub verification: Vec<VerificationResult>,
+    pub diff: String,
+}
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -80,13 +167,21 @@ impl TaskStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskEvent {
     /// The task moved to a new stage. Drives the pipeline timeline.
-    Status { status: TaskStatus },
+    Status {
+        status: TaskStatus,
+    },
 
     /// A debate round began.
-    RoundStarted { round: u32, of: u32 },
+    RoundStarted {
+        round: u32,
+        of: u32,
+    },
 
     /// The Proposer's full turn.
-    Proposal { round: u32, text: String },
+    Proposal {
+        round: u32,
+        text: String,
+    },
 
     /// The Critic's full turn, with its verdict pulled out so the UI can
     /// highlight it without re-parsing the prose.
@@ -99,16 +194,38 @@ pub enum TaskEvent {
     },
 
     /// SPEC.md is written. `markdown` is the document, `path` where it landed.
-    Spec { markdown: String, path: String },
+    Spec {
+        markdown: String,
+        path: String,
+    },
+
+    Inspection {
+        profile: ProjectProfile,
+        source_revision: Option<String>,
+    },
+
+    Verification {
+        result: VerificationResult,
+    },
+
+    Result {
+        result: TaskResult,
+    },
 
     /// A chunk of Claude Code's output while it builds.
-    Build { chunk: String },
+    Build {
+        chunk: String,
+    },
 
     /// Progress chatter — the grey lines v1 printed via `ui::system`.
-    Notice { message: String },
+    Notice {
+        message: String,
+    },
 
     /// Something the user should notice but that did not stop the run.
-    Warning { message: String },
+    Warning {
+        message: String,
+    },
 
     /// The run ended. `error` is set only when `status` is `Failed`.
     Finished {
@@ -142,8 +259,12 @@ pub struct Task {
     pub id: TaskId,
     pub title: String,
     pub description: String,
-    /// Project folder name inside WORKSPACE_ROOT.
-    pub project: String,
+    pub kind: TaskKind,
+    pub project_id: Option<ProjectId>,
+    pub technology: Option<TechStack>,
+    pub output: Option<OutputTarget>,
+    pub profile: Option<ProjectProfile>,
+    pub result: Option<TaskResult>,
     pub status: TaskStatus,
     /// Every event so far, so a browser opening late sees the whole debate.
     pub history: Vec<TaskEvent>,
@@ -154,22 +275,48 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         title: impl Into<String>,
         description: impl Into<String>,
-        project: impl Into<String>,
+        _legacy_project: impl Into<String>,
     ) -> Self {
-        Task {
+        Self {
             id: Uuid::new_v4(),
             title: title.into(),
             description: description.into(),
-            project: project.into(),
+            kind: TaskKind::NewProject,
+            project_id: None,
+            technology: Some(TechStack::Rust),
+            output: Some(OutputTarget::ReviewableResult),
+            profile: None,
+            result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
             spec: None,
             error: None,
             decision: None,
         }
+    }
+
+    pub fn from_request(request: TaskRequest) -> Result<Self, String> {
+        request.validate()?;
+        Ok(Task {
+            id: Uuid::new_v4(),
+            title: request.title.trim().to_string(),
+            description: request.description.trim().to_string(),
+            kind: request.kind,
+            project_id: request.project_id,
+            technology: request.technology,
+            output: request.output,
+            profile: None,
+            result: None,
+            status: TaskStatus::Created,
+            history: Vec::new(),
+            spec: None,
+            error: None,
+            decision: None,
+        })
     }
 
     /// What the models are actually asked about (DP-8).
@@ -189,6 +336,8 @@ impl Task {
         match event {
             TaskEvent::Status { status } => self.status = *status,
             TaskEvent::Spec { markdown, .. } => self.spec = Some(markdown.clone()),
+            TaskEvent::Inspection { profile, .. } => self.profile = Some(profile.clone()),
+            TaskEvent::Result { result } => self.result = Some(result.clone()),
             TaskEvent::Finished { status, error } => {
                 self.status = *status;
                 self.error = error.clone();
@@ -320,14 +469,37 @@ impl TaskManager {
         }
     }
 
-    /// Register a new task and return it.
+    /// Legacy helper retained for internal v2 tests and CLI-era call sites.
+    /// Production handlers use `create_from_request` and never accept paths.
     pub fn create(
         &self,
         title: impl Into<String>,
         description: impl Into<String>,
-        project: impl Into<String>,
+        _project: impl Into<String>,
     ) -> Task {
-        let task = Task::new(title, description, project);
+        let description = description.into();
+        let task = Task::from_request(TaskRequest {
+            kind: TaskKind::NewProject,
+            title: title.into(),
+            description: if description.trim().is_empty() {
+                "Legacy task".into()
+            } else {
+                description
+            },
+            project_id: None,
+            technology: Some(TechStack::Rust),
+            output: Some(OutputTarget::ReviewableResult),
+        })
+        .expect("legacy task input is valid");
+        self.insert(task)
+    }
+
+    pub fn create_from_request(&self, request: TaskRequest) -> Result<Task, String> {
+        let task = Task::from_request(request)?;
+        Ok(self.insert(task))
+    }
+
+    fn insert(&self, task: Task) -> Task {
         let mut tasks = self
             .inner
             .tasks
@@ -551,7 +723,8 @@ mod tests {
 
         let found = manager.get(task.id).expect("task should be stored");
         assert_eq!(found.title, "Renamer");
-        assert_eq!(found.project, "renamer");
+        assert_eq!(found.kind, TaskKind::NewProject);
+        assert!(found.project_id.is_none());
         assert_eq!(manager.len(), 1);
         assert!(manager.get(Uuid::new_v4()).is_none());
     }
@@ -704,5 +877,65 @@ mod tests {
 
         assert!(manager.get(task.id).is_some());
         assert_eq!(manager.list().len(), 1);
+    }
+
+    #[test]
+    fn validates_new_project_inputs() {
+        let valid = TaskRequest {
+            kind: TaskKind::NewProject,
+            title: "Service".into(),
+            description: "Build a service".into(),
+            project_id: None,
+            technology: Some(TechStack::Python),
+            output: Some(OutputTarget::ReviewableResult),
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut missing_stack = valid.clone();
+        missing_stack.technology = None;
+        assert!(missing_stack.validate().unwrap_err().contains("technology"));
+        let mut with_project = valid;
+        with_project.project_id = Some(Uuid::new_v4());
+        assert!(with_project.validate().is_err());
+    }
+
+    #[test]
+    fn feature_and_bug_fix_require_only_a_project() {
+        for kind in [TaskKind::Feature, TaskKind::BugFix] {
+            let mut request = TaskRequest {
+                kind,
+                title: "Change".into(),
+                description: "Make the requested change".into(),
+                project_id: Some(Uuid::new_v4()),
+                technology: None,
+                output: None,
+            };
+            assert!(request.validate().is_ok());
+            request.project_id = None;
+            assert!(
+                request
+                    .validate()
+                    .unwrap_err()
+                    .contains("registered project")
+            );
+        }
+    }
+
+    #[test]
+    fn all_task_kinds_require_title_and_description() {
+        let request = TaskRequest {
+            kind: TaskKind::NewProject,
+            title: "".into(),
+            description: "".into(),
+            project_id: None,
+            technology: Some(TechStack::Custom),
+            output: Some(OutputTarget::ReviewableResult),
+        };
+        assert!(request.validate().unwrap_err().contains("title"));
+        let request = TaskRequest {
+            title: "Title".into(),
+            ..request
+        };
+        assert!(request.validate().unwrap_err().contains("description"));
     }
 }

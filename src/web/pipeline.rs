@@ -1,29 +1,30 @@
-//! Runs the v1 pipeline in the background on behalf of a web task.
-//!
-//! Since Phase 9 the stages themselves publish their turn-by-turn events: this
-//! module only drives the sequence, owns the status transitions, and handles
-//! Gate 2. The stages still print to the terminal as well, so a `--web` run
-//! shows the debate in the server console too.
+//! Repository-backed orchestration in a disposable task workspace.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::api::claude::ClaudeClient;
 use crate::api::gemini::GeminiClient;
+use crate::inspection::inspect;
+use crate::project::Project;
 use crate::spec;
-use crate::task::{Emitter, TaskEvent, TaskId, TaskStatus};
+use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskResult, TaskStatus};
+use crate::technology::ProjectProfile;
 use crate::web::AppState;
+use crate::workspace::{TaskWorkspace, WorkspaceRequest, diff_result};
 
-/// Start the pipeline for `id` and return immediately.
-pub fn spawn(state: AppState, id: TaskId, repo: PathBuf) {
+pub fn spawn(state: AppState, id: TaskId) {
     tokio::spawn(async move {
         let emitter = state.manager.emitter(id);
+        let mut workspace = None;
+        let result = run(&state, id, &emitter, &mut workspace).await;
 
-        // One failure path for every stage: whatever went wrong, the task ends
-        // Failed with the message attached, instead of hanging forever in
-        // whatever state it happened to be in.
-        if let Err(error) = run(&state, id, &repo, &emitter).await {
+        if let Some(workspace) = workspace
+            && let Err(error) = state.workspaces.cleanup(&workspace)
+        {
+            emitter.warn(format!("workspace cleanup failed: {error}"));
+        }
+
+        if let Err(error) = result {
             emitter.emit(TaskEvent::Finished {
                 status: TaskStatus::Failed,
                 error: Some(format!("{error:#}")),
@@ -32,25 +33,75 @@ pub fn spawn(state: AppState, id: TaskId, repo: PathBuf) {
     });
 }
 
-async fn run(state: &AppState, id: TaskId, repo: &Path, emitter: &Emitter) -> Result<()> {
-    let config = &state.config;
-
+async fn run(
+    state: &AppState,
+    id: TaskId,
+    emitter: &Emitter,
+    workspace: &mut Option<TaskWorkspace>,
+) -> Result<()> {
     let task = match state.manager.get(id) {
         Some(task) => task,
-        // Only possible if the task was removed while starting up.
         None => return Ok(()),
     };
-    let topic = task.topic();
 
-    let proposer = GeminiClient::new(config)?;
-    let critic = ClaudeClient::new(config)?;
+    let project = match task.project_id {
+        Some(project_id) => Some(
+            state
+                .projects
+                .get(project_id)
+                .ok_or_else(|| anyhow::anyhow!("registered project no longer exists"))?,
+        ),
+        None => None,
+    };
 
-    // --- Gate 1: the debate ------------------------------------------------
+    let (profile, repository_context) = match task.kind {
+        TaskKind::NewProject => {
+            let technology = task
+                .technology
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("new project has no selected technology"))?;
+            (
+                ProjectProfile::selected(technology),
+                "New empty project".into(),
+            )
+        }
+        TaskKind::Feature | TaskKind::BugFix => {
+            let project = project
+                .as_ref()
+                .expect("validated existing task has project");
+            let prepared = prepare_existing(state, id, project)?;
+            let inspection = inspect(&prepared.path)?;
+            let profile = inspection.profile.clone();
+            state.projects.set_profile(project.id, profile.clone());
+            let context = inspection.prompt_context();
+            emitter.emit(TaskEvent::Inspection {
+                profile: profile.clone(),
+                source_revision: prepared.revision.clone(),
+            });
+            *workspace = Some(prepared);
+            (profile, context)
+        }
+    };
+
+    if task.kind == TaskKind::NewProject {
+        emitter.emit(TaskEvent::Inspection {
+            profile: profile.clone(),
+            source_revision: None,
+        });
+    }
+
+    let topic = format!(
+        "{}\n\n{}",
+        task.topic(),
+        crate::workflow::design_context(task.kind, &profile, &repository_context)
+    );
+    let proposer = GeminiClient::new(&state.config)?;
+    let critic = ClaudeClient::new(&state.config)?;
+
     emitter.status(TaskStatus::Debating);
     let outcome =
-        crate::debate::run(&proposer, &critic, &topic, config.max_rounds, emitter).await?;
+        crate::debate::run(&proposer, &critic, &topic, state.config.max_rounds, emitter).await?;
 
-    // --- The spec ----------------------------------------------------------
     emitter.status(TaskStatus::GeneratingSpec);
     let document = spec::build(
         &proposer,
@@ -60,21 +111,17 @@ async fn run(state: &AppState, id: TaskId, repo: &Path, emitter: &Emitter) -> Re
         emitter,
     )
     .await?;
-    let path = spec::write_to(repo, &document)?;
     emitter.emit(TaskEvent::Spec {
         markdown: document,
-        path: path.display().to_string(),
+        path: spec::SPEC_FILENAME.into(),
     });
 
-    // --- Gate 2: park until a human answers (DP-11) ------------------------
     emitter.status(TaskStatus::WaitingForApproval);
     let Some(decision) = state.manager.await_decision(id).await else {
-        // The task disappeared; nothing left to report it to.
         return Ok(());
     };
-
     if !decision.approve {
-        emitter.notice("rejected — SPEC.md is on disk if you want to edit it and re-run");
+        emitter.notice("rejected; no repository changes were published");
         emitter.emit(TaskEvent::Finished {
             status: TaskStatus::Rejected,
             error: None,
@@ -82,19 +129,58 @@ async fn run(state: &AppState, id: TaskId, repo: &Path, emitter: &Emitter) -> Re
         return Ok(());
     }
 
-    // An edited spec replaces the generated one before the build (DP-10).
-    if let Some(edited) = decision.spec {
-        spec::write_to(repo, &edited)?;
-        emitter.notice("using your edited SPEC.md");
+    if workspace.is_none() {
+        *workspace = Some(state.workspaces.prepare(WorkspaceRequest {
+            task_id: id,
+            source: None,
+            revision: None,
+        })?);
+    }
+    let workspace_ref = workspace.as_ref().expect("workspace was prepared");
+    let approved_spec = decision
+        .spec
+        .or_else(|| state.manager.get(id).and_then(|task| task.spec))
+        .expect("generated specification is stored");
+    spec::write_to(&workspace_ref.path, &approved_spec)?;
+
+    emitter.status(TaskStatus::Implementing);
+    let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
+    crate::implementer::run_with_prompt(&state.config, &workspace_ref.path, emitter, &prompt)
+        .await?;
+
+    let commands = crate::verification::plan(&profile, &workspace_ref.path);
+    if commands.is_empty() {
+        emitter.warn("no automatic verification commands were detected");
+    }
+    let verification = crate::verification::run(&commands, &workspace_ref.path).await?;
+    for result in &verification {
+        emitter.emit(TaskEvent::Verification {
+            result: result.clone(),
+        });
     }
 
-    // --- The build ---------------------------------------------------------
-    emitter.status(TaskStatus::Implementing);
-    crate::implementer::run(config, repo, emitter).await?;
+    let failed = verification.iter().any(|result| !result.success);
+    let result = TaskResult {
+        source_revision: workspace_ref.revision.clone(),
+        verification,
+        diff: diff_result(&workspace_ref.path)?,
+    };
+    emitter.emit(TaskEvent::Result { result });
+    if failed {
+        bail!("one or more verification commands failed");
+    }
 
     emitter.emit(TaskEvent::Finished {
         status: TaskStatus::Completed,
         error: None,
     });
     Ok(())
+}
+
+fn prepare_existing(state: &AppState, id: TaskId, project: &Project) -> Result<TaskWorkspace> {
+    state.workspaces.prepare(WorkspaceRequest {
+        task_id: id,
+        source: Some(&project.source),
+        revision: Some(&project.default_branch),
+    })
 }

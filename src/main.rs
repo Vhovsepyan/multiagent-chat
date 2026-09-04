@@ -10,11 +10,17 @@ mod cli;
 mod config;
 mod debate;
 mod implementer;
+mod inspection;
+mod project;
 mod spec;
 mod target;
 mod task;
+mod technology;
 mod ui;
+mod verification;
 mod web;
+mod workflow;
+mod workspace;
 
 use anyhow::Result;
 
@@ -46,7 +52,9 @@ async fn main() -> Result<()> {
             config.gemini_model, config.critic_model, config.max_rounds
         ));
     }
-    ui::system(&format!("workspace: {}", config.workspace_root.display()));
+    if let Some(root) = &config.workspace_root {
+        ui::system(&format!("legacy CLI workspace: {}", root.display()));
+    }
     println!();
 
     // The CLI has no web watchers, so every stage gets an emitter wired to

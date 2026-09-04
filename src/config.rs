@@ -19,7 +19,9 @@ pub struct Config {
     pub anthropic_api_key: String,
     /// Folder that holds all of the user's projects. The repo for one run is
     /// chosen inside this folder at runtime — see `target.rs`.
-    pub workspace_root: PathBuf,
+    /// Optional compatibility setting for the original terminal workflow.
+    /// Production web tasks use repository-backed temporary workspaces.
+    pub workspace_root: Option<PathBuf>,
     pub max_rounds: u32,
     pub gemini_model: String,
     pub critic_model: String,
@@ -60,11 +62,16 @@ impl Config {
             }
         }
 
-        let workspace_root = PathBuf::from(required("WORKSPACE_ROOT")?);
-        if !workspace_root.is_dir() {
+        let workspace_root = env::var("WORKSPACE_ROOT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        if let Some(path) = &workspace_root
+            && !path.is_dir()
+        {
             bail!(
                 "WORKSPACE_ROOT does not point at an existing directory: {}",
-                workspace_root.display()
+                path.display()
             );
         }
 

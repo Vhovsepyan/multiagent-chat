@@ -12,8 +12,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::target;
-use crate::task::{Decision, Task, TaskId, TaskStatus};
+use crate::project::{Project, ProjectSource};
+use crate::task::{Decision, Task, TaskId, TaskRequest, TaskStatus};
 use crate::web::{AppState, pipeline};
 
 // ---------------------------------------------------------------------------
@@ -99,22 +99,47 @@ pub async fn health() -> Json<Health> {
 
 #[derive(Serialize)]
 pub struct ProjectList {
-    pub projects: Vec<String>,
+    pub projects: Vec<Project>,
 }
 
-/// `GET /api/projects` — the folders inside WORKSPACE_ROOT.
+/// `GET /api/projects` — registered repository-backed Projects.
 pub async fn list_projects(State(state): State<AppState>) -> ApiResult<Json<ProjectList>> {
-    let projects =
-        target::list_projects(&state.config).map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(ProjectList { projects }))
+    Ok(Json(ProjectList {
+        projects: state.projects.list(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterProject {
+    pub name: String,
+    pub repository: String,
+    #[serde(default = "default_branch")]
+    pub default_branch: String,
+}
+
+fn default_branch() -> String {
+    "main".into()
+}
+
+pub async fn register_project(
+    State(state): State<AppState>,
+    Json(body): Json<RegisterProject>,
+) -> ApiResult<(StatusCode, Json<Project>)> {
+    let source = ProjectSource::github(&body.repository)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let project = Project::new(&body.name, source, &body.default_branch)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let project = state
+        .projects
+        .register(project)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok((StatusCode::CREATED, Json(project)))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTask {
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    pub project: String,
+    #[serde(flatten)]
+    pub request: TaskRequest,
 }
 
 /// `POST /api/tasks` — create a task and start the pipeline in the background.
@@ -125,25 +150,19 @@ pub async fn create_task(
     State(state): State<AppState>,
     Json(body): Json<CreateTask>,
 ) -> ApiResult<(StatusCode, Json<Task>)> {
-    if body.title.trim().is_empty() {
-        return Err(ApiError::bad_request("title cannot be empty"));
+    body.request.validate().map_err(ApiError::bad_request)?;
+    if let Some(project_id) = body.request.project_id
+        && state.projects.get(project_id).is_none()
+    {
+        return Err(ApiError::bad_request("project is not registered"));
     }
-    if body.project.trim().is_empty() {
-        return Err(ApiError::bad_request("project cannot be empty"));
-    }
 
-    // Resolve the project up front so a bad name fails the request, rather than
-    // failing invisibly inside the background task a moment later.
-    let repo = target::ensure_project(&state.config, &body.project)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let task = state
+        .manager
+        .create_from_request(body.request)
+        .map_err(ApiError::bad_request)?;
 
-    let task = state.manager.create(
-        body.title.trim(),
-        body.description.trim(),
-        body.project.trim(),
-    );
-
-    pipeline::spawn(state.clone(), task.id, repo);
+    pipeline::spawn(state.clone(), task.id);
 
     Ok((StatusCode::CREATED, Json(task)))
 }

@@ -10,8 +10,10 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::config::Config;
+use crate::project::{Project, ProjectSource};
 use crate::task::{Decision, TaskEvent, TaskStatus};
 use crate::web::{AppState, router};
+use crate::workspace::LocalWorkspaceProvider;
 
 /// A config pointing at a throwaway workspace, with fake keys.
 ///
@@ -25,7 +27,7 @@ fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
     let config = Config {
         gemini_api_key: "test".into(),
         anthropic_api_key: "test".into(),
-        workspace_root: root.clone(),
+        workspace_root: Some(root.clone()),
         max_rounds: 1,
         gemini_model: "test-model".into(),
         critic_model: "test-model".into(),
@@ -33,7 +35,11 @@ fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         permission_mode: "acceptEdits".into(),
         port: 0,
     };
-    (AppState::new(config), root)
+    let provider = LocalWorkspaceProvider::new(root.join("task-workspaces")).unwrap();
+    (
+        AppState::with_workspace(config, std::sync::Arc::new(provider)),
+        root,
+    )
 }
 
 async fn body_json(response: axum::response::Response) -> Value {
@@ -66,32 +72,84 @@ async fn health_reports_ok() {
 }
 
 #[tokio::test]
-async fn projects_lists_workspace_directories() {
+async fn projects_lists_registered_repositories_not_workspace_directories() {
     let (state, root) = test_state("projects");
     std::fs::create_dir_all(root.join("alpha")).unwrap();
-    std::fs::create_dir_all(root.join("beta")).unwrap();
-    // Hidden folders and loose files are not projects.
-    std::fs::create_dir_all(root.join(".git")).unwrap();
-    std::fs::write(root.join("notes.txt"), "x").unwrap();
+    let project = Project::new(
+        "Beta",
+        ProjectSource::github("openai/beta").unwrap(),
+        "main",
+    )
+    .unwrap();
+    state.projects.register(project).unwrap();
 
     let response = router(state).oneshot(get("/api/projects")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let projects = body_json(response).await["projects"].clone();
-    assert_eq!(projects, json!(["alpha", "beta"]));
+    assert_eq!(projects.as_array().unwrap().len(), 1);
+    assert_eq!(projects[0]["name"], "Beta");
+    assert_eq!(projects[0]["source"]["repository"], "openai/beta");
 
     std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]
-async fn creating_a_task_returns_201_and_makes_the_project() {
+async fn projects_can_be_registered_through_the_api() {
+    let (state, root) = test_state("register");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/projects",
+            json!({"name": "Engine", "repository": "https://github.com/openai/engine.git", "default_branch": "main"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(body["source"]["provider"], "github");
+    assert_eq!(body["source"]["repository"], "openai/engine");
+    assert_eq!(state.projects.list().len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn feature_and_bug_fix_validate_registered_projects() {
+    for kind in ["feature", "bug_fix"] {
+        let (state, root) = test_state(kind);
+        let unknown = uuid::Uuid::new_v4();
+        let response = router(state)
+            .oneshot(post(
+                "/api/tasks",
+                json!({"kind": kind, "title": "Change", "description": "Do it", "project_id": unknown}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("registered")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[tokio::test]
+async fn creating_a_new_project_task_returns_typed_task_without_user_path() {
     let (state, root) = test_state("create");
     let app = router(state);
 
     let response = app
         .oneshot(post(
             "/api/tasks",
-            json!({"title": "Renamer", "description": "search and replace", "project": "renamer"}),
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result"
+            }),
         ))
         .await
         .unwrap();
@@ -99,9 +157,11 @@ async fn creating_a_task_returns_201_and_makes_the_project() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let task = body_json(response).await;
     assert_eq!(task["title"], "Renamer");
-    assert_eq!(task["project"], "renamer");
+    assert_eq!(task["kind"], "new_project");
+    assert_eq!(task["technology"], "rust");
+    assert!(task["project_id"].is_null());
     assert!(task["id"].is_string());
-    assert!(root.join("renamer").is_dir(), "project should be created");
+    assert!(!root.join("renamer").exists());
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -113,7 +173,7 @@ async fn creating_a_task_rejects_an_empty_title() {
     let response = router(state)
         .oneshot(post(
             "/api/tasks",
-            json!({"title": "   ", "description": "d", "project": "p"}),
+            json!({"kind": "new_project", "title": "   ", "description": "d", "technology": "rust", "output": "reviewable_result"}),
         ))
         .await
         .unwrap();
@@ -128,21 +188,19 @@ async fn creating_a_task_rejects_an_empty_title() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// A project name must not be able to climb out of WORKSPACE_ROOT.
 #[tokio::test]
-async fn creating_a_task_rejects_a_path_traversal_project() {
-    let (state, root) = test_state("traversal");
+async fn registering_a_project_rejects_non_github_paths() {
+    let (state, root) = test_state("source-validation");
 
     let response = router(state)
         .oneshot(post(
-            "/api/tasks",
-            json!({"title": "t", "description": "d", "project": "../escape"}),
+            "/api/projects",
+            json!({"name": "escape", "repository": "C:/private/repo", "default_branch": "main"}),
         ))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(!root.parent().unwrap().join("escape").exists());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -463,6 +521,9 @@ async fn the_index_page_is_served_from_disk() {
         html.contains("htmx.min.js"),
         "htmx should be vendored locally"
     );
+    assert!(html.contains("GitHub repository"));
+    assert!(!html.contains("WORKSPACE_ROOT"));
+    assert!(!html.contains("new_project\" name=\"new_project"));
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -480,13 +541,20 @@ async fn the_stylesheet_is_served() {
 #[tokio::test]
 async fn the_project_picker_lists_projects() {
     let (state, root) = test_state("ui-projects");
-    std::fs::create_dir_all(root.join("alpha")).unwrap();
+    let project = Project::new(
+        "Alpha",
+        ProjectSource::github("openai/alpha").unwrap(),
+        "main",
+    )
+    .unwrap();
+    let id = project.id;
+    state.projects.register(project).unwrap();
 
     let response = router(state).oneshot(get("/ui/projects")).await.unwrap();
     let html = body_text(response).await;
 
     assert!(
-        html.contains(r#"<option value="alpha">alpha</option>"#),
+        html.contains(&format!(r#"<option value="{id}">Alpha</option>"#)),
         "got: {html}"
     );
     std::fs::remove_dir_all(&root).ok();
@@ -557,7 +625,7 @@ async fn creating_from_the_form_redirects_to_the_task() {
     let response = router(state)
         .oneshot(post_form(
             "/ui/tasks",
-            "title=Renamer&description=d&project=&new_project=renamer",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result",
         ))
         .await
         .unwrap();
@@ -570,7 +638,7 @@ async fn creating_from_the_form_redirects_to_the_task() {
         .to_str()
         .unwrap();
     assert!(redirect.starts_with("/task/"), "got: {redirect}");
-    assert!(root.join("renamer").is_dir());
+    assert!(!root.join("renamer").exists());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -580,13 +648,13 @@ async fn the_form_reports_a_missing_project() {
     let response = router(state)
         .oneshot(post_form(
             "/ui/tasks",
-            "title=T&description=&project=&new_project=",
+            "kind=feature&title=T&description=Change+it",
         ))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(body_text(response).await.contains("Pick a project"));
+    assert!(body_text(response).await.contains("registered project"));
     std::fs::remove_dir_all(&root).ok();
 }
 

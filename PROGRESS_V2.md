@@ -1,21 +1,43 @@
 # Progress
 
 ## Current status
-v2 IS DONE. All four phases (7-10) are complete and proven live: a task was
-created through the browser form, streamed its debate and spec as HTML over SSE,
-was approved through the gate panel, streamed 21 build chunks, and Claude Code
-produced a working `greet.py`. `cargo run` now serves the UI; `--cli` runs the
-v1 terminal pipeline. 106 tests, clippy clean.
+The repository-backed task-platform phase is implemented. The production web
+model now has registered GitHub Projects, New Project / Feature / Bug Fix task
+kinds, isolated disposable task workspaces, bounded repository inspection,
+evidence-based technology profiles, task-specific prompts, stack-aware
+verification, and reviewable task results. The original v2 state machine, SSE
+streaming, editable approval gate, and Claude Code implementation stage remain.
+
+The legacy CLI remains available behind `--cli`; only that compatibility path
+uses optional `WORKSPACE_ROOT`. Production web forms and APIs do not accept
+arbitrary server filesystem paths.
 
 ## Next steps
-- Nothing outstanding for v2. Possible polish if it gets real use:
-  render the spec as Markdown rather than preformatted text; a task list page
-  (only the create page and one task page exist); persistence, since the task
-  registry is in memory and a restart loses history.
-- Re-package the distributable: the v0.1.0 zip ships a bare .exe, which is no
-  longer enough now that assets come off disk (DP-13). See Distribution.
+- Add durable Project/task/artifact persistence behind the new store boundaries.
+- Add secure GitHub authentication and a durable publication/download flow as
+  separate production tasks.
+- Split task execution from the web/API process before cloud deployment.
+- Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-15 (2026-09-04): A Project is repository identity and metadata, never a
+  persistent workspace path. GitHub `owner/repository` is normalized at the
+  domain boundary; provider-specific acquisition stays behind ProjectSource.
+- DP-16 (2026-09-04): Every web task gets a UUID-named, provider-owned temporary
+  workspace. Existing repositories are shallow-cloned at their configured
+  branch; new projects are initialized only after approval. Cleanup is explicit
+  and restricted to the managed root.
+- DP-17 (2026-09-04): TaskKind and its validation matrix are domain data.
+  Existing-project tasks require a registered Project; New Project requires a
+  technology and output configuration. Invalid combinations fail before agent
+  calls or workspace preparation.
+- DP-18 (2026-09-04): Technology detection, workflow prompts, repository
+  inspection, and verification are separate modules. Verification commands are
+  selected from structured profiles and repository wrappers/scripts rather than
+  generated freely by an agent.
+- DP-19 (2026-09-04): Project/task storage stays in memory for this phase, but
+  ProjectStore and WorkspaceProvider are explicit replacement boundaries for
+  durable persistence and separate cloud task execution.
 - DP-1..DP-6: (Retained from v1 CLI milestone).
 - DP-7 (2026-08-21): Adopted a unified `Task` state machine (`Created` -> `Debating` -> `SpecReady` -> `WaitingForApproval` -> `Implementing` -> `Completed` / `Failed`) driven by background Tokio tasks communicating via `tokio::sync::broadcast`.
 - DP-8 (2026-08-21): UI separation: `Title` (concise identifier) and `Description` (detailed context) split at input, concatenated cleanly for agent prompt ingestion. Implemented as `Task::topic()`, which falls back to the title alone when the description is blank.
