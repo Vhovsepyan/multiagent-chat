@@ -7,7 +7,7 @@ use crate::api::gemini::GeminiClient;
 use crate::inspection::{InspectionRequest, inspect};
 use crate::project::Project;
 use crate::spec;
-use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskResult, TaskStatus};
+use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus};
 use crate::technology::ProjectProfile;
 use crate::web::AppState;
 use crate::workspace::{TaskWorkspace, WorkspaceRequest, diff_result};
@@ -144,11 +144,7 @@ async fn run(
         })?);
     }
     let workspace_ref = workspace.as_ref().expect("workspace was prepared");
-    let approved_spec = decision
-        .spec
-        .or_else(|| state.manager.get(id).and_then(|task| task.spec))
-        .expect("generated specification is stored");
-    spec::write_to(&workspace_ref.path, &approved_spec)?;
+    write_approved_spec(&state.manager, id, &workspace_ref.path)?;
 
     emitter.status(TaskStatus::Implementing);
     let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
@@ -190,4 +186,46 @@ fn prepare_existing(state: &AppState, id: TaskId, project: &Project) -> Result<T
         source: Some(&project.source),
         revision: Some(&project.default_branch),
     })
+}
+
+fn write_approved_spec(manager: &TaskManager, id: TaskId, root: &std::path::Path) -> Result<()> {
+    let approved_spec = manager
+        .approved_spec(id)
+        .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
+    spec::write_to(root, &approved_spec)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::{Decision, TaskEvent};
+    use uuid::Uuid;
+
+    #[test]
+    fn implementer_spec_file_matches_authoritative_approved_text() {
+        let manager = TaskManager::new();
+        let task = manager.create("task", "description", "legacy");
+        manager.emitter(task.id).emit(TaskEvent::Spec {
+            markdown: "generated".into(),
+            path: spec::SPEC_FILENAME.into(),
+        });
+        manager.decide(
+            task.id,
+            Decision {
+                approve: true,
+                spec: Some("edited and approved".into()),
+            },
+        );
+        let root = std::env::temp_dir().join(format!("mac-approved-spec-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_approved_spec(&manager, task.id, &root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(spec::SPEC_FILENAME)).unwrap(),
+            manager.approved_spec(task.id).unwrap()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 }

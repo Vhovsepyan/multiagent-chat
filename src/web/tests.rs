@@ -270,6 +270,10 @@ async fn approving_a_task_that_is_not_waiting_is_409() {
 async fn approving_at_the_gate_records_the_decision() {
     let (state, root) = test_state("approve");
     let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "generated spec".into(),
+        path: "SPEC.md".into(),
+    });
     state
         .manager
         .emitter(task.id)
@@ -286,7 +290,8 @@ async fn approving_at_the_gate_records_the_decision() {
     assert_eq!(response.status(), StatusCode::OK);
     let decision = state.manager.decision(task.id).expect("decision recorded");
     assert!(decision.approve);
-    assert!(decision.spec.is_none());
+    assert_eq!(decision.spec.as_deref(), Some("generated spec"));
+    assert_eq!(state.manager.get(task.id).unwrap().spec, decision.spec);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -295,6 +300,10 @@ async fn approving_at_the_gate_records_the_decision() {
 async fn an_edited_spec_is_carried_on_the_approval() {
     let (state, root) = test_state("edited");
     let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "original".into(),
+        path: "SPEC.md".into(),
+    });
     state
         .manager
         .emitter(task.id)
@@ -311,6 +320,7 @@ async fn an_edited_spec_is_carried_on_the_approval() {
     assert_eq!(response.status(), StatusCode::OK);
     let decision = state.manager.decision(task.id).unwrap();
     assert_eq!(decision.spec.as_deref(), Some("## Problem\nedited by hand"));
+    assert_eq!(state.manager.get(task.id).unwrap().spec, decision.spec);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -340,6 +350,10 @@ async fn an_empty_edited_spec_is_rejected() {
 async fn rejecting_is_recorded_too() {
     let (state, root) = test_state("reject");
     let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "generated spec".into(),
+        path: "SPEC.md".into(),
+    });
     state
         .manager
         .emitter(task.id)
@@ -355,6 +369,10 @@ async fn rejecting_is_recorded_too() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!state.manager.decision(task.id).unwrap().approve);
+    assert_eq!(
+        state.manager.get(task.id).unwrap().spec.as_deref(),
+        Some("generated spec")
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -663,6 +681,10 @@ async fn the_form_reports_a_missing_project() {
 async fn approving_from_the_page_carries_the_edited_spec() {
     let (state, root) = test_state("ui-approve");
     let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "original".into(),
+        path: "SPEC.md".into(),
+    });
     state
         .manager
         .emitter(task.id)
@@ -677,9 +699,13 @@ async fn approving_from_the_page_carries_the_edited_spec() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("## Problem\nedited"));
+    assert!(!body.contains("original"));
     let decision = state.manager.decision(task.id).unwrap();
     assert!(decision.approve);
     assert_eq!(decision.spec.as_deref(), Some("## Problem\nedited"));
+    assert_eq!(state.manager.get(task.id).unwrap().spec, decision.spec);
     std::fs::remove_dir_all(&root).ok();
 }
 

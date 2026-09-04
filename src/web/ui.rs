@@ -126,6 +126,13 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
             ))
         }
         TaskEvent::Spec { markdown, .. } => Some(("spec", gate_html(id, markdown))),
+        TaskEvent::SpecApproved { markdown } => Some((
+            "spec",
+            format!(
+                r#"<div class="card"><h2 class="section">SPEC.md</h2><div class="spec-body">{}</div></div>"#,
+                esc(markdown)
+            ),
+        )),
         TaskEvent::Inspection {
             profile,
             source_revision,

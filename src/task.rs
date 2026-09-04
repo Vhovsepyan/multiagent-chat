@@ -199,6 +199,12 @@ pub enum TaskEvent {
         path: String,
     },
 
+    /// The exact specification accepted at Gate 2. This becomes the task's
+    /// authoritative specification for the UI, implementation, and replay.
+    SpecApproved {
+        markdown: String,
+    },
+
     Inspection {
         profile: ProjectProfile,
         source_revision: Option<String>,
@@ -335,7 +341,9 @@ impl Task {
     pub fn apply(&mut self, event: &TaskEvent) {
         match event {
             TaskEvent::Status { status } => self.status = *status,
-            TaskEvent::Spec { markdown, .. } => self.spec = Some(markdown.clone()),
+            TaskEvent::Spec { markdown, .. } | TaskEvent::SpecApproved { markdown } => {
+                self.spec = Some(markdown.clone());
+            }
             TaskEvent::Inspection { profile, .. } => self.profile = Some(profile.clone()),
             TaskEvent::Result { result } => self.result = Some(result.clone()),
             TaskEvent::Finished { status, error } => {
@@ -552,19 +560,36 @@ impl TaskManager {
 
     /// Record the human's Gate 2 answer and wake the waiting pipeline (DP-11).
     ///
-    /// Returns `false` if there is no such task. Answering twice is harmless:
-    /// the second call overwrites, and the pipeline has already moved on.
-    pub fn decide(&self, id: TaskId, decision: Decision) -> bool {
-        {
+    /// Returns `false` if there is no such task. On approval, the generated or
+    /// edited text is recorded through `SpecApproved` before the gate wakes.
+    pub fn decide(&self, id: TaskId, mut decision: Decision) -> bool {
+        let approved_event = {
             let mut tasks = self
                 .inner
                 .tasks
                 .write()
                 .expect("task registry lock poisoned");
             match tasks.get_mut(&id) {
-                Some(task) => task.decision = Some(decision),
+                Some(task) => {
+                    let event = if decision.approve {
+                        decision.spec = decision.spec.or_else(|| task.spec.clone());
+                        decision.spec.clone().map(|markdown| {
+                            let event = TaskEvent::SpecApproved { markdown };
+                            task.apply(&event);
+                            event
+                        })
+                    } else {
+                        decision.spec = None;
+                        None
+                    };
+                    task.decision = Some(decision);
+                    event
+                }
                 None => return false,
             }
+        };
+        if let Some(event) = approved_event {
+            let _ = self.inner.tx.send((id, event));
         }
         // notify_one, NOT notify_waiters: notify_one stores a permit if nobody
         // is parked yet, so an answer that arrives before the pipeline reaches
@@ -581,6 +606,20 @@ impl TaskManager {
             .read()
             .expect("task registry lock poisoned");
         tasks.get(&id).and_then(|task| task.decision.clone())
+    }
+
+    /// The specification accepted at Gate 2, if approval has completed.
+    pub fn approved_spec(&self, id: TaskId) -> Option<String> {
+        let tasks = self
+            .inner
+            .tasks
+            .read()
+            .expect("task registry lock poisoned");
+        let task = tasks.get(&id)?;
+        task.decision
+            .as_ref()
+            .filter(|decision| decision.approve)
+            .and(task.spec.clone())
     }
 
     /// Park until the human answers Gate 2.
@@ -660,6 +699,86 @@ mod tests {
         });
 
         assert_eq!(task.spec.as_deref(), Some("## Problem"));
+    }
+
+    #[test]
+    fn approval_without_edits_promotes_the_generated_spec() {
+        let manager = TaskManager::new();
+        let task = manager.create("t", "d", "p");
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::Spec {
+            markdown: "generated".into(),
+            path: "SPEC.md".into(),
+        });
+
+        assert!(manager.decide(
+            task.id,
+            Decision {
+                approve: true,
+                spec: None,
+            },
+        ));
+
+        assert_eq!(manager.approved_spec(task.id).as_deref(), Some("generated"));
+        assert_eq!(
+            manager.decision(task.id).unwrap().spec.as_deref(),
+            Some("generated")
+        );
+        assert!(matches!(
+            manager.get(task.id).unwrap().history.last(),
+            Some(TaskEvent::SpecApproved { markdown }) if markdown == "generated"
+        ));
+    }
+
+    #[test]
+    fn edited_approval_replaces_the_authoritative_task_spec() {
+        let manager = TaskManager::new();
+        let task = manager.create("t", "d", "p");
+        manager.emitter(task.id).emit(TaskEvent::Spec {
+            markdown: "generated".into(),
+            path: "SPEC.md".into(),
+        });
+
+        manager.decide(
+            task.id,
+            Decision {
+                approve: true,
+                spec: Some("edited and approved".into()),
+            },
+        );
+
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.spec.as_deref(), Some("edited and approved"));
+        assert_eq!(manager.approved_spec(task.id), stored.spec);
+    }
+
+    #[test]
+    fn rejection_keeps_the_generated_spec_without_approving_it() {
+        let manager = TaskManager::new();
+        let task = manager.create("t", "d", "p");
+        manager.emitter(task.id).emit(TaskEvent::Spec {
+            markdown: "generated".into(),
+            path: "SPEC.md".into(),
+        });
+
+        manager.decide(
+            task.id,
+            Decision {
+                approve: false,
+                spec: Some("textarea must be ignored".into()),
+            },
+        );
+
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.spec.as_deref(), Some("generated"));
+        assert!(manager.approved_spec(task.id).is_none());
+        assert!(manager.decision(task.id).unwrap().spec.is_none());
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|event| matches!(event, TaskEvent::SpecApproved { .. }))
+        );
     }
 
     #[test]
