@@ -20,7 +20,7 @@ pub fn ask(
     approved_by_critic: bool,
     reason: Option<&str>,
 ) -> Result<bool> {
-    ui::header("SPEC.md");
+    ui::header("Specification");
     println!("{}", spec.trim());
 
     println!();

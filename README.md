@@ -64,8 +64,29 @@ is skipped and the server retains the UUID-named task workspace for manual
 recovery. Results otherwise remain in memory until persistence is implemented.
 
 Inspection skips linked repository files, including instructions and metadata.
-Writing the approved `SPEC.md` rejects linked destinations and replaces an
-ordinary file through a temporary file, without truncating its existing target.
+Each task workspace has separate `repo/` and `artifacts/` directories. The exact
+approved text, including user edits, is saved as `artifacts/approved-spec.md`
+and its absolute path is supplied to Claude Code. It is never written into the
+repository, never replaces a project-owned `SPEC.md`, and does not appear in
+the project's diff. Cleanup covers both directories.
+
+Git, verification tools, and Claude Code start with cleared environments and
+an explicit runtime-variable allowlist (OS paths, home/temp locations, locale,
+and supported toolchain locations). Claude Code additionally receives only the
+configured `ANTHROPIC_API_KEY`; other provider keys, database/cloud credentials,
+alternate provider endpoints/tokens, and arbitrary tool options are not inherited.
+Custom setups relying on other environment variables may need a reviewed policy
+change. This reduces environment exposure, but is **not a sandbox**: child
+processes still have the server user's filesystem/network access, can read
+on-disk credentials or tool configuration, and Claude Code's own subprocesses
+may inherit its required Anthropic credential. Do not execute untrusted
+repositories on this basis alone.
+
+The legacy CLI also stores generated/imported specification snapshots outside
+the project in a UUID-named temporary artifact directory. It prints that path
+and retains it for manual review/recovery; `--implement-only` continues to read
+a project-owned `SPEC.md` without overwriting it. These CLI artifacts require
+manual cleanup and are not durable storage.
 
 ## Supported technology profiles
 
@@ -156,6 +177,7 @@ src/
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code process and streamed output
+  process_environment.rs explicit child-process environment policy
   web/             axum API, pipeline, SSE, and production UI
 ```
 

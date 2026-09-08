@@ -5,7 +5,6 @@ use std::process::Stdio;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use crate::technology::{BuildTool, ProjectProfile};
 
@@ -105,7 +104,7 @@ fn node_commands(root: &Path) -> Vec<VerificationCommand> {
 pub async fn run(commands: &[VerificationCommand], root: &Path) -> Result<Vec<VerificationResult>> {
     let mut results = Vec::new();
     for command in commands {
-        let output = match Command::new(&command.program)
+        let output = match crate::process_environment::async_command(&command.program)
             .args(&command.args)
             .current_dir(root)
             .stdin(Stdio::null())

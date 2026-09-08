@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -160,7 +159,11 @@ fn slug_from_topic(topic: &str) -> String {
 /// `git init` in a freshly created folder. A failure here is not fatal — the
 /// spec can still be written — so we only warn.
 fn git_init(path: &Path) -> Result<()> {
-    match Command::new("git").arg("init").current_dir(path).output() {
+    match crate::process_environment::command("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+    {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             ui::warn(&format!(

@@ -1,4 +1,4 @@
-//! Turns the finished debate into a clean SPEC.md.
+//! Turns the finished debate into a specification and stores external artifacts.
 //!
 //! DP-3 (decided): the Proposer drafts the spec, then the Critic checks it
 //! against the debate and returns a corrected version. Two extra calls, but it
@@ -16,8 +16,9 @@ use crate::debate::Transcript;
 use crate::task::Emitter;
 use crate::ui;
 
-/// The file the implementer will read.
+/// Legacy, project-owned input for `--implement-only`. Never written by us.
 pub const SPEC_FILENAME: &str = "SPEC.md";
+pub const APPROVED_SPEC_FILENAME: &str = "approved-spec.md";
 
 /// The section list from plan.md. Both calls are held to it.
 const SECTIONS: &str = "\
@@ -68,8 +69,8 @@ pub async fn build(
          Use exactly these sections:\n\n{SECTIONS}"
     );
 
-    ui::system("drafting SPEC.md (Proposer)...");
-    emitter.notice("drafting SPEC.md (Proposer)...");
+    ui::system("drafting specification (Proposer)...");
+    emitter.notice("drafting specification (Proposer)...");
     let mut messages = transcript.for_proposer();
     push_user(&mut messages, request);
     let draft = proposer
@@ -88,8 +89,8 @@ pub async fn build(
          'Open risks', worded so an implementer knows it is unsettled."
     };
 
-    ui::system("checking SPEC.md against the debate (Critic)...");
-    emitter.notice("checking SPEC.md against the debate (Critic)...");
+    ui::system("checking specification against the debate (Critic)...");
+    emitter.notice("checking specification against the debate (Critic)...");
     let mut messages = transcript.for_critic();
     push_user(
         &mut messages,
@@ -123,20 +124,23 @@ pub fn read_from(repo: &Path) -> Result<String> {
     Ok(text)
 }
 
-/// Write the spec into the target repo, returning where it landed.
-pub fn write_to(repo: &Path, spec: &str) -> Result<PathBuf> {
-    let repo = repo.canonicalize()?;
-    let path = repo.join(SPEC_FILENAME);
+/// Write an orchestration artifact in a provider-owned directory outside repo.
+pub fn write_artifact(artifacts: &Path, spec: &str) -> Result<PathBuf> {
+    if crate::repository_file::is_link(&fs::symlink_metadata(artifacts)?) {
+        bail!("refusing a linked artifact directory");
+    }
+    let artifacts = artifacts.canonicalize()?;
+    let path = artifacts.join(APPROVED_SPEC_FILENAME);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if crate::repository_file::is_link(&metadata) || !metadata.is_file() => {
-            bail!("refusing to replace a linked or non-regular SPEC.md");
+            bail!("refusing to replace a linked or non-regular specification artifact");
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
         _ => {}
     }
     // Never open the existing destination: rename replaces its directory entry,
     // so even a link swapped in after the check cannot redirect the write.
-    let temporary = repo.join(format!(".spec-{}.tmp", uuid::Uuid::new_v4()));
+    let temporary = artifacts.join(format!(".spec-{}.tmp", uuid::Uuid::new_v4()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -152,6 +156,15 @@ pub fn write_to(repo: &Path, spec: &str) -> Result<PathBuf> {
     }
     result.with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
+}
+
+/// Legacy CLI runs do not own the project directory's lifecycle. Store their
+/// artifacts separately and retain the path for manual review/recovery.
+pub fn write_cli_artifact(spec: &str) -> Result<PathBuf> {
+    let artifacts =
+        std::env::temp_dir().join(format!("multiagent-chat-cli-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&artifacts)?;
+    write_artifact(&artifacts, spec)
 }
 
 /// Models often wrap a whole document in ```markdown fences despite being told
@@ -222,8 +235,8 @@ mod tests {
     #[test]
     fn reads_back_a_written_spec() {
         let dir = scratch_dir("roundtrip");
-        write_to(
-            &dir,
+        fs::write(
+            dir.join(SPEC_FILENAME),
             "## Problem
 something",
         )
@@ -249,12 +262,7 @@ something"
     #[test]
     fn an_empty_spec_is_rejected() {
         let dir = scratch_dir("empty");
-        write_to(
-            &dir, "   
-
-",
-        )
-        .unwrap();
+        fs::write(dir.join(SPEC_FILENAME), "   \n\n").unwrap();
 
         let err = read_from(&dir).unwrap_err().to_string();
         assert!(err.contains("empty"), "unexpected: {err}");
@@ -262,13 +270,13 @@ something"
     }
 
     #[test]
-    fn writes_the_file_into_the_repo() {
+    fn writes_the_file_into_the_artifact_directory() {
         let dir = std::env::temp_dir().join(format!("mac-spec-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
 
-        let path = write_to(&dir, "## Problem\nx").unwrap();
+        let path = write_artifact(&dir, "## Problem\nx").unwrap();
 
-        assert_eq!(path.file_name().unwrap(), SPEC_FILENAME);
+        assert_eq!(path.file_name().unwrap(), APPROVED_SPEC_FILENAME);
         assert_eq!(fs::read_to_string(&path).unwrap(), "## Problem\nx");
 
         fs::remove_dir_all(&dir).ok();

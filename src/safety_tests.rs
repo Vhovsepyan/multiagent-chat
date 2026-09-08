@@ -68,19 +68,20 @@ fn inspection_never_reads_linked_instructions_or_metadata() {
     windows,
     ignore = "requires Windows Developer Mode or symlink privilege; runs normally on Unix"
 )]
-fn spec_write_refuses_external_and_dangling_links() {
+fn artifact_write_refuses_external_and_dangling_links() {
     for dangling in [false, true] {
         let fixture = Fixture::new();
-        let root = fixture.0.join("repo");
+        let root = fixture.0.join("artifacts");
+        fs::create_dir(&root).unwrap();
         let outside = fixture.0.join(if dangling {
             "missing.txt"
         } else {
             "outside.txt"
         });
-        file_link(&outside, &root.join("SPEC.md"));
-        assert!(crate::spec::write_to(&root, "replacement").is_err());
+        file_link(&outside, &root.join(crate::spec::APPROVED_SPEC_FILENAME));
+        assert!(crate::spec::write_artifact(&root, "replacement").is_err());
         assert!(
-            fs::symlink_metadata(root.join("SPEC.md"))
+            fs::symlink_metadata(root.join(crate::spec::APPROVED_SPEC_FILENAME))
                 .unwrap()
                 .file_type()
                 .is_symlink()
@@ -97,13 +98,18 @@ fn spec_write_refuses_external_and_dangling_links() {
 }
 
 #[test]
-fn spec_replacement_does_not_truncate_hard_link_targets() {
+fn artifact_replacement_does_not_truncate_hard_link_targets() {
     let fixture = Fixture::new();
-    let root = fixture.0.join("repo");
-    fs::hard_link(fixture.0.join("outside.txt"), root.join("SPEC.md")).unwrap();
-    crate::spec::write_to(&root, "approved").unwrap();
+    let root = fixture.0.join("artifacts");
+    fs::create_dir(&root).unwrap();
+    fs::hard_link(
+        fixture.0.join("outside.txt"),
+        root.join(crate::spec::APPROVED_SPEC_FILENAME),
+    )
+    .unwrap();
+    crate::spec::write_artifact(&root, "approved").unwrap();
     assert_eq!(
-        fs::read_to_string(root.join("SPEC.md")).unwrap(),
+        fs::read_to_string(root.join(crate::spec::APPROVED_SPEC_FILENAME)).unwrap(),
         "approved"
     );
     assert_eq!(

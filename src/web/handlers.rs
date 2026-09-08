@@ -220,7 +220,7 @@ pub async fn task_events(
 
 /// `POST /api/tasks/{id}/approve` — Gate 2 (DP-10).
 ///
-/// The body may carry an edited spec, which replaces SPEC.md before the build.
+/// The body may carry an edited spec, used for the external artifact before build.
 pub async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,

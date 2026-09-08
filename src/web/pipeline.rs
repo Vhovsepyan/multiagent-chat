@@ -169,7 +169,7 @@ async fn run(
     .await?;
     emitter.emit(TaskEvent::Spec {
         markdown: document,
-        path: spec::SPEC_FILENAME.into(),
+        path: format!("artifacts/{}", spec::APPROVED_SPEC_FILENAME),
     });
 
     emitter.status(TaskStatus::WaitingForApproval);
@@ -193,12 +193,18 @@ async fn run(
         })?);
     }
     let workspace_ref = workspace.as_ref().expect("workspace was prepared");
-    write_approved_spec(&state.manager, id, &workspace_ref.path)?;
+    let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
 
     emitter.status(TaskStatus::Implementing);
     let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
-    crate::implementer::run_with_prompt(&state.config, &workspace_ref.path, emitter, &prompt)
-        .await?;
+    crate::implementer::run_with_prompt(
+        &state.config,
+        &workspace_ref.path,
+        &spec_path,
+        emitter,
+        &prompt,
+    )
+    .await?;
 
     let commands = crate::verification::plan(&profile, &workspace_ref.path);
     if commands.is_empty() {
@@ -237,12 +243,15 @@ fn prepare_existing(state: &AppState, id: TaskId, project: &Project) -> Result<T
     })
 }
 
-fn write_approved_spec(manager: &TaskManager, id: TaskId, root: &std::path::Path) -> Result<()> {
+fn write_approved_spec(
+    manager: &TaskManager,
+    id: TaskId,
+    workspace: &TaskWorkspace,
+) -> Result<std::path::PathBuf> {
     let approved_spec = manager
         .approved_spec(id)
         .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
-    spec::write_to(root, &approved_spec)?;
-    Ok(())
+    spec::write_artifact(&workspace.artifacts(), &approved_spec)
 }
 
 #[cfg(test)]
@@ -347,10 +356,14 @@ mod tests {
         let (state, root) = crate::web::tests::test_state("uncaptured-result");
         let task = state.manager.create("task", "description", "legacy");
         let workspace = TaskWorkspace {
-            path: root.join("task-workspaces").join(task.id.to_string()),
+            root: root.join("task-workspaces").join(task.id.to_string()),
+            path: root
+                .join("task-workspaces")
+                .join(task.id.to_string())
+                .join("repo"),
             revision: None,
         };
-        std::fs::create_dir(&workspace.path).unwrap();
+        std::fs::create_dir_all(&workspace.path).unwrap();
         std::fs::write(workspace.path.join("recover.txt"), "preserve me").unwrap();
         finish_run(
             &state,
@@ -388,14 +401,39 @@ mod tests {
             },
         );
         let root = std::env::temp_dir().join(format!("mac-approved-spec-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-
-        write_approved_spec(&manager, task.id, &root).unwrap();
+        let provider = crate::workspace::LocalWorkspaceProvider::new(root.clone()).unwrap();
+        use crate::workspace::WorkspaceProvider;
+        let workspace = provider
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        std::fs::write(
+            workspace.path.join("SPEC.md"),
+            "project-owned specification",
+        )
+        .unwrap();
+        let spec_path = write_approved_spec(&manager, task.id, &workspace).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(root.join(spec::SPEC_FILENAME)).unwrap(),
+            std::fs::read_to_string(&spec_path).unwrap(),
             manager.approved_spec(task.id).unwrap()
         );
+        assert!(!spec_path.starts_with(workspace.path.canonicalize().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("SPEC.md")).unwrap(),
+            "project-owned specification"
+        );
+        let prompt = crate::implementer::prompt(&spec_path, "Implement the task.");
+        assert!(prompt.contains(&serde_json::to_string(&spec_path.to_string_lossy()).unwrap()));
+        let changes = crate::workspace::change_set(&workspace.path).unwrap();
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].path, "SPEC.md");
+        assert!(!changes.render().contains("edited and approved"));
+        provider.cleanup(&workspace).unwrap();
+        assert!(!spec_path.exists());
         std::fs::remove_dir_all(root).ok();
     }
 }

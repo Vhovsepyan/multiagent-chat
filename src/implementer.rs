@@ -1,8 +1,8 @@
-//! Phase 5: hand SPEC.md to Claude Code and let it build.
+//! Hand an external approved specification artifact to Claude Code.
 //!
 //! DP-5 (decided):
 //!   - launch the `claude` CLI in headless mode (`-p`) with the working
-//!     directory set to the target repo, so it only ever sees that project;
+//!     directory set to the target repo (this is not a filesystem sandbox);
 //!   - model: `claude-opus-4-8` by default (`IMPLEMENTER_MODEL`);
 //!   - permission mode: `bypassPermissions` by default
 //!     (`CLAUDE_PERMISSION_MODE`). Headless has nobody to answer a permission
@@ -20,25 +20,25 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 use crate::config::Config;
-use crate::spec::SPEC_FILENAME;
 use crate::task::{Emitter, TaskEvent};
 use crate::ui;
 
 /// The CLI we shell out to. Resolved from PATH.
 const CLAUDE_BIN: &str = "claude";
 
-/// What we ask Claude Code to do. Deliberately short: everything it needs to
-/// know is in SPEC.md, which is sitting in its working directory.
-fn prompt() -> String {
+/// Common artifact instructions stay separate from task-specific behavior.
+pub fn prompt(spec_path: &Path, task_prompt: &str) -> String {
     format!(
-        "Read {SPEC_FILENAME} in this repository and implement it.\n\n\
+        "Read the approved specification at this external path: {}\n\n\
+         This orchestration artifact is authoritative. Do not copy it into the \
+         repository or overwrite a project-owned SPEC.md with it.\n\n\
          Work through the Steps section in order. Follow the existing \
          conventions of this repository if it already has code. When you are \
          done, run the project's tests if it has any, and summarise what you \
-         built and anything from {SPEC_FILENAME} you did not implement."
+         built and anything from the approved specification you did not implement.\n\n{task_prompt}",
+        serde_json::to_string(&spec_path.to_string_lossy()).expect("path serializes")
     )
 }
 
@@ -49,8 +49,8 @@ fn prompt() -> String {
 /// web UI. The tradeoff is real: Claude Code no longer sees a TTY, so it may
 /// drop colour and progress animations that it would show when run directly.
 /// Line-by-line output is otherwise identical.
-pub async fn run(config: &Config, repo: &Path, emitter: &Emitter) -> Result<()> {
-    run_with_prompt(config, repo, emitter, &prompt()).await
+pub async fn run(config: &Config, repo: &Path, spec_path: &Path, emitter: &Emitter) -> Result<()> {
+    run_with_prompt(config, repo, spec_path, emitter, "Do not commit or push.").await
 }
 
 /// Launch Claude Code with task-kind-specific instructions prepared by the
@@ -58,6 +58,7 @@ pub async fn run(config: &Config, repo: &Path, emitter: &Emitter) -> Result<()> 
 pub async fn run_with_prompt(
     config: &Config,
     repo: &Path,
+    spec_path: &Path,
     emitter: &Emitter,
     task_prompt: &str,
 ) -> Result<()> {
@@ -73,23 +74,24 @@ pub async fn run_with_prompt(
     }
     println!();
 
-    let mut child = Command::new(CLAUDE_BIN)
-        .current_dir(repo)
-        .arg("-p")
-        .arg(task_prompt)
-        .arg("--model")
-        .arg(&config.implementer_model)
-        .arg("--permission-mode")
-        .arg(&config.permission_mode)
-        // Piped, not inherited, so every line can be forwarded to the web UI.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?"
-            )
-        })?;
+    let mut child =
+        crate::process_environment::implementer_command(CLAUDE_BIN, &config.anthropic_api_key)
+            .current_dir(repo)
+            .arg("-p")
+            .arg(prompt(spec_path, task_prompt))
+            .arg("--model")
+            .arg(&config.implementer_model)
+            .arg("--permission-mode")
+            .arg(&config.permission_mode)
+            // Piped, not inherited, so every line can be forwarded to the web UI.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?"
+                )
+            })?;
 
     // `take` moves the handles out of the child so they can be read on their
     // own tasks while we wait for the process itself.
@@ -150,7 +152,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the Claude Code CLI on PATH"]
     async fn the_cli_is_reachable() {
-        let status = Command::new(CLAUDE_BIN)
+        let status = crate::process_environment::async_command(CLAUDE_BIN)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -163,8 +165,11 @@ mod tests {
 
     #[test]
     fn the_prompt_names_the_spec_file() {
-        let p = prompt();
-        assert!(p.contains(SPEC_FILENAME));
+        let path = Path::new("/task with spaces/artifacts/approved-spec.md");
+        let p = prompt(path, "Fix the root cause.");
+        assert!(p.contains("/task with spaces/artifacts/approved-spec.md"));
+        assert!(p.contains("Fix the root cause."));
+        assert!(!p.contains("Read SPEC.md"));
         assert!(p.contains("Steps"));
     }
 }

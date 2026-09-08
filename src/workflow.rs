@@ -17,7 +17,7 @@ pub fn design_context(kind: TaskKind, profile: &ProjectProfile, inspection: &str
 
 pub fn implementation_prompt(kind: TaskKind, profile: &ProjectProfile) -> String {
     format!(
-        "Read SPEC.md and implement the approved {} workflow. Follow repository instructions and existing conventions. Use the {:?} project profile to choose repository-defined build and test commands. Do not commit, push, or modify unrelated behavior. Summarize completed work and limitations.",
+        "Implement the approved {} workflow using the supplied specification artifact. Follow repository instructions and existing conventions. Use the {:?} project profile to choose repository-defined build and test commands. Do not commit, push, or modify unrelated behavior. Summarize completed work and limitations.",
         kind.label(),
         profile.stack
     )

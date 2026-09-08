@@ -20,12 +20,26 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- Pre-persistence security (2026-09-08): Provider-owned task roots now contain
+  sibling `repo/` and `artifacts/` directories. The authoritative approved text
+  is written to `artifacts/approved-spec.md` and passed by explicit absolute path
+  to Claude Code. Repository-owned SPEC.md is untouched and artifacts are outside
+  the diff boundary. Normal cleanup removes the entire task root; recovery after
+  failed result capture still retains it. Legacy CLI snapshots are external too,
+  retained at the printed temporary path for manual cleanup.
+- All external process construction uses one explicit runtime environment
+  allowlist after env_clear, including Git and stack-aware verification. Claude
+  Code receives only the configured Anthropic API key in addition to runtime
+  settings; unrelated secrets and inherited provider overrides are excluded.
+  No sandbox is provided: filesystem credentials, tool configuration, network
+  access, and inheritance of Claude's required key by its children remain risks.
 - P1 review fixes (2026-09-08): Approval validation and decision recording now
   share one TaskManager lock; only an unanswered WaitingForApproval gate can
   accept a decision. Both HTTP approval paths use this boundary.
 - Repository inspection rejects linked files and linked parent paths, including
-  instruction/build metadata reads. Approved SPEC.md is written to an exclusively
-  created temporary file and renamed, with linked destinations rejected.
+  instruction/build metadata reads. Specification writes use an exclusively
+  created temporary file and rename, with linked destinations rejected; the
+  artifact location is now outside the repository as described above.
 - Browser requests are limited to the configured local UI origins and Host
   values; permissive CORS has been removed. Authentication remains future work.
 - Failed implementation/verification captures available diffs before cleanup.

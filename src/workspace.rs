@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -18,8 +17,17 @@ pub struct WorkspaceRequest<'a> {
 
 #[derive(Debug)]
 pub struct TaskWorkspace {
+    /// Provider-owned lifecycle root; repository and artifacts are siblings.
+    pub root: PathBuf,
+    /// Only this directory is inspected, implemented, verified, and diffed.
     pub path: PathBuf,
     pub revision: Option<String>,
+}
+
+impl TaskWorkspace {
+    pub fn artifacts(&self) -> PathBuf {
+        self.root.join("artifacts")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,59 +121,71 @@ impl LocalWorkspaceProvider {
 
 impl WorkspaceProvider for LocalWorkspaceProvider {
     fn prepare(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
-        let path = self.task_path(request.task_id);
-        self.ensure_owned(&path)?;
-        if path.exists() {
-            bail!("task workspace already exists");
-        }
-
-        match request.source {
-            Some(source) => {
-                let mut command = Command::new("git");
-                command.arg("clone").arg("--depth").arg("1");
-                if let Some(revision) = request.revision {
-                    command.arg("--branch").arg(revision);
+        let root = self.task_path(request.task_id);
+        self.ensure_owned(&root)?;
+        // Exclusive creation avoids reusing an existing task or linked root.
+        fs::create_dir(&root).context("could not create a fresh task workspace")?;
+        let path = root.join("repo");
+        let prepared = (|| -> Result<TaskWorkspace> {
+            fs::create_dir(root.join("artifacts"))?;
+            match request.source {
+                Some(source) => {
+                    let mut command = crate::process_environment::command("git");
+                    command.arg("clone").arg("--depth").arg("1");
+                    if let Some(revision) = request.revision {
+                        command.arg("--branch").arg(revision);
+                    }
+                    let output = command
+                        .arg(source.clone_url())
+                        .arg(&path)
+                        .output()
+                        .context("could not start git to prepare repository workspace")?;
+                    if !output.status.success() {
+                        bail!(
+                            "could not prepare repository workspace: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
                 }
-                let output = command
-                    .arg(source.clone_url())
-                    .arg(&path)
-                    .output()
-                    .context("could not start git to prepare repository workspace")?;
-                if !output.status.success() {
-                    let _ = fs::remove_dir_all(&path);
-                    bail!(
-                        "could not prepare repository workspace: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
+                None => {
+                    fs::create_dir(&path).with_context(|| {
+                        format!("could not create workspace {}", path.display())
+                    })?;
+                    let output = crate::process_environment::command("git")
+                        .arg("init")
+                        .arg("--quiet")
+                        .current_dir(&path)
+                        .output()
+                        .context("could not initialize new-project workspace")?;
+                    if !output.status.success() {
+                        bail!("could not initialize new-project workspace");
+                    }
                 }
             }
-            None => {
-                fs::create_dir(&path)
-                    .with_context(|| format!("could not create workspace {}", path.display()))?;
-                let output = Command::new("git")
-                    .arg("init")
-                    .arg("--quiet")
-                    .current_dir(&path)
-                    .output()
-                    .context("could not initialize new-project workspace")?;
-                if !output.status.success() {
-                    let _ = fs::remove_dir_all(&path);
-                    bail!("could not initialize new-project workspace");
-                }
-            }
-        }
 
-        let revision = git_output(&path, &["rev-parse", "HEAD"])
-            .ok()
-            .filter(|value| !value.is_empty());
-        Ok(TaskWorkspace { path, revision })
+            let revision = git_output(&path, &["rev-parse", "HEAD"])
+                .ok()
+                .filter(|value| !value.is_empty());
+            Ok(TaskWorkspace {
+                root: root.clone(),
+                path,
+                revision,
+            })
+        })();
+        if prepared.is_err() {
+            let _ = fs::remove_dir_all(&root);
+        }
+        prepared
     }
 
     fn cleanup(&self, workspace: &TaskWorkspace) -> Result<()> {
-        self.ensure_owned(&workspace.path)?;
-        if workspace.path.exists() {
-            fs::remove_dir_all(&workspace.path).with_context(|| {
-                format!("could not clean workspace {}", workspace.path.display())
+        self.ensure_owned(&workspace.root)?;
+        if workspace.path != workspace.root.join("repo") {
+            bail!("repository path does not belong to the task workspace");
+        }
+        if workspace.root.exists() {
+            fs::remove_dir_all(&workspace.root).with_context(|| {
+                format!("could not clean workspace {}", workspace.root.display())
             })?;
         }
         Ok(())
@@ -317,7 +337,7 @@ fn git_output_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("git")
+    crate::process_environment::command("git")
         .args(args)
         .current_dir(root)
         .output()
@@ -330,7 +350,7 @@ mod tests {
     use uuid::Uuid;
 
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::process_environment::command("git")
             .args(args)
             .current_dir(root)
             .output()
@@ -375,11 +395,57 @@ mod tests {
             .unwrap();
         assert_ne!(first.path, second.path);
         assert!(first.path.is_dir() && second.path.is_dir());
+        assert_eq!(first.path, first.root.join("repo"));
+        assert!(first.artifacts().is_dir());
+        assert!(!first.artifacts().starts_with(&first.path));
+        let artifact =
+            crate::spec::write_artifact(&first.artifacts(), "approved orchestration-only text")
+                .unwrap();
+        assert!(!first.path.join("SPEC.md").exists());
+        assert!(change_set(&first.path).unwrap().files.is_empty());
+        assert_eq!(
+            diff_result(&first.path).unwrap(),
+            "No working-tree changes."
+        );
         provider.cleanup(&first).unwrap();
+        assert!(!artifact.exists());
+        assert!(!first.root.exists());
         provider.cleanup(&first).unwrap();
         assert!(second.path.is_dir());
         provider.cleanup(&second).unwrap();
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn preserves_project_owned_spec_and_excludes_artifact_from_changes() {
+        let root = std::env::temp_dir().join(format!("mac-spec-workspace-{}", Uuid::new_v4()));
+        let provider = LocalWorkspaceProvider::new(root.clone()).unwrap();
+        let workspace = provider
+            .prepare(WorkspaceRequest {
+                task_id: Uuid::new_v4(),
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        let owned = b"# User-owned SPEC\r\nDo not replace.\r\n";
+        fs::write(workspace.path.join("SPEC.md"), owned).unwrap();
+        git(
+            &workspace.path,
+            &["config", "user.email", "tests@example.com"],
+        );
+        git(&workspace.path, &["config", "user.name", "Tests"]);
+        git(&workspace.path, &["add", "SPEC.md"]);
+        git(
+            &workspace.path,
+            &["commit", "--quiet", "-m", "project-owned specification"],
+        );
+        let artifact =
+            crate::spec::write_artifact(&workspace.artifacts(), "approved task text").unwrap();
+        assert_eq!(fs::read(workspace.path.join("SPEC.md")).unwrap(), owned);
+        assert_eq!(fs::read_to_string(artifact).unwrap(), "approved task text");
+        assert!(change_set(&workspace.path).unwrap().files.is_empty());
+        provider.cleanup(&workspace).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

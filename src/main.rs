@@ -11,6 +11,7 @@ mod config;
 mod debate;
 mod implementer;
 mod inspection;
+mod process_environment;
 mod project;
 mod repository_file;
 #[cfg(test)]
@@ -101,23 +102,24 @@ async fn main() -> Result<()> {
             &emitter,
         )
         .await?;
-        spec::write_to(&repo, &document)?;
 
         (repo, document, outcome.approved, outcome.last_reason)
     };
 
-    let spec_path = target_repo.join(spec::SPEC_FILENAME);
+    // Both generated and legacy imported specifications are snapshotted outside
+    // the project. The project-owned SPEC.md is only ever read.
+    let spec_path = spec::write_cli_artifact(&document)?;
 
     // Gate 2: nothing touches the repo unless a human says yes.
     if !approve::ask(&document, &spec_path, approved, reason.as_deref())? {
-        ui::system("stopped. SPEC.md is on disk if you want to edit it and re-run.");
+        ui::system("stopped. The external specification artifact remains at the path shown above.");
         return Ok(());
     }
 
     ui::success("approved.");
 
     // Phase 5: hand it to Claude Code inside the target repo.
-    implementer::run(&config, &target_repo, &emitter).await?;
+    implementer::run(&config, &target_repo, &spec_path, &emitter).await?;
 
     Ok(())
 }

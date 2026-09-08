@@ -133,13 +133,13 @@ pub enum TaskStatus {
     Debating,
     /// The debate is over; the spec is being drafted and checked.
     GeneratingSpec,
-    /// SPEC.md exists and is on disk, gate not yet answered.
+    /// The generated specification is in task state; gate not yet answered.
     WaitingForApproval,
     /// Claude Code is running in the target repo.
     Implementing,
     /// Finished successfully.
     Completed,
-    /// The human declined at the gate. Not an error — SPEC.md is still there.
+    /// The human declined at the gate. Not an error; task state keeps the spec.
     Rejected,
     /// Something went wrong; `Task::error` says what.
     Failed,
@@ -193,7 +193,8 @@ pub enum TaskEvent {
         reason: Option<String>,
     },
 
-    /// SPEC.md is written. `markdown` is the document, `path` where it landed.
+    /// Specification generated. `path` is its intended orchestration artifact
+    /// location, not a file in the user's repository.
     Spec {
         markdown: String,
         path: String,
@@ -246,7 +247,7 @@ pub enum TaskEvent {
 
 /// The human's answer at Gate 2 (DP-10).
 ///
-/// `spec` carries an edited document. When present it replaces SPEC.md before
+/// `spec` carries an edited document. When present it becomes the artifact before
 /// the build starts, so editing and approving are one atomic action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {

@@ -72,7 +72,7 @@ fn timeline_html(status: TaskStatus) -> String {
 
 fn gate_html(id: TaskId, spec: &str) -> String {
     format!(
-        r#"<div class="card"><h2 class="section">SPEC.md — your call</h2>
+        r#"<div class="card"><h2 class="section">Specification — your call</h2>
 <form hx-post="/ui/tasks/{id}/approve" hx-swap="none">
 <textarea class="spec-edit" name="spec">{}</textarea>
 <div class="hint">Edit freely — the approved text is what gets built.</div>
@@ -129,7 +129,7 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
         TaskEvent::SpecApproved { markdown } => Some((
             "spec",
             format!(
-                r#"<div class="card"><h2 class="section">SPEC.md</h2><div class="spec-body">{}</div></div>"#,
+                r#"<div class="card"><h2 class="section">Specification</h2><div class="spec-body">{}</div></div>"#,
                 esc(markdown)
             ),
         )),
@@ -361,7 +361,7 @@ fn spec_readonly(task: &Task) -> String {
 }
 
 fn spec_readonly_html(spec: Option<&str>) -> String {
-    spec.map(|spec| format!(r#"<div class="card"><h2 class="section">SPEC.md</h2><div class="spec-body">{}</div></div>"#, esc(spec))).unwrap_or_default()
+    spec.map(|spec| format!(r#"<div class="card"><h2 class="section">Specification</h2><div class="spec-body">{}</div></div>"#, esc(spec))).unwrap_or_default()
 }
 
 fn page_html(
