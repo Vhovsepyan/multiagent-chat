@@ -12,6 +12,9 @@ mod debate;
 mod implementer;
 mod inspection;
 mod project;
+mod repository_file;
+#[cfg(test)]
+mod safety_tests;
 mod spec;
 mod target;
 mod task;

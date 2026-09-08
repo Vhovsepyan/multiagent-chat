@@ -422,12 +422,14 @@ pub async fn approve(
     Form(form): Form<ApproveForm>,
 ) -> Response {
     let approve = form.approve == "true";
-    let spec = match (&form.spec, approve) {
-        (Some(text), true) if !text.trim().is_empty() => Some(text.clone()),
-        _ => None,
-    };
-    if !state.manager.decide(id, Decision { approve, spec }) {
-        return (StatusCode::NOT_FOUND, Html("unknown task")).into_response();
+    let spec = if approve { form.spec } else { None };
+    if let Err(error) = state.manager.decide_checked(id, Decision { approve, spec }) {
+        let status = match error {
+            crate::task::DecisionError::NotFound => StatusCode::NOT_FOUND,
+            crate::task::DecisionError::NotWaiting => StatusCode::CONFLICT,
+            crate::task::DecisionError::InvalidSpec => StatusCode::BAD_REQUEST,
+        };
+        return (status, Html(esc(&error.to_string()))).into_response();
     }
     let body = state
         .manager

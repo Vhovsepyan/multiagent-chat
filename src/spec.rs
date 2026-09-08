@@ -6,6 +6,7 @@
 //! concession it made under review.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -124,8 +125,32 @@ pub fn read_from(repo: &Path) -> Result<String> {
 
 /// Write the spec into the target repo, returning where it landed.
 pub fn write_to(repo: &Path, spec: &str) -> Result<PathBuf> {
+    let repo = repo.canonicalize()?;
     let path = repo.join(SPEC_FILENAME);
-    fs::write(&path, spec).with_context(|| format!("could not write {}", path.display()))?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if crate::repository_file::is_link(&metadata) || !metadata.is_file() => {
+            bail!("refusing to replace a linked or non-regular SPEC.md");
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    // Never open the existing destination: rename replaces its directory entry,
+    // so even a link swapped in after the check cannot redirect the write.
+    let temporary = repo.join(format!(".spec-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        file.write_all(spec.as_bytes())?;
+        drop(file);
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
 }
 

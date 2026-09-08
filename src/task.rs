@@ -255,6 +255,23 @@ pub struct Decision {
     pub spec: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionError {
+    NotFound,
+    NotWaiting,
+    InvalidSpec,
+}
+
+impl std::fmt::Display for DecisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "unknown task",
+            Self::NotWaiting => "task is not waiting for an unanswered approval",
+            Self::InvalidSpec => "approval requires a non-empty specification",
+        })
+    }
+}
+
 /// One orchestration run, and enough history to render the page on a fresh
 /// load or a reconnect.
 ///
@@ -560,9 +577,14 @@ impl TaskManager {
 
     /// Record the human's Gate 2 answer and wake the waiting pipeline (DP-11).
     ///
-    /// Returns `false` if there is no such task. On approval, the generated or
-    /// edited text is recorded through `SpecApproved` before the gate wakes.
-    pub fn decide(&self, id: TaskId, mut decision: Decision) -> bool {
+    /// Test convenience wrapper; invalid state/input also returns `false`.
+    #[cfg(test)]
+    pub fn decide(&self, id: TaskId, decision: Decision) -> bool {
+        self.decide_checked(id, decision).is_ok()
+    }
+
+    /// Validate and consume the approval gate under the same write lock.
+    pub fn decide_checked(&self, id: TaskId, mut decision: Decision) -> Result<(), DecisionError> {
         let approved_event = {
             let mut tasks = self
                 .inner
@@ -571,8 +593,18 @@ impl TaskManager {
                 .expect("task registry lock poisoned");
             match tasks.get_mut(&id) {
                 Some(task) => {
+                    if task.status != TaskStatus::WaitingForApproval || task.decision.is_some() {
+                        return Err(DecisionError::NotWaiting);
+                    }
                     let event = if decision.approve {
                         decision.spec = decision.spec.or_else(|| task.spec.clone());
+                        if decision
+                            .spec
+                            .as_ref()
+                            .is_none_or(|text| text.trim().is_empty())
+                        {
+                            return Err(DecisionError::InvalidSpec);
+                        }
                         decision.spec.clone().map(|markdown| {
                             let event = TaskEvent::SpecApproved { markdown };
                             task.apply(&event);
@@ -585,7 +617,7 @@ impl TaskManager {
                     task.decision = Some(decision);
                     event
                 }
-                None => return false,
+                None => return Err(DecisionError::NotFound),
             }
         };
         if let Some(event) = approved_event {
@@ -595,7 +627,7 @@ impl TaskManager {
         // is parked yet, so an answer that arrives before the pipeline reaches
         // the gate is still delivered. notify_waiters would drop it silently.
         self.inner.gate(id).notify_one();
-        true
+        Ok(())
     }
 
     /// The Gate 2 answer, if one has been given.
@@ -711,6 +743,9 @@ mod tests {
             path: "SPEC.md".into(),
         });
 
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
         assert!(manager.decide(
             task.id,
             Decision {
@@ -739,6 +774,9 @@ mod tests {
             path: "SPEC.md".into(),
         });
 
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
         manager.decide(
             task.id,
             Decision {
@@ -756,6 +794,9 @@ mod tests {
     fn rejection_keeps_the_generated_spec_without_approving_it() {
         let manager = TaskManager::new();
         let task = manager.create("t", "d", "p");
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
         manager.emitter(task.id).emit(TaskEvent::Spec {
             markdown: "generated".into(),
             path: "SPEC.md".into(),
@@ -792,6 +833,123 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.error.as_deref(), Some("boom"));
         assert!(task.status.is_terminal());
+    }
+
+    #[test]
+    fn approval_gate_rejects_invalid_states_and_duplicate_decisions() {
+        let manager = TaskManager::new();
+        for status in [
+            TaskStatus::Created,
+            TaskStatus::Debating,
+            TaskStatus::Implementing,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Rejected,
+        ] {
+            let task = manager.create("task", "description", "legacy");
+            manager.emitter(task.id).status(status);
+            let before = manager.get(task.id).unwrap();
+            assert_eq!(
+                manager.decide_checked(
+                    task.id,
+                    Decision {
+                        approve: true,
+                        spec: Some("injected".into()),
+                    }
+                ),
+                Err(DecisionError::NotWaiting)
+            );
+            let after = manager.get(task.id).unwrap();
+            assert_eq!(after.spec, before.spec);
+            assert!(after.decision.is_none());
+            assert_eq!(after.history.len(), before.history.len());
+        }
+        let task = manager.create("task", "description", "legacy");
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        assert_eq!(
+            manager.decide_checked(
+                task.id,
+                Decision {
+                    approve: true,
+                    spec: None
+                }
+            ),
+            Err(DecisionError::InvalidSpec)
+        );
+        assert_eq!(
+            manager.decide_checked(
+                task.id,
+                Decision {
+                    approve: true,
+                    spec: Some("  ".into())
+                }
+            ),
+            Err(DecisionError::InvalidSpec)
+        );
+        manager
+            .decide_checked(
+                task.id,
+                Decision {
+                    approve: true,
+                    spec: Some("approved".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.decide_checked(
+                task.id,
+                Decision {
+                    approve: false,
+                    spec: None
+                }
+            ),
+            Err(DecisionError::NotWaiting)
+        );
+        assert_eq!(manager.approved_spec(task.id).as_deref(), Some("approved"));
+    }
+
+    #[test]
+    fn simultaneous_decisions_only_accept_one_specification() {
+        let manager = TaskManager::new();
+        let task = manager.create("task", "description", "legacy");
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|text| {
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.decide_checked(
+                        task.id,
+                        Decision {
+                            approve: true,
+                            spec: Some(text.into()),
+                        },
+                    )
+                })
+            })
+            .collect();
+        let accepted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(accepted, 1);
+        let task = manager.get(task.id).unwrap();
+        assert_eq!(
+            task.history
+                .iter()
+                .filter(|event| matches!(event, TaskEvent::SpecApproved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(task.spec, task.decision.unwrap().spec);
     }
 
     #[test]

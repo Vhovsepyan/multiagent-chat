@@ -1,6 +1,8 @@
 //! Evidence-based project technology detection.
 
+#[cfg(test)]
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::Result;
@@ -64,7 +66,7 @@ pub fn detect(root: &Path) -> Result<ProjectProfile> {
     }
 
     if root.join("pom.xml").is_file() {
-        let pom = read_lossy(&root.join("pom.xml"));
+        let pom = read_lossy(root, &root.join("pom.xml"));
         return Ok(profile(
             TechStack::JavaSpringBoot,
             BuildTool::Maven,
@@ -77,7 +79,7 @@ pub fn detect(root: &Path) -> Result<ProjectProfile> {
         .into_iter()
         .find(|name| root.join(name).is_file());
     if let Some(name) = gradle {
-        let build = read_lossy(&root.join(name));
+        let build = read_lossy(root, &root.join(name));
         return Ok(profile(
             TechStack::JavaSpringBoot,
             BuildTool::Gradle,
@@ -87,7 +89,7 @@ pub fn detect(root: &Path) -> Result<ProjectProfile> {
     }
 
     if root.join("package.json").is_file() {
-        let package = read_lossy(&root.join("package.json"));
+        let package = read_lossy(root, &root.join("package.json"));
         let typescript = root.join("tsconfig.json").is_file() || package.contains("typescript");
         let mut evidence = vec!["package.json".to_string()];
         if root.join("tsconfig.json").is_file() {
@@ -136,8 +138,12 @@ fn profile(
     }
 }
 
-fn read_lossy(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default().to_lowercase()
+fn read_lossy(root: &Path, path: &Path) -> String {
+    let mut text = String::new();
+    if let Ok(file) = crate::repository_file::open(root, path) {
+        let _ = file.take(16 * 1024).read_to_string(&mut text);
+    }
+    text.to_lowercase()
 }
 
 #[cfg(test)]

@@ -48,6 +48,25 @@ In the web UI:
 
 Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output configuration. The initial output is a reviewable task result; repository publishing is intentionally deferred.
 
+Approval is accepted only once, while the task is waiting for review. Early,
+duplicate, and terminal-task approval requests are rejected. An approved
+specification must contain non-empty text.
+
+The local web server accepts browser requests only from
+`http://127.0.0.1:PORT` or `http://localhost:PORT`, using its configured port.
+Cross-origin browser requests and unrecognized Host headers are rejected;
+native clients may omit Origin. This origin boundary does not replace future
+user authentication or an execution sandbox.
+
+If implementation or verification fails, available changes are captured in the
+task result before workspace cleanup. If result capture itself fails, cleanup
+is skipped and the server retains the UUID-named task workspace for manual
+recovery. Results otherwise remain in memory until persistence is implemented.
+
+Inspection skips linked repository files, including instructions and metadata.
+Writing the approved `SPEC.md` rejects linked destinations and replaces an
+ordinary file through a temporary file, without truncating its existing target.
+
 ## Supported technology profiles
 
 The application currently detects or accepts:
@@ -147,7 +166,7 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Only public GitHub repositories are supported; no OAuth or GitHub App authentication exists yet.
 - Projects and task history are lost when the process restarts.
 - The initial New Project output is a reviewable result, not a downloadable archive or pushed repository.
-- Workspaces use the server's temporary directory and are cleaned after execution.
+- Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
 

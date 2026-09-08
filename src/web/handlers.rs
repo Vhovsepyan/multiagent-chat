@@ -243,9 +243,14 @@ pub async fn approve_task(
         return Err(ApiError::bad_request("an edited spec cannot be empty"));
     }
 
-    if !state.manager.decide(id, decision) {
-        return Err(ApiError::not_found(format!("no task {id}")));
-    }
+    state
+        .manager
+        .decide_checked(id, decision)
+        .map_err(|error| match error {
+            crate::task::DecisionError::NotFound => ApiError::not_found(error.to_string()),
+            crate::task::DecisionError::NotWaiting => ApiError::conflict(error.to_string()),
+            crate::task::DecisionError::InvalidSpec => ApiError::bad_request(error.to_string()),
+        })?;
 
     let updated = state
         .manager

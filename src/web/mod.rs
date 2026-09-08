@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::config::Config;
@@ -94,10 +93,46 @@ pub fn router(state: AppState) -> Router {
         // browser refresh. The path is relative to the working directory.
         .nest_service("/static", ServeDir::new(static_dir()))
         .fallback_service(ServeDir::new(static_dir()))
-        // The frontend is served from this same origin in Phase 10, so CORS is
-        // only here to keep a separately-served dev page working.
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.port,
+            require_local_origin,
+        ))
         .with_state(state)
+}
+
+/// The unauthenticated local UI accepts only its configured loopback origins.
+/// Origin checks include reads; Fetch Metadata also blocks cross-site forms
+/// and navigations that omit Origin. Native clients may omit both headers.
+async fn require_local_origin(
+    axum::extract::State(port): axum::extract::State<u16>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let origins = hosts
+        .iter()
+        .map(|host| format!("http://{host}"))
+        .collect::<Vec<_>>();
+    let headers = request.headers();
+    let bad_host = headers.get(header::HOST).is_some_and(|host| {
+        host.to_str()
+            .map_or(true, |host| !hosts.iter().any(|allowed| allowed == host))
+    });
+    let bad_origin = headers.get(header::ORIGIN).is_some_and(|origin| {
+        origin.to_str().map_or(true, |origin| {
+            !origins.iter().any(|allowed| allowed == origin)
+        })
+    });
+    let cross_site = headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin" && site != "none");
+    if bad_host || bad_origin || cross_site {
+        return (StatusCode::FORBIDDEN, "request origin is not allowed").into_response();
+    }
+    next.run(request).await
 }
 
 /// Bind the port and serve until interrupted.

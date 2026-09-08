@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -105,13 +105,23 @@ fn node_commands(root: &Path) -> Vec<VerificationCommand> {
 pub async fn run(commands: &[VerificationCommand], root: &Path) -> Result<Vec<VerificationResult>> {
     let mut results = Vec::new();
     for command in commands {
-        let output = Command::new(&command.program)
+        let output = match Command::new(&command.program)
             .args(&command.args)
             .current_dir(root)
             .stdin(Stdio::null())
             .output()
             .await
-            .with_context(|| format!("could not run {}", command.display()))?;
+        {
+            Ok(output) => output,
+            Err(error) => {
+                results.push(VerificationResult {
+                    command: command.display(),
+                    success: false,
+                    output: format!("could not launch verification: {error}"),
+                });
+                break;
+            }
+        };
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),

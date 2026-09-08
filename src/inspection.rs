@@ -133,7 +133,7 @@ pub fn inspect(root: &Path, request: InspectionRequest<'_>) -> Result<Repository
         .filter(|path| is_source(path) || is_test(path))
         .take(MAX_CANDIDATE_FILES)
         .filter_map(|path| {
-            let preview = read_prefix(path, MAX_SCORE_BYTES).ok()?;
+            let preview = read_prefix(root, path, MAX_SCORE_BYTES).ok()?;
             let score = relevance_score(root, path, &preview, &keywords, request.kind);
             (score > 0).then(|| Candidate {
                 path: path.clone(),
@@ -310,9 +310,9 @@ fn relevance_score(
     score
 }
 
-fn read_prefix(path: &Path, limit: usize) -> Result<String> {
+fn read_prefix(root: &Path, path: &Path, limit: usize) -> Result<String> {
     let mut bytes = Vec::with_capacity(limit);
-    fs::File::open(path)?
+    crate::repository_file::open(root, path)?
         .take(limit as u64)
         .read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -348,7 +348,7 @@ fn read_inspected_file(root: &Path, path: &Path, remaining: &mut usize) -> Resul
     if *remaining == 0 {
         bail!("inspection context budget exhausted");
     }
-    let file = fs::File::open(path)?;
+    let file = crate::repository_file::open(root, path)?;
     let file_size = file.metadata()?.len() as usize;
     let limit = file_size.min(MAX_FILE_BYTES).min(*remaining);
     let mut bytes = Vec::with_capacity(limit);

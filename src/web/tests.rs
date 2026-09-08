@@ -20,7 +20,7 @@ use crate::workspace::LocalWorkspaceProvider;
 /// No test in this file makes an API call: creating a task spawns the pipeline,
 /// which fails on the first request and marks the task Failed. That is fine —
 /// these tests are about the HTTP surface, not the debate.
-fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("mac-web-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
 
@@ -69,6 +69,119 @@ async fn health_reports_ok() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await["status"], "ok");
+}
+
+#[tokio::test]
+async fn browser_origin_policy_rejects_foreign_requests_and_allows_local_ui() {
+    let (state, root) = test_state("origin-policy");
+    let app = router(state.clone());
+    for method in ["GET", "POST", "OPTIONS"] {
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost:1234",
+            "http://127.0.0.1:0.evil.example",
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/api/projects")
+                .header("host", "127.0.0.1:0")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+        }
+    }
+    for headers in [
+        [("sec-fetch-site", "cross-site")],
+        [("host", "evil.example:0")],
+    ] {
+        let request = Request::builder()
+            .uri("/api/projects")
+            .header(headers[0].0, headers[0].1)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for (index, host) in ["127.0.0.1:0", "localhost:0"].into_iter().enumerate() {
+        let mut request = post(
+            "/api/projects",
+            json!({"name":host,"repository":format!("owner/repo-{index}")}),
+        );
+        request.headers_mut().insert("host", host.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("origin", format!("http://{host}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn both_approval_endpoints_reject_early_terminal_and_duplicate_requests() {
+    let (state, root) = test_state("approval-state-policy");
+    let app = router(state.clone());
+    for endpoint in ["api", "ui"] {
+        for status in [
+            TaskStatus::Created,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Rejected,
+        ] {
+            let task = state.manager.create("task", "description", "legacy");
+            state.manager.emitter(task.id).emit(TaskEvent::Spec {
+                markdown: "original".into(),
+                path: "SPEC.md".into(),
+            });
+            state.manager.emitter(task.id).status(status);
+            let uri = format!("/{endpoint}/tasks/{}/approve", task.id);
+            let request = if endpoint == "api" {
+                post(&uri, json!({"approve":true,"spec":"injected"}))
+            } else {
+                post_form(&uri, "approve=true&spec=injected")
+            };
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::CONFLICT
+            );
+            let stored = state.manager.get(task.id).unwrap();
+            assert_eq!(stored.spec.as_deref(), Some("original"));
+            assert!(stored.decision.is_none());
+        }
+        let task = state.manager.create("task", "description", "legacy");
+        state
+            .manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        let uri = format!("/{endpoint}/tasks/{}/approve", task.id);
+        for expected in [StatusCode::OK, StatusCode::CONFLICT] {
+            let request = if endpoint == "api" {
+                post(&uri, json!({"approve":true,"spec":"approved"}))
+            } else {
+                post_form(&uri, "approve=true&spec=approved")
+            };
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
@@ -382,6 +495,14 @@ async fn rejecting_is_recorded_too() {
 async fn the_gate_wakes_a_waiting_pipeline() {
     let (state, root) = test_state("gate-wake");
     let task = state.manager.create("t", "d", "p");
+    state.manager.emitter(task.id).emit(TaskEvent::Spec {
+        markdown: "generated".into(),
+        path: "SPEC.md".into(),
+    });
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::WaitingForApproval);
 
     let manager = state.manager.clone();
     let id = task.id;
@@ -408,6 +529,10 @@ async fn the_gate_wakes_a_waiting_pipeline() {
 async fn an_answer_before_the_gate_is_not_lost() {
     let (state, root) = test_state("gate-early");
     let task = state.manager.create("t", "d", "p");
+    state
+        .manager
+        .emitter(task.id)
+        .status(TaskStatus::WaitingForApproval);
 
     state.manager.decide(
         task.id,

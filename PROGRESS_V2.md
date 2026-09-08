@@ -20,6 +20,17 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- P1 review fixes (2026-09-08): Approval validation and decision recording now
+  share one TaskManager lock; only an unanswered WaitingForApproval gate can
+  accept a decision. Both HTTP approval paths use this boundary.
+- Repository inspection rejects linked files and linked parent paths, including
+  instruction/build metadata reads. Approved SPEC.md is written to an exclusively
+  created temporary file and renamed, with linked destinations rejected.
+- Browser requests are limited to the configured local UI origins and Host
+  values; permissive CORS has been removed. Authentication remains future work.
+- Failed implementation/verification captures available diffs before cleanup.
+  Launch errors become verification failures; failed diff capture retains the
+  task workspace for manual recovery.
 - DP-15 (2026-09-04): A Project is repository identity and metadata, never a
   persistent workspace path. GitHub `owner/repository` is normalized at the
   domain boundary; provider-specific acquisition stays behind ProjectSource.

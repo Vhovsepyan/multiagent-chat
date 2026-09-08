@@ -18,19 +18,68 @@ pub fn spawn(state: AppState, id: TaskId) {
         let mut workspace = None;
         let result = run(&state, id, &emitter, &mut workspace).await;
 
-        if let Some(workspace) = workspace
-            && let Err(error) = state.workspaces.cleanup(&workspace)
-        {
-            emitter.warn(format!("workspace cleanup failed: {error}"));
-        }
-
-        if let Err(error) = result {
-            emitter.emit(TaskEvent::Finished {
-                status: TaskStatus::Failed,
-                error: Some(format!("{error:#}")),
-            });
-        }
+        finish_run(&state, id, &emitter, workspace.as_ref(), result);
     });
+}
+
+fn finish_run(
+    state: &AppState,
+    id: TaskId,
+    emitter: &Emitter,
+    workspace: Option<&TaskWorkspace>,
+    result: Result<()>,
+) {
+    let mut may_cleanup = true;
+    if result.is_err()
+        && let Some(workspace) = workspace
+        && state
+            .manager
+            .get(id)
+            .is_some_and(|task| task.result.is_none())
+    {
+        match diff_result(&workspace.path) {
+            Ok(diff) => {
+                let verification = state
+                    .manager
+                    .get(id)
+                    .map(|task| {
+                        task.history
+                            .into_iter()
+                            .filter_map(|event| match event {
+                                TaskEvent::Verification { result } => Some(result),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                emitter.emit(TaskEvent::Result {
+                    result: TaskResult {
+                        source_revision: workspace.revision.clone(),
+                        verification,
+                        diff,
+                    },
+                });
+            }
+            Err(error) => {
+                may_cleanup = false;
+                emitter.warn(format!(
+                    "result capture failed: {error}; task workspace retained for recovery"
+                ));
+            }
+        }
+    }
+    if may_cleanup
+        && let Some(workspace) = workspace
+        && let Err(error) = state.workspaces.cleanup(workspace)
+    {
+        emitter.warn(format!("workspace cleanup failed: {error}"));
+    }
+    if let Err(error) = result {
+        emitter.emit(TaskEvent::Finished {
+            status: TaskStatus::Failed,
+            error: Some(format!("{error:#}")),
+        });
+    }
 }
 
 async fn run(
@@ -69,7 +118,8 @@ async fn run(
             let project = project
                 .as_ref()
                 .expect("validated existing task has project");
-            let prepared = prepare_existing(state, id, project)?;
+            *workspace = Some(prepare_existing(state, id, project)?);
+            let prepared = workspace.as_ref().expect("workspace was prepared");
             let inspection = inspect(
                 &prepared.path,
                 InspectionRequest {
@@ -85,7 +135,6 @@ async fn run(
                 profile: profile.clone(),
                 source_revision: prepared.revision.clone(),
             });
-            *workspace = Some(prepared);
             (profile, context)
         }
     };
@@ -203,6 +252,124 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn partial_implementation_failure_captures_changes_before_cleanup() {
+        let (state, root) = crate::web::tests::test_state("partial-result");
+        let task = state.manager.create("task", "description", "legacy");
+        let emitter = state.manager.emitter(task.id);
+        emitter.status(TaskStatus::Implementing);
+        let workspace = state
+            .workspaces
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        std::fs::write(workspace.path.join("partial.py"), "print('partial work')\n").unwrap();
+        finish_run(
+            &state,
+            task.id,
+            &emitter,
+            Some(&workspace),
+            Err(anyhow::anyhow!("implementer failed")),
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert!(
+            stored
+                .result
+                .unwrap()
+                .diff
+                .contains("+print('partial work')")
+        );
+        assert!(!workspace.path.exists());
+        let result_index = stored
+            .history
+            .iter()
+            .position(|event| matches!(event, TaskEvent::Result { .. }))
+            .unwrap();
+        let finished_index = stored
+            .history
+            .iter()
+            .position(|event| matches!(event, TaskEvent::Finished { .. }))
+            .unwrap();
+        assert!(result_index < finished_index);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_verifier_keeps_generated_files_and_verification_failure() {
+        let (state, root) = crate::web::tests::test_state("missing-verifier-result");
+        let task = state.manager.create("task", "description", "legacy");
+        let emitter = state.manager.emitter(task.id);
+        let workspace = state
+            .workspaces
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        std::fs::write(workspace.path.join("main.py"), "print('complete')\n").unwrap();
+        let commands = [crate::verification::VerificationCommand {
+            program: root
+                .join("missing-verifier-executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![],
+        }];
+        let results = crate::verification::run(&commands, &workspace.path)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        emitter.emit(TaskEvent::Verification {
+            result: results[0].clone(),
+        });
+        finish_run(
+            &state,
+            task.id,
+            &emitter,
+            Some(&workspace),
+            Err(anyhow::anyhow!("verification failed")),
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        let result = stored.result.unwrap();
+        assert!(result.diff.contains("+print('complete')"));
+        assert!(result.verification[0].output.contains("could not launch"));
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert!(!workspace.path.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_diff_capture_retains_workspace_for_recovery() {
+        let (state, root) = crate::web::tests::test_state("uncaptured-result");
+        let task = state.manager.create("task", "description", "legacy");
+        let workspace = TaskWorkspace {
+            path: root.join("task-workspaces").join(task.id.to_string()),
+            revision: None,
+        };
+        std::fs::create_dir(&workspace.path).unwrap();
+        std::fs::write(workspace.path.join("recover.txt"), "preserve me").unwrap();
+        finish_run(
+            &state,
+            task.id,
+            &state.manager.emitter(task.id),
+            Some(&workspace),
+            Err(anyhow::anyhow!("execution failed")),
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("recover.txt")).unwrap(),
+            "preserve me"
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert!(stored.history.iter().any(|event| matches!(event, TaskEvent::Warning { message } if message.contains("retained for recovery"))));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn implementer_spec_file_matches_authoritative_approved_text() {
         let manager = TaskManager::new();
         let task = manager.create("task", "description", "legacy");
@@ -210,6 +377,9 @@ mod tests {
             markdown: "generated".into(),
             path: spec::SPEC_FILENAME.into(),
         });
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
         manager.decide(
             task.id,
             Decision {
