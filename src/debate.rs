@@ -11,7 +11,8 @@
 
 use anyhow::Result;
 
-use crate::api::{Message, claude::ClaudeClient, gemini::GeminiClient};
+use crate::agent::ChatAgent;
+use crate::api::Message;
 use crate::task::{Emitter, TaskEvent};
 use crate::ui;
 
@@ -84,6 +85,12 @@ impl Transcript {
             topic: topic.into(),
             turns: Vec::new(),
         }
+    }
+
+    /// Test-only: build a transcript without running a debate.
+    #[cfg(test)]
+    pub fn push_for_test(&mut self, speaker: Speaker, text: impl Into<String>) {
+        self.push(speaker, text);
     }
 
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
@@ -214,8 +221,8 @@ pub struct Outcome {
 /// stays exactly as v1 had it, so the CLI is unchanged; a CLI run just passes
 /// `Emitter::detached()` and nothing is published.
 pub async fn run(
-    proposer: &GeminiClient,
-    critic: &ClaudeClient,
+    proposer: &dyn ChatAgent,
+    critic: &dyn ChatAgent,
     topic: &str,
     max_rounds: u32,
     emitter: &Emitter,
@@ -235,7 +242,7 @@ pub async fn run(
 
         ui::system("waiting for the Proposer...");
         let proposal = proposer
-            .send(Some(PROPOSER_SYSTEM), &transcript.for_proposer())
+            .complete_text(Some(PROPOSER_SYSTEM), &transcript.for_proposer())
             .await?;
         ui::proposer(&proposal);
         emitter.emit(TaskEvent::Proposal {
@@ -246,7 +253,7 @@ pub async fn run(
 
         ui::system("waiting for the Critic...");
         let critique = critic
-            .send(Some(CRITIC_SYSTEM), &transcript.for_critic())
+            .complete_text(Some(CRITIC_SYSTEM), &transcript.for_critic())
             .await?;
         ui::critic(&critique);
         transcript.push(Speaker::Critic, &critique);
@@ -307,7 +314,102 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ProviderId;
+    use crate::agent::chat::ScriptedAgent;
     use crate::api::Role;
+
+    // --- task 0004: the loop is provider-agnostic --------------------------
+
+    /// The whole point of the abstraction: a full debate with no API key, no
+    /// network, and no vendor type in sight.
+    #[tokio::test]
+    async fn runs_to_approval_against_any_chat_agent() {
+        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["a concrete plan"]);
+        let critic = ScriptedAgent::new(
+            ProviderId::Anthropic,
+            &["Good enough.
+
+REASON: the plan is buildable
+VERDICT: APPROVED"],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 3).await;
+
+        assert!(outcome.approved);
+        assert_eq!(outcome.rounds_used, 1);
+        assert_eq!(
+            outcome.last_reason.as_deref(),
+            Some("the plan is buildable")
+        );
+        assert_eq!(outcome.transcript.turns.len(), 2);
+        assert_eq!(outcome.transcript.turns[0].speaker, Speaker::Proposer);
+        assert_eq!(outcome.transcript.turns[1].speaker, Speaker::Critic);
+    }
+
+    /// NEEDS_WORK sends the review back and the second round sees it, which is
+    /// what proves the two agents share one transcript (DP-1).
+    #[tokio::test]
+    async fn feeds_a_rejected_proposal_back_to_the_proposer() {
+        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft one", "draft two"]);
+        let critic = ScriptedAgent::new(
+            ProviderId::Anthropic,
+            &[
+                "REASON: the schema is wrong
+VERDICT: NEEDS_WORK",
+                "REASON: fixed
+VERDICT: APPROVED",
+            ],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 3).await;
+
+        assert!(outcome.approved);
+        assert_eq!(outcome.rounds_used, 2);
+        assert_eq!(proposer.calls(), 2);
+        let (system, second) = proposer.call(1);
+        assert_eq!(system.as_deref(), Some(PROPOSER_SYSTEM));
+        assert!(
+            second
+                .last()
+                .unwrap()
+                .content
+                .contains("the schema is wrong"),
+            "the second round should carry the critique back"
+        );
+    }
+
+    /// Gate 1 returns either way; running out of rounds is not an error.
+    #[tokio::test]
+    async fn stops_unapproved_when_the_rounds_run_out() {
+        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft"]);
+        let critic = ScriptedAgent::new(
+            ProviderId::Anthropic,
+            &["REASON: still unsafe
+VERDICT: NEEDS_WORK"],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 1).await;
+
+        assert!(!outcome.approved);
+        assert_eq!(outcome.rounds_used, 1);
+        assert_eq!(outcome.last_reason.as_deref(), Some("still unsafe"));
+    }
+
+    async fn debate_with(
+        proposer: &ScriptedAgent,
+        critic: &ScriptedAgent,
+        max_rounds: u32,
+    ) -> Outcome {
+        run(
+            proposer,
+            critic,
+            "credit applications",
+            max_rounds,
+            &Emitter::detached(),
+        )
+        .await
+        .expect("scripted agents never fail")
+    }
 
     fn transcript_with(turns: &[(Speaker, &str)]) -> Transcript {
         let mut t = Transcript::new("credit applications");

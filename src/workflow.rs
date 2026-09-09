@@ -5,6 +5,9 @@ use crate::technology::ProjectProfile;
 
 const COMMON: &str = "Preserve unrelated behavior, follow repository instructions, avoid secrets, and produce a concrete buildable proposal.";
 
+/// The terminal pipeline has no task kind, so it keeps the instruction v1 used.
+pub const CLI_INSTRUCTIONS: &str = "Do not commit or push.";
+
 pub fn design_context(kind: TaskKind, profile: &ProjectProfile, inspection: &str) -> String {
     format!(
         "Task workflow: {}\nTechnology profile: {:?}\n\n{}\n\nRepository context:\n{}",

@@ -213,6 +213,7 @@ Core modules:
 
 ```text
 src/
+  agent/           role abstractions (chat/coding) and provider factories
   project.rs       repository-backed Project domain and store boundary
   workspace.rs     isolated task workspace provider and result diff
   inspection.rs    bounded metadata and instruction discovery
@@ -222,7 +223,7 @@ src/
   task.rs          task state, validation, history, and result model
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
-  implementer.rs   Claude Code process and streamed output
+  implementer.rs   Claude Code coding-agent adapter, process and streamed output
   process_environment.rs explicit child-process environment policy
   execution_limits.rs centralized timeout, output, history, recovery settings
   process_runner.rs bounded process execution and output streaming

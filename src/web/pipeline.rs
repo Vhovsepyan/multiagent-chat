@@ -2,8 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::api::claude::ClaudeClient;
-use crate::api::gemini::GeminiClient;
+use crate::agent::CodingTaskRequest;
 use crate::inspection::{InspectionRequest, inspect};
 use crate::project::Project;
 use crate::spec;
@@ -209,17 +208,23 @@ async fn run(
         task.topic(),
         crate::workflow::design_context(task.kind, &profile, &repository_context)
     );
-    let proposer = GeminiClient::new(&state.config)?;
-    let critic = ClaudeClient::new(&state.config)?;
+    let proposer = crate::agent::default_proposer(&state.config)?;
+    let critic = crate::agent::default_critic(&state.config)?;
 
     emitter.status(TaskStatus::Debating);
-    let outcome =
-        crate::debate::run(&proposer, &critic, &topic, state.config.max_rounds, emitter).await?;
+    let outcome = crate::debate::run(
+        proposer.as_ref(),
+        critic.as_ref(),
+        &topic,
+        state.config.max_rounds,
+        emitter,
+    )
+    .await?;
 
     emitter.status(TaskStatus::GeneratingSpec);
     let document = spec::build(
-        &proposer,
-        &critic,
+        proposer.as_ref(),
+        critic.as_ref(),
         &outcome.transcript,
         outcome.approved,
         emitter,
@@ -258,14 +263,17 @@ async fn run(
 
     emitter.status(TaskStatus::Implementing);
     let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
-    crate::implementer::run_with_prompt(
-        &state.config,
-        &workspace_ref.path,
-        &spec_path,
-        emitter,
-        &prompt,
-    )
-    .await?;
+    let worker = crate::agent::default_worker(&state.config)?;
+    worker
+        .execute(
+            CodingTaskRequest {
+                workspace: &workspace_ref.path,
+                spec_path: &spec_path,
+                instructions: &prompt,
+            },
+            emitter,
+        )
+        .await?;
 
     let commands = crate::verification::plan(&profile, &workspace_ref.path);
     if commands.is_empty() {

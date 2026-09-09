@@ -20,6 +20,19 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-20 (2026-09-09, task 0004): orchestration depends on agent ROLES, not
+  vendors. `src/agent/` holds two traits — `ChatAgent` (Proposer/Critic) and
+  `CodingAgent` (Worker) — because a conversational agent and a process that
+  edits a workspace are different in kind. `async-trait` was added so the
+  traits stay usable as `&dyn`/`Box<dyn>`, which is what per-task provider
+  selection will need; the cost is one boxed future per call, negligible next
+  to an HTTP round trip. Provider choice exists only in the factories in
+  `agent/mod.rs` (`DEFAULT_PROPOSER`/`DEFAULT_CRITIC`/`DEFAULT_WORKER`), so no
+  pipeline stage branches on a provider. Adapters stay with their vendor:
+  `api/gemini.rs`, `api/claude.rs`, and `implementer.rs` (`ClaudeCodeAgent`),
+  keeping retry policy, process environment filtering, execution limits and
+  artifact-path handling unchanged. Wiring is unchanged: Gemini proposes,
+  Anthropic critiques, Claude Code implements.
 - Execution limits (2026-09-08): Shared process runner drains stdout/stderr
   concurrently with bounded capture and explicit truncation markers. Defaults:
   30 minutes for implementation, 10 minutes per verification command, 5 minutes

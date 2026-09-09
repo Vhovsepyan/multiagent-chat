@@ -4,6 +4,7 @@
 //! target repo, the Proposer/Critic debate (Gate 1), SPEC.md, and the human
 //! approval gate (Gate 2). Phase 5 adds the implementer.
 
+mod agent;
 mod api;
 mod approve;
 mod cli;
@@ -32,8 +33,7 @@ mod workspace;
 
 use anyhow::Result;
 
-use crate::api::claude::ClaudeClient;
-use crate::api::gemini::GeminiClient;
+use crate::agent::CodingTaskRequest;
 use crate::config::Config;
 
 #[tokio::main]
@@ -86,11 +86,19 @@ async fn main() -> Result<()> {
         };
         let repo = target::resolve(&config, &topic)?;
 
-        let proposer = GeminiClient::new(&config)?;
-        let critic = ClaudeClient::new(&config)?;
+        // Roles, not vendors (task 0004): the factory decides who serves each.
+        let proposer = agent::default_proposer(&config)?;
+        let critic = agent::default_critic(&config)?;
 
         // Gate 1: the debate runs until APPROVED or max rounds.
-        let outcome = debate::run(&proposer, &critic, &topic, config.max_rounds, &emitter).await?;
+        let outcome = debate::run(
+            proposer.as_ref(),
+            critic.as_ref(),
+            &topic,
+            config.max_rounds,
+            &emitter,
+        )
+        .await?;
         ui::system(&format!(
             "debate finished after {} round(s)",
             outcome.rounds_used
@@ -99,8 +107,8 @@ async fn main() -> Result<()> {
         // The spec is built from the transcript either way; `approved` only
         // changes how loudly we warn about it.
         let document = spec::build(
-            &proposer,
-            &critic,
+            proposer.as_ref(),
+            critic.as_ref(),
             &outcome.transcript,
             outcome.approved,
             &emitter,
@@ -122,8 +130,18 @@ async fn main() -> Result<()> {
 
     ui::success("approved.");
 
-    // Phase 5: hand it to Claude Code inside the target repo.
-    implementer::run(&config, &target_repo, &spec_path, &emitter).await?;
+    // Phase 5: hand it to the Worker agent inside the target repo.
+    let worker = agent::default_worker(&config)?;
+    worker
+        .execute(
+            CodingTaskRequest {
+                workspace: &target_repo,
+                spec_path: &spec_path,
+                instructions: workflow::CLI_INSTRUCTIONS,
+            },
+            &emitter,
+        )
+        .await?;
 
     Ok(())
 }

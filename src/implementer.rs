@@ -20,7 +20,9 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 
+use crate::agent::{CodingAgent, CodingTaskRequest, CodingTaskResult, ProviderId};
 use crate::config::Config;
 use crate::task::Emitter;
 use crate::ui;
@@ -42,6 +44,52 @@ pub fn prompt(spec_path: &Path, task_prompt: &str) -> String {
     )
 }
 
+/// Claude Code behind the `CodingAgent` abstraction (task 0004).
+///
+/// It owns a `Config` clone rather than borrowing one, so the agent can be
+/// boxed and handed to a pipeline stage without tying it to a caller frame.
+pub struct ClaudeCodeAgent {
+    config: Config,
+}
+
+impl ClaudeCodeAgent {
+    pub fn new(config: &Config) -> Self {
+        ClaudeCodeAgent {
+            config: config.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl CodingAgent for ClaudeCodeAgent {
+    fn provider(&self) -> ProviderId {
+        ProviderId::ClaudeCode
+    }
+
+    fn model(&self) -> &str {
+        &self.config.implementer_model
+    }
+
+    async fn execute(
+        &self,
+        request: CodingTaskRequest<'_>,
+        emitter: &Emitter,
+    ) -> Result<CodingTaskResult> {
+        run_with_prompt(
+            &self.config,
+            request.workspace,
+            request.spec_path,
+            emitter,
+            request.instructions,
+        )
+        .await?;
+        Ok(CodingTaskResult {
+            provider: self.provider(),
+            model: self.model().to_string(),
+        })
+    }
+}
+
 /// Launch Claude Code in `repo` and stream its output until it exits.
 ///
 /// Phase 9 changed this from inheriting the terminal to PIPING stdout/stderr,
@@ -49,13 +97,9 @@ pub fn prompt(spec_path: &Path, task_prompt: &str) -> String {
 /// web UI. The tradeoff is real: Claude Code no longer sees a TTY, so it may
 /// drop colour and progress animations that it would show when run directly.
 /// Line-by-line output is otherwise identical.
-pub async fn run(config: &Config, repo: &Path, spec_path: &Path, emitter: &Emitter) -> Result<()> {
-    run_with_prompt(config, repo, spec_path, emitter, "Do not commit or push.").await
-}
-
-/// Launch Claude Code with task-kind-specific instructions prepared by the
-/// workflow module. Common process and streaming behavior stays here.
-pub async fn run_with_prompt(
+///
+/// Private since task 0004: orchestration goes through `CodingAgent::execute`.
+async fn run_with_prompt(
     config: &Config,
     repo: &Path,
     spec_path: &Path,
@@ -129,6 +173,17 @@ mod tests {
             .expect("`claude` should be on PATH");
 
         assert!(status.success(), "claude --version failed: {status:?}");
+    }
+
+    /// Task 0004: the worker role is reached through the abstraction, and the
+    /// agent reports the provider and model it will actually use.
+    #[test]
+    fn the_claude_code_agent_reports_itself() {
+        let config = crate::agent::test_config();
+        let agent = ClaudeCodeAgent::new(&config);
+
+        assert_eq!(agent.provider(), ProviderId::ClaudeCode);
+        assert_eq!(agent.model(), config.implementer_model);
     }
 
     #[test]

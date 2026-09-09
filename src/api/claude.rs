@@ -234,6 +234,35 @@ fn text_of(response: &Response) -> Result<String> {
     Ok(text)
 }
 
+// ---------------------------------------------------------------------------
+// ChatAgent adapter (task 0004)
+// ---------------------------------------------------------------------------
+
+/// Anthropic as one of the interchangeable chat agents. The orchestration layer
+/// only ever sees this trait; everything Anthropic-specific stays above.
+#[async_trait::async_trait]
+impl crate::agent::ChatAgent for ClaudeClient {
+    fn provider(&self) -> crate::agent::ProviderId {
+        crate::agent::ProviderId::Anthropic
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn complete(
+        &self,
+        request: crate::agent::ChatRequest<'_>,
+    ) -> Result<crate::agent::ChatResponse> {
+        let text = self.send(request.system, request.messages).await?;
+        Ok(crate::agent::ChatResponse {
+            text,
+            provider: crate::agent::ChatAgent::provider(self),
+            model: self.model.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

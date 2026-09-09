@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::api::{claude::ClaudeClient, gemini::GeminiClient, push_user};
+use crate::agent::ChatAgent;
+use crate::api::push_user;
 use crate::debate::Transcript;
 use crate::task::Emitter;
 use crate::ui;
@@ -58,8 +59,8 @@ document in a code fence. If the draft was already correct, output it unchanged.
 
 /// Draft with the Proposer, then have the Critic check it (DP-3).
 pub async fn build(
-    proposer: &GeminiClient,
-    critic: &ClaudeClient,
+    proposer: &dyn ChatAgent,
+    critic: &dyn ChatAgent,
     transcript: &Transcript,
     approved: bool,
     emitter: &Emitter,
@@ -74,7 +75,7 @@ pub async fn build(
     let mut messages = transcript.for_proposer();
     push_user(&mut messages, request);
     let draft = proposer
-        .send(Some(DRAFT_SYSTEM), &messages)
+        .complete_text(Some(DRAFT_SYSTEM), &messages)
         .await
         .context("the Proposer failed to draft the spec")?;
 
@@ -101,7 +102,7 @@ pub async fn build(
         ),
     );
     let checked = critic
-        .send(Some(CHECK_SYSTEM), &messages)
+        .complete_text(Some(CHECK_SYSTEM), &messages)
         .await
         .context("the Critic failed to check the spec")?;
 
@@ -194,6 +195,78 @@ fn strip_code_fence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ProviderId;
+    use crate::agent::chat::ScriptedAgent;
+    use crate::debate::{Speaker, Transcript};
+
+    // --- task 0004: DP-3 now runs against any chat agent -------------------
+
+    /// The Critic checks the Proposer draft, and its corrected version is what
+    /// comes back — fence and all removed.
+    #[tokio::test]
+    async fn the_critics_corrected_draft_is_the_result() {
+        let proposer = ScriptedAgent::new(
+            ProviderId::Gemini,
+            &["## Problem
+drafted"],
+        );
+        let critic = ScriptedAgent::new(
+            ProviderId::Anthropic,
+            &["```markdown
+## Problem
+corrected
+```"],
+        );
+
+        let document = build(
+            &proposer,
+            &critic,
+            &transcript(),
+            true,
+            &crate::task::Emitter::detached(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            document,
+            "## Problem
+corrected"
+        );
+        assert!(critic.call(0).1.last().unwrap().content.contains("drafted"));
+    }
+
+    /// An unapproved debate must tell the Critic to keep its live objections
+    /// in the document, or the implementer builds a design nobody agreed to.
+    #[tokio::test]
+    async fn an_unapproved_debate_demands_open_risks() {
+        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft"]);
+        let critic = ScriptedAgent::new(ProviderId::Anthropic, &["checked"]);
+
+        build(
+            &proposer,
+            &critic,
+            &transcript(),
+            false,
+            &crate::task::Emitter::detached(),
+        )
+        .await
+        .unwrap();
+
+        let request = critic.call(0).1.last().unwrap().content.clone();
+        assert!(
+            request.contains("WITHOUT agreement"),
+            "unexpected: {request}"
+        );
+        assert!(request.contains("Open risks"));
+    }
+
+    fn transcript() -> Transcript {
+        let mut t = Transcript::new("credit applications");
+        t.push_for_test(Speaker::Proposer, "the agreed design");
+        t.push_for_test(Speaker::Critic, "VERDICT: APPROVED");
+        t
+    }
 
     #[test]
     fn unwraps_a_whole_document_fence() {
