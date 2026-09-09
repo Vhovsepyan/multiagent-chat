@@ -11,7 +11,7 @@ use crate::spec;
 use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus};
 use crate::technology::ProjectProfile;
 use crate::web::AppState;
-use crate::workspace::{TaskWorkspace, WorkspaceRequest, diff_result_with_limits};
+use crate::workspace::{TaskWorkspace, WorkspaceRequest, task_result_diff};
 
 pub fn spawn(state: AppState, id: TaskId) {
     tokio::spawn(async move {
@@ -52,7 +52,11 @@ fn finish_run(
             .get(id)
             .is_some_and(|task| task.result.is_none())
     {
-        match diff_result_with_limits(&workspace.path, &state.config.execution) {
+        match task_result_diff(
+            &workspace.path,
+            workspace.revision.as_deref(),
+            &state.config.execution,
+        ) {
             Ok(diff) => {
                 let verification = state
                     .manager
@@ -418,9 +422,11 @@ async fn run(
             });
             let diff_path = workspace_ref.path.clone();
             let limits = state.config.execution.clone();
-            let diff =
-                tokio::task::spawn_blocking(move || diff_result_with_limits(&diff_path, &limits))
-                    .await??;
+            let baseline = workspace_ref.revision.clone();
+            let diff = tokio::task::spawn_blocking(move || {
+                task_result_diff(&diff_path, baseline.as_deref(), &limits)
+            })
+            .await??;
             emitter.emit(TaskEvent::Result {
                 result: TaskResult {
                     source_revision: workspace_ref.revision.clone(),
@@ -485,8 +491,11 @@ async fn run(
     }
     let diff_path = workspace_ref.path.clone();
     let limits = state.config.execution.clone();
-    let diff =
-        tokio::task::spawn_blocking(move || diff_result_with_limits(&diff_path, &limits)).await??;
+    let baseline = workspace_ref.revision.clone();
+    let diff = tokio::task::spawn_blocking(move || {
+        task_result_diff(&diff_path, baseline.as_deref(), &limits)
+    })
+    .await??;
     let result = TaskResult {
         source_revision: workspace_ref.revision.clone(),
         verification: all_verification,

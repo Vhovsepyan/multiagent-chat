@@ -203,8 +203,38 @@ pub fn diff_result(root: &Path) -> Result<String> {
     Ok(change_set(root)?.render())
 }
 
-pub fn diff_result_with_limits(root: &Path, limits: &ExecutionLimits) -> Result<String> {
-    Ok(change_set_with_limits(root, limits)?.render())
+/// What a captured result is measured against (task 0009 follow-up).
+///
+/// Once milestones are committed, the working tree matches HEAD and a
+/// HEAD-relative diff reports nothing. A task result must instead describe
+/// everything the run produced, committed or not.
+#[derive(Debug, Clone, Copy)]
+pub enum DiffBaseline<'a> {
+    /// Uncommitted work only — the pre-0009 view. Production capture always
+    /// measures from the task baseline, so only tests build this variant.
+    #[allow(dead_code)]
+    Head,
+    /// The revision the workspace was prepared at: milestone commits made
+    /// since then are part of the result, as is anything still uncommitted.
+    Revision(&'a str),
+    /// The task started from an empty project, so everything present is new.
+    EmptyProject,
+}
+
+/// The complete change a task produced, whatever its Git mode.
+///
+/// `revision` is `TaskWorkspace::revision`: the source revision of an existing
+/// repository, or `None` for a New Project, which starts empty.
+pub fn task_result_diff(
+    root: &Path,
+    revision: Option<&str>,
+    limits: &ExecutionLimits,
+) -> Result<String> {
+    let baseline = match revision {
+        Some(revision) => DiffBaseline::Revision(revision),
+        None => DiffBaseline::EmptyProject,
+    };
+    Ok(change_set_from(root, baseline, limits)?.render())
 }
 
 #[cfg(test)]
@@ -212,24 +242,77 @@ pub fn change_set(root: &Path) -> Result<ChangeSet> {
     change_set_with_limits(root, &ExecutionLimits::default())
 }
 
+#[cfg(test)]
 fn change_set_with_limits(root: &Path, limits: &ExecutionLimits) -> Result<ChangeSet> {
+    change_set_from(root, DiffBaseline::Head, limits)
+}
+
+fn change_set_from(
+    root: &Path,
+    baseline: DiffBaseline<'_>,
+    limits: &ExecutionLimits,
+) -> Result<ChangeSet> {
     let status = git_output_bytes(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         limits,
     )?;
-    let files = parse_status(&status);
     let has_head = git_command(root, &["rev-parse", "--verify", "HEAD"], limits)?
         .status
         .success();
-    let tracked_diff = if has_head {
-        git_output(
-            root,
-            &["diff", "--no-ext-diff", "--find-renames", "HEAD"],
-            limits,
-        )?
-    } else {
-        String::new()
+    let (files, tracked_diff) = match baseline {
+        DiffBaseline::Head => {
+            let tracked = if has_head {
+                git_output(
+                    root,
+                    &["diff", "--no-ext-diff", "--find-renames", "HEAD"],
+                    limits,
+                )?
+            } else {
+                String::new()
+            };
+            (parse_status(&status), tracked)
+        }
+        DiffBaseline::Revision(revision) => {
+            // `git diff <revision>` compares the WORKING TREE with that commit,
+            // so committed milestones and uncommitted work arrive together.
+            let named = git_output_bytes(
+                root,
+                &["diff", "--name-status", "-z", "--find-renames", revision],
+                limits,
+            )?;
+            let mut files = parse_name_status(&named);
+            // Untracked files belong to no tree, so they come from status.
+            files.extend(
+                parse_status(&status)
+                    .into_iter()
+                    .filter(|change| change.untracked),
+            );
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            let tracked = git_output(
+                root,
+                &["diff", "--no-ext-diff", "--find-renames", revision],
+                limits,
+            )?;
+            (files, tracked)
+        }
+        DiffBaseline::EmptyProject => {
+            // Nothing existed at the start, so every file present now — whether
+            // a milestone committed it or the worker just wrote it — is added,
+            // and its content is read from disk rather than from a diff.
+            let listing = git_output_bytes(
+                root,
+                &[
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+                limits,
+            )?;
+            (parse_file_listing(root, &listing), String::new())
+        }
     };
     let mut remaining = GIT_OUTPUT_BYTES.saturating_sub(tracked_diff.len() + status.len());
     let mut untracked_diffs = Vec::new();
@@ -246,6 +329,69 @@ fn change_set_with_limits(root: &Path, limits: &ExecutionLimits) -> Result<Chang
         tracked_diff,
         untracked_diffs,
     })
+}
+
+/// `git diff --name-status -z`: a status field, then one path (two for a
+/// rename or copy), each NUL-terminated.
+fn parse_name_status(raw: &[u8]) -> Vec<FileChange> {
+    let fields = raw
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut changes = Vec::new();
+    let mut index = 0;
+    while index + 1 < fields.len() {
+        let code = fields[index][0];
+        let renamed = matches!(code, b'R' | b'C');
+        let (path, previous_path) = if renamed && index + 2 < fields.len() {
+            let previous = String::from_utf8_lossy(fields[index + 1]).into_owned();
+            let path = String::from_utf8_lossy(fields[index + 2]).into_owned();
+            index += 3;
+            (path, Some(previous))
+        } else {
+            let path = String::from_utf8_lossy(fields[index + 1]).into_owned();
+            index += 2;
+            (path, None)
+        };
+        let kind = match code {
+            b'A' => ChangeKind::Added,
+            b'D' => ChangeKind::Deleted,
+            b'R' | b'C' => ChangeKind::Renamed,
+            _ => ChangeKind::Modified,
+        };
+        changes.push(FileChange {
+            path,
+            previous_path,
+            kind,
+            // Its content is already part of the tracked diff.
+            untracked: false,
+        });
+    }
+    changes
+}
+
+/// `git ls-files -z --cached --others --exclude-standard`: every file the
+/// project currently has. Index entries whose file is gone are skipped, since
+/// there is nothing to render for them against an empty baseline.
+fn parse_file_listing(root: &Path, raw: &[u8]) -> Vec<FileChange> {
+    let mut paths = raw
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .filter(|path| root.join(path).exists())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| FileChange {
+            path,
+            previous_path: None,
+            kind: ChangeKind::Added,
+            // Rendered from disk, exactly like an untracked file.
+            untracked: true,
+        })
+        .collect()
 }
 
 fn parse_status(status: &[u8]) -> Vec<FileChange> {
@@ -598,5 +744,193 @@ mod tests {
         let root = test_repository();
         assert_eq!(diff_result(&root).unwrap(), "No working-tree changes.");
         fs::remove_dir_all(root).ok();
+    }
+
+    // --- task 0009 follow-up: results are measured from the task baseline ---
+
+    fn commit(root: &Path, message: &str) -> String {
+        git(root, &["add", "--all", "."]);
+        git(root, &["commit", "--quiet", "-m", message]);
+        head(root)
+    }
+
+    fn head(root: &Path) -> String {
+        let output = crate::process_environment::command("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// An empty project workspace, as `prepare` leaves it for a New Project:
+    /// initialized, with no commit and therefore no source revision.
+    fn empty_project() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mac-newproject-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.email", "tests@example.com"]);
+        git(&root, &["config", "user.name", "Tests"]);
+        root
+    }
+
+    /// The bug this fixes: after a milestone commit the working tree matches
+    /// HEAD, so a HEAD-relative capture reports nothing at all.
+    #[test]
+    fn committed_milestone_work_stays_in_the_task_result() {
+        let root = test_repository();
+        let baseline = head(&root);
+        fs::write(root.join("feature.rs"), "fn feature() {}\n").unwrap();
+        commit(&root, "feat(milestone-01): feature");
+
+        assert_eq!(diff_result(&root).unwrap(), "No working-tree changes.");
+
+        let result = task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap();
+        assert!(result.contains("Added: feature.rs"), "{result}");
+        assert!(result.contains("fn feature() {}"), "{result}");
+    }
+
+    /// Several milestones accumulate into one result, not just the last one.
+    #[test]
+    fn multiple_milestone_commits_produce_a_cumulative_result() {
+        let root = test_repository();
+        let baseline = head(&root);
+
+        fs::write(root.join("first.rs"), "fn first() {}\n").unwrap();
+        commit(&root, "feat(milestone-01): first");
+        fs::write(root.join("second.rs"), "fn second() {}\n").unwrap();
+        fs::write(root.join("tracked.txt"), "after\n").unwrap();
+        fs::remove_file(root.join("delete.txt")).unwrap();
+        commit(&root, "feat(milestone-02): second");
+
+        let result = task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap();
+
+        assert!(result.contains("Added: first.rs"), "{result}");
+        assert!(result.contains("Added: second.rs"), "{result}");
+        assert!(result.contains("Modified: tracked.txt"), "{result}");
+        assert!(result.contains("Deleted: delete.txt"), "{result}");
+        assert!(result.contains("fn first() {}"), "{result}");
+        assert!(result.contains("fn second() {}"), "{result}");
+    }
+
+    /// A milestone that fails after earlier ones committed must still show the
+    /// committed work AND whatever the failing milestone left behind.
+    #[test]
+    fn a_failed_later_milestone_keeps_earlier_commits_and_current_work() {
+        let root = test_repository();
+        let baseline = head(&root);
+        fs::write(root.join("done.rs"), "fn done() {}\n").unwrap();
+        commit(&root, "feat(milestone-01): done");
+
+        // Milestone two fails: its work is only in the working tree.
+        fs::write(root.join("half-done.rs"), "fn half() {\n").unwrap();
+        fs::write(
+            root.join("tracked.txt"),
+            "edited by the failing milestone\n",
+        )
+        .unwrap();
+
+        let result = task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap();
+
+        assert!(result.contains("Added: done.rs"), "{result}");
+        assert!(result.contains("fn done() {}"), "{result}");
+        assert!(result.contains("Added: half-done.rs"), "{result}");
+        assert!(result.contains("fn half() {"), "{result}");
+        assert!(result.contains("Modified: tracked.txt"), "{result}");
+        assert!(
+            result.contains("edited by the failing milestone"),
+            "{result}"
+        );
+    }
+
+    /// A New Project has no baseline revision, so everything it generated is
+    /// the result — committed or not.
+    #[test]
+    fn a_committed_new_project_still_reports_its_generated_files() {
+        let root = empty_project();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        commit(&root, "feat(milestone-01): bootstrap");
+        // A later milestone is still in progress.
+        fs::write(root.join("src/lib.rs"), "pub fn work() {}\n").unwrap();
+
+        let result = task_result_diff(&root, None, &ExecutionLimits::default()).unwrap();
+
+        assert_ne!(result, "No working-tree changes.");
+        assert!(result.contains("Added: Cargo.toml"), "{result}");
+        assert!(result.contains("Added: src/main.rs"), "{result}");
+        assert!(result.contains("Added: src/lib.rs"), "{result}");
+        assert!(result.contains("fn main() {}"), "{result}");
+        assert!(result.contains("pub fn work() {}"), "{result}");
+        // Git's own metadata is never part of the result.
+        assert!(!result.contains(".git/"), "{result}");
+    }
+
+    /// With no commits the baseline capture must match what the task produced
+    /// before this change: the same files, the same content.
+    #[test]
+    fn uncommitted_only_results_are_unchanged() {
+        let root = test_repository();
+        let baseline = head(&root);
+        fs::write(root.join("tracked.txt"), "after\n").unwrap();
+        fs::write(root.join("added.txt"), "new file\n").unwrap();
+        fs::remove_file(root.join("delete.txt")).unwrap();
+
+        let previous = diff_result(&root).unwrap();
+        let result = task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap();
+
+        for expected in [
+            "Modified: tracked.txt",
+            "Added: added.txt",
+            "Deleted: delete.txt",
+            "new file",
+        ] {
+            assert!(previous.contains(expected), "{previous}");
+            assert!(result.contains(expected), "{result}");
+        }
+    }
+
+    /// The same for a New Project that never committed: unchanged behavior.
+    #[test]
+    fn an_uncommitted_new_project_result_is_unchanged() {
+        let root = empty_project();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let previous = diff_result(&root).unwrap();
+        let result = task_result_diff(&root, None, &ExecutionLimits::default()).unwrap();
+
+        assert!(previous.contains("Added: main.rs"), "{previous}");
+        assert!(result.contains("Added: main.rs"), "{result}");
+        assert!(result.contains("fn main() {}"), "{result}");
+    }
+
+    /// A clean run that committed everything is not "no changes"; a run that
+    /// produced nothing at all still is.
+    #[test]
+    fn an_untouched_workspace_still_reports_no_changes() {
+        let root = test_repository();
+        let baseline = head(&root);
+
+        assert_eq!(
+            task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap(),
+            "No working-tree changes."
+        );
+    }
+
+    /// Renames survive the baseline capture, including across a commit.
+    #[test]
+    fn committed_renames_are_reported_as_renames() {
+        let root = test_repository();
+        let baseline = head(&root);
+        git(&root, &["mv", "tracked.txt", "renamed.txt"]);
+        commit(&root, "feat(milestone-01): rename");
+
+        let result = task_result_diff(&root, Some(&baseline), &ExecutionLimits::default()).unwrap();
+
+        assert!(
+            result.contains("Renamed: tracked.txt -> renamed.txt"),
+            "{result}"
+        );
     }
 }

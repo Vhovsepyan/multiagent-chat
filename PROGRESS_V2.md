@@ -23,6 +23,19 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-28 (2026-09-09, task 0009 follow-up): a task result is measured from the
+  task's own baseline, not from `HEAD`. `workspace::task_result_diff` takes
+  `TaskWorkspace::revision`: `Some(revision)` compares the working tree with
+  that commit (`git diff <revision>`, which spans committed milestones and
+  uncommitted work in one pass, with untracked files added from status), and
+  `None` — a New Project, which starts empty — lists every file the project now
+  has (`git ls-files --cached --others --exclude-standard`) and renders each
+  from disk. Without this, a run whose milestones all committed reported "No
+  working-tree changes", and a failed later milestone lost the earlier
+  committed work. All three capture sites (success, milestone failure, and the
+  failure finalizer) use it, so GitMode::None output is unchanged: with no
+  commits the baseline diff equals the previous HEAD-relative diff. Capture
+  stays read-only and keeps the existing Git output budget.
 - DP-27 (2026-09-09, task 0009): milestone commits are opt-in per run.
   `GitMode` (`none` by default, `commit_per_milestone`) is part of the task
   request, frozen on the task like the agent selection, and `src/git.rs` owns

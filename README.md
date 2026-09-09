@@ -286,6 +286,14 @@ identity passed per command, so global Git configuration is never modified, and
 signing is disabled for that command because headless execution cannot answer a
 passphrase prompt.
 
+The captured task result is measured from where the task started, not from
+`HEAD`, so committing a milestone never removes it from the result. An existing
+project is compared with the source revision the workspace was prepared at; a
+New Project is compared with the empty project it began as. Either way the
+result contains every committed milestone plus anything still staged, unstaged
+or untracked, under the same Git output budget as before. Capture remains
+read-only: it never resets, cleans, checks out, or rewrites anything.
+
 ## Agent selection
 
 Three roles are configured independently per task:
