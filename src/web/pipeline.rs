@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use crate::agent::{CodingAgent, CodingAgentConfig, CodingTaskRequest};
 use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
 use crate::inspection::{InspectionRequest, inspect};
+use crate::milestone::plan_from_spec;
 use crate::project::Project;
 use crate::spec;
 use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus};
@@ -92,21 +93,26 @@ fn finish_run(
     if !may_cleanup && let Some(workspace) = workspace {
         schedule_recovery_cleanup(state, workspace, emitter);
     }
-    let (status, error) = match result {
-        Err(error) => (TaskStatus::Failed, Some(format!("{error:#}"))),
-        Ok(()) => {
-            let rejected = state
-                .manager
-                .get(id)
-                .is_some_and(|task| task.status == TaskStatus::Rejected);
-            (
-                if rejected {
-                    TaskStatus::Rejected
-                } else {
-                    TaskStatus::Completed
-                },
-                None,
-            )
+    let cancelled = state.manager.is_cancelled(id);
+    let (status, error) = if cancelled {
+        (TaskStatus::Cancelled, None)
+    } else {
+        match result {
+            Err(error) => (TaskStatus::Failed, Some(format!("{error:#}"))),
+            Ok(()) => {
+                let rejected = state
+                    .manager
+                    .get(id)
+                    .is_some_and(|task| task.status == TaskStatus::Rejected);
+                (
+                    if rejected {
+                        TaskStatus::Rejected
+                    } else {
+                        TaskStatus::Completed
+                    },
+                    None,
+                )
+            }
         }
     };
     // Send terminal UI updates only after result/cleanup diagnostics are known.
@@ -120,6 +126,7 @@ fn finish_run(
             error: error.unwrap_or_else(|| "task failed".into()),
         }),
         TaskStatus::Rejected => {}
+        TaskStatus::Cancelled => {}
         _ => {}
     }
 }
@@ -283,45 +290,152 @@ async fn run(
     let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
 
     emitter.status(TaskStatus::Implementing);
-    let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
-    execute_worker(
-        agents.worker.as_ref(),
-        &task.agents.worker,
-        CodingTaskRequest {
-            workspace: &workspace_ref.path,
-            spec_path: &spec_path,
-            instructions: &prompt,
-        },
-        emitter,
-    )
-    .await?;
-
     let commands = crate::verification::plan(&profile, &workspace_ref.path);
     if commands.is_empty() {
         emitter.warn("no automatic verification commands were detected");
     }
-    let verification = execute_verification(
-        &commands,
-        &workspace_ref.path,
-        &state.config.execution,
-        emitter,
-    )
-    .await?;
-    let failed = verification.iter().any(|result| !result.success);
+    let approved_spec = state
+        .manager
+        .approved_spec(id)
+        .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
+    let milestones = plan_from_spec(&approved_spec, &commands).map_err(anyhow::Error::msg)?;
+    emitter.emit(TaskEvent::MilestonePlanCreated {
+        milestones: milestones.clone(),
+    });
+    let base_prompt = crate::workflow::implementation_prompt(task.kind, &profile);
+    let mut all_verification = Vec::new();
+    for milestone in milestones {
+        if state.manager.is_cancelled(id) {
+            emitter.emit(TaskEvent::MilestoneCancelled {
+                id: milestone.id,
+                order: milestone.order,
+                title: milestone.title,
+                reason: "task cancelled before milestone start".into(),
+            });
+            return Ok(());
+        }
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: milestone.id.clone(),
+            order: milestone.order,
+            title: milestone.title.clone(),
+            worker_tool: task.agents.worker.tool,
+            worker_model: task.agents.worker.model.clone(),
+        });
+        let instructions = format!(
+            "{base_prompt}\n\nRepository context:\n{repository_context}\n\nCurrent milestone {}: {}\nObjective: {}\nVerification instructions: {}\nDo not implement future milestones.",
+            milestone.id,
+            milestone.title,
+            milestone.objective,
+            milestone.verification_instructions.join("; ")
+        );
+        if let Err(error) = execute_worker_for_milestone(
+            agents.worker.as_ref(),
+            &task.agents.worker,
+            CodingTaskRequest {
+                workspace: &workspace_ref.path,
+                spec_path: &spec_path,
+                instructions: &instructions,
+            },
+            emitter,
+            Some((&milestone.id, &milestone.title)),
+        )
+        .await
+        {
+            let message = format!("{error:#}");
+            emitter.emit(TaskEvent::MilestoneFailed {
+                id: milestone.id,
+                order: milestone.order,
+                title: milestone.title,
+                verification: Vec::new(),
+                worker_result_summary: None,
+                error: message,
+            });
+            return Err(error);
+        }
+        if state.manager.is_cancelled(id) {
+            emitter.emit(TaskEvent::MilestoneCancelled {
+                id: milestone.id,
+                order: milestone.order,
+                title: milestone.title,
+                reason: "task cancelled after worker execution".into(),
+            });
+            return Ok(());
+        }
+        let verification = match execute_verification(
+            &commands,
+            &workspace_ref.path,
+            &state.config.execution,
+            emitter,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                emitter.emit(TaskEvent::MilestoneFailed {
+                    id: milestone.id,
+                    order: milestone.order,
+                    title: milestone.title,
+                    verification: Vec::new(),
+                    worker_result_summary: Some(
+                        "Worker completed; verification could not finish.".into(),
+                    ),
+                    error: format!("{error:#}"),
+                });
+                return Err(error);
+            }
+        };
+        if state.manager.is_cancelled(id) {
+            emitter.emit(TaskEvent::MilestoneCancelled {
+                id: milestone.id,
+                order: milestone.order,
+                title: milestone.title,
+                reason: "task cancelled during verification".into(),
+            });
+            return Ok(());
+        }
+        all_verification.extend(verification.clone());
+        let failed = verification.iter().any(|result| !result.success);
+        if failed {
+            emitter.emit(TaskEvent::MilestoneFailed {
+                id: milestone.id,
+                order: milestone.order,
+                title: milestone.title,
+                verification,
+                worker_result_summary: Some("Worker completed; verification failed.".into()),
+                error: "one or more verification commands failed".into(),
+            });
+            let diff_path = workspace_ref.path.clone();
+            let limits = state.config.execution.clone();
+            let diff =
+                tokio::task::spawn_blocking(move || diff_result_with_limits(&diff_path, &limits))
+                    .await??;
+            emitter.emit(TaskEvent::Result {
+                result: TaskResult {
+                    source_revision: workspace_ref.revision.clone(),
+                    verification: all_verification,
+                    diff,
+                },
+            });
+            bail!("one or more verification commands failed");
+        }
+        emitter.emit(TaskEvent::MilestoneCompleted {
+            id: milestone.id,
+            order: milestone.order,
+            title: milestone.title,
+            verification,
+            worker_result_summary: "Worker completed successfully.".into(),
+        });
+    }
     let diff_path = workspace_ref.path.clone();
     let limits = state.config.execution.clone();
     let diff =
         tokio::task::spawn_blocking(move || diff_result_with_limits(&diff_path, &limits)).await??;
     let result = TaskResult {
         source_revision: workspace_ref.revision.clone(),
-        verification,
+        verification: all_verification,
         diff,
     };
     emitter.emit(TaskEvent::Result { result });
-    if failed {
-        bail!("one or more verification commands failed");
-    }
-
     Ok(())
 }
 
@@ -368,6 +482,16 @@ async fn execute_worker(
     request: CodingTaskRequest<'_>,
     emitter: &Emitter,
 ) -> Result<()> {
+    execute_worker_for_milestone(worker, selection, request, emitter, None).await
+}
+
+async fn execute_worker_for_milestone(
+    worker: &dyn CodingAgent,
+    selection: &CodingAgentConfig,
+    request: CodingTaskRequest<'_>,
+    emitter: &Emitter,
+    milestone: Option<(&str, &str)>,
+) -> Result<()> {
     let instruction = crate::evidence::worker_instruction(request.instructions);
     emitter.emit(TaskEvent::WorkerStarted {
         tool: selection.tool,
@@ -379,6 +503,8 @@ async fn execute_worker(
         emitter.record_evidence(EvidencePayload::WorkerExecution {
             role: WorkerRole::Worker,
             stage: WorkerStage::Implementation,
+            milestone_id: milestone.map(|(id, _)| id.to_string()),
+            milestone_title: milestone.map(|(_, title)| title.to_string()),
             tool: selection.tool,
             model: selection.model.clone(),
             instruction,
@@ -397,6 +523,8 @@ async fn execute_worker(
     emitter.record_evidence(EvidencePayload::WorkerExecution {
         role: WorkerRole::Worker,
         stage: WorkerStage::Implementation,
+        milestone_id: milestone.map(|(id, _)| id.to_string()),
+        milestone_title: milestone.map(|(_, title)| title.to_string()),
         tool: selection.tool,
         model: selection.model.clone(),
         instruction,

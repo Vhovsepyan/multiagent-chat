@@ -7,8 +7,9 @@ kinds, isolated disposable task workspaces, bounded repository inspection,
 evidence-based technology profiles, task-specific prompts, stack-aware
 verification, and reviewable task results. The original v2 state machine, SSE
 streaming, editable approval gate, and Claude Code implementation stage remain.
-Tasks now also retain redacted proposer/critic and worker evidence and expose a
-deterministic five-file evidence ZIP from the task page/API.
+Tasks now also retain redacted proposer/critic and worker evidence, expose a
+deterministic five-file evidence ZIP from the task page/API, and execute each
+approved specification as an ordered, sequential milestone plan.
 
 The legacy CLI remains available behind `--cli`; only that compatibility path
 uses optional `WORKSPACE_ROOT`. Production web forms and APIs do not accept
@@ -22,6 +23,18 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-25 (2026-09-09, task 0008): approved specifications must contain a
+  non-empty `## Steps` section; those ordered entries become frozen milestone
+  records without an additional LLM call. Each milestone invokes the task's
+  frozen worker once, receives the approved specification plus current-step
+  context (never future steps), and runs the configured verification commands
+  before pass. A failure stops later milestones with no automatic retry loop;
+  cancellation preserves passed milestones and marks only the active/pending
+  cancellation event. Milestone lifecycle events use the existing immutable
+  sequence/timestamp allocator, redaction, bounded verification/process output,
+  separate evidence stream, and UI log limits. The task snapshot exposes the
+  milestone plan/status for the progress card; cancellation remains an
+  internal manager control rather than a new public endpoint.
 - DP-24 (2026-09-09, task 0007): detailed `EvidenceRecord` entries retain each
   real proposer/critic call (prompt, response/error, stage, round, frozen
   provider/model, status, and duration) and each worker execution (safe

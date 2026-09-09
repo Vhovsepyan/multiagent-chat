@@ -16,6 +16,7 @@ use crate::agent::{
     AgentSelection, AgentSelectionRequest, ChatAgentRequest, ChatProvider, CodingAgentRequest,
     CodingTool,
 };
+use crate::milestone::MilestoneStatus;
 use crate::project::{Project, ProjectSource};
 use crate::task::{
     Decision, OutputTarget, RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRequest,
@@ -52,7 +53,10 @@ fn timeline_html(status: TaskStatus) -> String {
         TaskStatus::GeneratingSpec => 2,
         TaskStatus::WaitingForApproval => 3,
         TaskStatus::Implementing => 4,
-        TaskStatus::Completed | TaskStatus::Rejected | TaskStatus::Failed => 5,
+        TaskStatus::Completed
+        | TaskStatus::Rejected
+        | TaskStatus::Failed
+        | TaskStatus::Cancelled => 5,
     };
     let mut html = String::from(r#"<div class="timeline">"#);
     for (label, step) in steps {
@@ -69,6 +73,7 @@ fn timeline_html(status: TaskStatus) -> String {
         TaskStatus::Completed => ("step done", "Completed"),
         TaskStatus::Rejected => ("step bad", "Rejected"),
         TaskStatus::Failed => ("step bad", "Failed"),
+        TaskStatus::Cancelled => ("step bad", "Cancelled"),
         _ => ("step", "Done"),
     };
     html.push_str(&format!(r#"<span class="{class}">{label}</span></div>"#));
@@ -104,6 +109,34 @@ fn agents_html(agents: &AgentSelection) -> String {
 fn actions_html(id: TaskId) -> String {
     format!(
         r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{id}/evidence" download>Export Evidence</a><div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#
+    )
+}
+
+fn milestones_html(task: &Task) -> String {
+    if task.milestones.is_empty() {
+        return r#"<div id="milestones" class="card" sse-swap="milestones" hx-swap="beforeend"><h2 class="section">Milestones</h2><div class="hint">The ordered milestone plan will appear after approval.</div></div>"#.into();
+    }
+    let rows = task
+        .milestones
+        .iter()
+        .map(|milestone| {
+            let class = match milestone.status {
+                MilestoneStatus::Passed => "ok",
+                MilestoneStatus::Failed | MilestoneStatus::Cancelled => "err",
+                MilestoneStatus::Running => "active",
+                MilestoneStatus::Pending => "pending",
+            };
+            format!(
+                r#"<li><span class="milestone-status {class}">{}</span> <strong>{}. {}</strong><div class="hint">{}</div></li>"#,
+                milestone.status.label(),
+                milestone.order,
+                esc(&milestone.title),
+                esc(&milestone.objective)
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<div id="milestones" class="card" sse-swap="milestones" hx-swap="beforeend"><h2 class="section">Milestones</h2><ol class="milestones">{rows}</ol></div>"#
     )
 }
 
@@ -386,6 +419,62 @@ fn event_html(
                 esc(model)
             ),
         )),
+        TaskEvent::MilestonePlanCreated { milestones } => Some((
+            "milestones",
+            format!(
+                r#"<div class="notice ok">Milestone plan created Â· {} milestones</div>{}"#,
+                milestones.len(),
+                milestones
+                    .iter()
+                    .map(|milestone| format!(
+                        "<div>{}. {} Â· {}</div>",
+                        milestone.order,
+                        esc(&milestone.title),
+                        milestone.status.label()
+                    ))
+                    .collect::<String>()
+            ),
+        )),
+        TaskEvent::MilestoneStarted { order, title, .. } => Some((
+            "milestones",
+            format!(
+                r#"<div class="notice">Milestone {order} started Â· {}</div>"#,
+                esc(title)
+            ),
+        )),
+        TaskEvent::MilestoneCompleted { order, title, .. } => Some((
+            "milestones",
+            format!(
+                r#"<div class="notice ok">Milestone {order} passed Â· {}</div>"#,
+                esc(title)
+            ),
+        )),
+        TaskEvent::MilestoneFailed {
+            order,
+            title,
+            error,
+            ..
+        } => Some((
+            "milestones",
+            format!(
+                r#"<div class="notice err">Milestone {order} failed Â· {} Â· {}</div>"#,
+                esc(title),
+                esc(error)
+            ),
+        )),
+        TaskEvent::MilestoneCancelled {
+            order,
+            title,
+            reason,
+            ..
+        } => Some((
+            "milestones",
+            format!(
+                r#"<div class="notice warn">Milestone {order} cancelled Â· {} Â· {}</div>"#,
+                esc(title),
+                esc(reason)
+            ),
+        )),
         TaskEvent::Result { result } => {
             Some(("build", format!("<pre>{}</pre>", esc(&result.diff))))
         }
@@ -407,6 +496,10 @@ fn event_html(
                 TaskStatus::Rejected => (
                     "warn",
                     "Rejected. No repository changes were published.".into(),
+                ),
+                TaskStatus::Cancelled => (
+                    "warn",
+                    "Cancelled. Completed milestones were preserved.".into(),
                 ),
                 _ => (
                     "bad",
@@ -712,8 +805,9 @@ fn page_html(
     done: &str,
 ) -> String {
     let actions = actions_html(task.id);
+    let milestones = milestones_html(task);
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{actions}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{actions}{milestones}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
         id = task.id,
         title = esc(&task.title),
         kind = task.kind.label(),

@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::agent::{AgentSelection, AgentSelectionRequest};
 use crate::evidence::{EvidencePayload, EvidenceRecord};
 use crate::execution_limits::{HistoryLimits, bounded_text};
+use crate::milestone::{Milestone, MilestoneStatus};
 use crate::project::ProjectId;
 use crate::technology::{ProjectProfile, TechStack};
 use crate::verification::VerificationResult;
@@ -151,6 +152,8 @@ pub enum TaskStatus {
     Rejected,
     /// Something went wrong; `Task::error` says what.
     Failed,
+    /// Execution was cancelled before all milestones completed.
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -158,7 +161,10 @@ impl TaskStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TaskStatus::Completed | TaskStatus::Rejected | TaskStatus::Failed
+            TaskStatus::Completed
+                | TaskStatus::Rejected
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
         )
     }
 }
@@ -274,6 +280,38 @@ pub enum TaskEvent {
     /// so the event stream carries role/provider/model too (task 0005).
     AgentsSelected {
         agents: AgentSelection,
+    },
+
+    MilestonePlanCreated {
+        milestones: Vec<Milestone>,
+    },
+    MilestoneStarted {
+        id: String,
+        order: u32,
+        title: String,
+        worker_tool: crate::agent::CodingTool,
+        worker_model: String,
+    },
+    MilestoneCompleted {
+        id: String,
+        order: u32,
+        title: String,
+        verification: Vec<VerificationResult>,
+        worker_result_summary: String,
+    },
+    MilestoneFailed {
+        id: String,
+        order: u32,
+        title: String,
+        verification: Vec<VerificationResult>,
+        worker_result_summary: Option<String>,
+        error: String,
+    },
+    MilestoneCancelled {
+        id: String,
+        order: u32,
+        title: String,
+        reason: String,
     },
 
     Inspection {
@@ -421,6 +459,69 @@ impl TaskEvent {
                     clean(&mut verification.command);
                     clean(&mut verification.output);
                 }
+            }
+            Self::MilestonePlanCreated { milestones } => {
+                for milestone in milestones {
+                    clean(&mut milestone.title);
+                    clean(&mut milestone.objective);
+                    for instruction in &mut milestone.verification_instructions {
+                        clean(instruction);
+                    }
+                    if let Some(summary) = &mut milestone.worker_result_summary {
+                        clean(summary);
+                    }
+                }
+            }
+            Self::MilestoneStarted {
+                id,
+                title,
+                worker_model,
+                ..
+            } => {
+                clean(id);
+                clean(title);
+                clean(worker_model);
+            }
+            Self::MilestoneCompleted {
+                id,
+                title,
+                verification,
+                worker_result_summary,
+                ..
+            } => {
+                clean(id);
+                clean(title);
+                clean(worker_result_summary);
+                for result in verification {
+                    clean(&mut result.command);
+                    clean(&mut result.output);
+                }
+            }
+            Self::MilestoneFailed {
+                id,
+                title,
+                verification,
+                worker_result_summary,
+                error,
+                ..
+            } => {
+                clean(id);
+                clean(title);
+                if let Some(summary) = worker_result_summary {
+                    clean(summary);
+                }
+                clean(error);
+                for result in verification {
+                    clean(&mut result.command);
+                    clean(&mut result.output);
+                }
+            }
+            Self::MilestoneCancelled {
+                id, title, reason, ..
+            } => {
+                clean(id);
+                clean(title);
+                clean(reason);
             }
             Self::Build { chunk } => clean(chunk),
             Self::Notice { message } | Self::Warning { message } => clean(message),
@@ -631,6 +732,10 @@ pub struct Task {
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
     pub decision: Option<Decision>,
+    /// Ordered approved-spec execution plan and live milestone state.
+    pub milestones: Vec<Milestone>,
+    #[serde(skip)]
+    cancelled: bool,
 }
 
 impl Task {
@@ -662,6 +767,8 @@ impl Task {
             spec: None,
             error: None,
             decision: None,
+            milestones: Vec::new(),
+            cancelled: false,
         }
     }
 
@@ -691,6 +798,8 @@ impl Task {
             spec: None,
             error: None,
             decision: None,
+            milestones: Vec::new(),
+            cancelled: false,
         })
     }
 
@@ -712,6 +821,7 @@ impl Task {
     }
 
     fn record_event(&mut self, event: TaskEvent) -> RecordedEvent {
+        let timestamp = DateTime::<Utc>::from(std::time::SystemTime::now());
         match event {
             TaskEvent::Status { status } => self.status = status,
             TaskEvent::Spec { ref markdown, .. } | TaskEvent::SpecApproved { ref markdown } => {
@@ -731,13 +841,61 @@ impl Task {
                 self.status = TaskStatus::Failed;
                 self.error = Some(error.clone());
             }
+            TaskEvent::TaskCancelled => {
+                self.status = TaskStatus::Cancelled;
+                self.cancelled = true;
+                self.error = None;
+                for milestone in &mut self.milestones {
+                    if milestone.status == MilestoneStatus::Running {
+                        milestone.status = MilestoneStatus::Cancelled;
+                        milestone.completed_at = Some(timestamp);
+                    }
+                }
+            }
+            TaskEvent::MilestonePlanCreated { ref milestones } => {
+                self.milestones = milestones.clone();
+            }
+            TaskEvent::MilestoneStarted { ref id, .. } => {
+                if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
+                    milestone.status = MilestoneStatus::Running;
+                    milestone.started_at = Some(timestamp);
+                }
+            }
+            TaskEvent::MilestoneCompleted {
+                ref id,
+                ref worker_result_summary,
+                ..
+            } => {
+                if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
+                    milestone.status = MilestoneStatus::Passed;
+                    milestone.completed_at = Some(timestamp);
+                    milestone.worker_result_summary = Some(worker_result_summary.clone());
+                }
+            }
+            TaskEvent::MilestoneFailed {
+                ref id,
+                ref worker_result_summary,
+                ..
+            } => {
+                if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
+                    milestone.status = MilestoneStatus::Failed;
+                    milestone.completed_at = Some(timestamp);
+                    milestone.worker_result_summary = worker_result_summary.clone();
+                }
+            }
+            TaskEvent::MilestoneCancelled { ref id, .. } => {
+                if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
+                    milestone.status = MilestoneStatus::Cancelled;
+                    milestone.completed_at = Some(timestamp);
+                }
+            }
             _ => {}
         }
         if matches!(&event, TaskEvent::Build { chunk } if chunk.contains(crate::execution_limits::TRUNCATED))
         {
             self.worker_output_truncated = true;
         }
-        let (sequence, timestamp) = self.next_audit_metadata();
+        let (sequence, _) = self.next_audit_metadata();
         let recorded = RecordedEvent {
             sequence,
             timestamp,
@@ -825,6 +983,17 @@ impl Task {
             for verification in &mut result.verification {
                 clean(&mut verification.command);
                 clean(&mut verification.output);
+            }
+        }
+        for milestone in &mut self.milestones {
+            clean(&mut milestone.id);
+            clean(&mut milestone.title);
+            clean(&mut milestone.objective);
+            for instruction in &mut milestone.verification_instructions {
+                clean(instruction);
+            }
+            if let Some(summary) = &mut milestone.worker_result_summary {
+                clean(summary);
             }
         }
     }
@@ -1207,6 +1376,38 @@ impl TaskManager {
             .and(task.spec.clone())
     }
 
+    pub fn cancel(&self, id: TaskId) -> bool {
+        let mut tasks = self
+            .inner
+            .tasks
+            .write()
+            .expect("task registry lock poisoned");
+        let cancelled = if let Some(task) = tasks.get_mut(&id) {
+            if task.status.is_terminal() {
+                false
+            } else {
+                let event = TaskEvent::TaskCancelled
+                    .sanitized(&self.inner.redactor)
+                    .bounded(self.inner.history_limits);
+                let recorded = task.record_event(event);
+                let _ = self.inner.tx.send((id, recorded));
+                true
+            }
+        } else {
+            false
+        };
+        drop(tasks);
+        if cancelled {
+            self.inner.gate(id).notify_one();
+        }
+        cancelled
+    }
+
+    pub fn is_cancelled(&self, id: TaskId) -> bool {
+        self.get(id)
+            .is_some_and(|task| task.cancelled || task.status == TaskStatus::Cancelled)
+    }
+
     /// Park until the human answers Gate 2.
     ///
     /// The state is checked BEFORE awaiting, which together with `notify_one`'s
@@ -1220,6 +1421,9 @@ impl TaskManager {
         loop {
             if let Some(decision) = self.decision(id) {
                 return Some(decision);
+            }
+            if self.is_cancelled(id) {
+                return None;
             }
             // Bail out if the task disappeared, rather than parking forever.
             self.get(id)?;
@@ -1373,6 +1577,123 @@ mod tests {
             ["worker_started", "worker_cancelled", "task_cancelled"]
         );
         assert!(!kinds.iter().any(|kind| kind == "task_completed"));
+    }
+
+    #[test]
+    fn milestone_events_update_state_with_ordered_timestamps_and_redaction() {
+        let manager = TaskManager::with_history_limits_and_secrets(
+            HistoryLimits::default(),
+            ["milestone-secret-value".to_string()],
+        );
+        let task = manager.create("audit", "milestones", "legacy");
+        let plan = crate::milestone::plan_from_spec("## Steps\n1. First\n2. Second", &[]).unwrap();
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::MilestonePlanCreated {
+            milestones: plan.clone(),
+        });
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: plan[0].id.clone(),
+            order: 1,
+            title: "First milestone-secret-value".into(),
+            worker_tool: crate::agent::CodingTool::ClaudeCode,
+            worker_model: "worker-model".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneCompleted {
+            id: plan[0].id.clone(),
+            order: 1,
+            title: "First".into(),
+            verification: Vec::new(),
+            worker_result_summary: "done".into(),
+        });
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.milestones[0].status, MilestoneStatus::Passed);
+        assert!(stored.milestones[0].started_at <= stored.milestones[0].completed_at);
+        assert_eq!(stored.milestones[1].status, MilestoneStatus::Pending);
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(!json.contains("milestone-secret-value"));
+        assert!(
+            stored
+                .history
+                .windows(2)
+                .all(|events| events[0].sequence < events[1].sequence)
+        );
+    }
+
+    #[test]
+    fn cancellation_preserves_completed_milestones_and_cancels_future_work() {
+        let manager = TaskManager::new();
+        let task = manager.create("audit", "milestones", "legacy");
+        let plan = crate::milestone::plan_from_spec("## Steps\n1. First\n2. Second", &[]).unwrap();
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::MilestonePlanCreated {
+            milestones: plan.clone(),
+        });
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            worker_tool: crate::agent::CodingTool::ClaudeCode,
+            worker_model: "worker".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneCompleted {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            verification: Vec::new(),
+            worker_result_summary: "done".into(),
+        });
+        assert!(manager.cancel(task.id));
+        emitter.emit(TaskEvent::MilestoneCancelled {
+            id: "m2".into(),
+            order: 2,
+            title: "Second".into(),
+            reason: "task cancelled before milestone start".into(),
+        });
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Cancelled);
+        assert_eq!(stored.milestones[0].status, MilestoneStatus::Passed);
+        assert_eq!(stored.milestones[1].status, MilestoneStatus::Cancelled);
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|event| matches!(event.event, TaskEvent::TaskCompleted))
+        );
+    }
+
+    #[test]
+    fn milestone_failure_stops_before_later_milestones() {
+        let manager = TaskManager::new();
+        let task = manager.create("audit", "milestones", "legacy");
+        let plan = crate::milestone::plan_from_spec("## Steps\n1. First\n2. Later", &[]).unwrap();
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::MilestonePlanCreated { milestones: plan });
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            worker_tool: crate::agent::CodingTool::ClaudeCode,
+            worker_model: "worker".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneFailed {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            verification: vec![VerificationResult {
+                command: "cargo test".into(),
+                success: false,
+                output: "failure".into(),
+            }],
+            worker_result_summary: Some("worker finished".into()),
+            error: "verification failed".into(),
+        });
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.milestones[0].status, MilestoneStatus::Failed);
+        assert_eq!(stored.milestones[1].status, MilestoneStatus::Pending);
+        assert!(!stored.history.iter().any(|event| matches!(
+            event.event,
+            TaskEvent::MilestoneStarted { ref id, .. } if id == "m2"
+        )));
     }
 
     #[test]
@@ -1643,10 +1964,11 @@ mod tests {
     }
 
     #[test]
-    fn only_completed_rejected_and_failed_are_terminal() {
+    fn successful_rejected_failed_and_cancelled_are_terminal() {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Rejected.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
+        assert!(TaskStatus::Cancelled.is_terminal());
 
         assert!(!TaskStatus::Created.is_terminal());
         assert!(!TaskStatus::Debating.is_terminal());

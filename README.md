@@ -207,7 +207,8 @@ ordered by the shared task sequence. Its stable record kinds are:
   `round`, `provider`, `model`, `prompt`, optional `response`, `status`, optional
   `error`, `duration_ms`, and `truncated`.
 - `worker_execution`: `sequence`, `timestamp`, `kind`, `role`, `stage`, `tool`,
-  `model`, `instruction`, `summary`, `status`, `duration_ms`, and `truncated`.
+  optional `milestone_id`/`milestone_title`, `model`, `instruction`, `summary`,
+  `status`, `duration_ms`, and `truncated`.
 - `verification`: `sequence`, `timestamp`, `kind`, `command`, `success`, `output`,
   and `truncated`.
 
@@ -236,6 +237,22 @@ inspection, diff capture, and cleanup run off the HTTP runtime workers.
 Delayed cleanup is in-process only. A server restart loses its timers; failed
 cleanup retries and workspaces left by a restart require manual cleanup. These
 limits do not make untrusted repositories safe to execute.
+
+## Milestone execution
+
+After approval, the server derives a non-empty ordered milestone plan from the
+specification's `## Steps` section. It executes one milestone at a time: the
+frozen worker receives the approved specification plus only the current
+milestone and repository context, then the configured verification commands
+run before the milestone can pass. A failed milestone stops later work; there
+is no automatic retry or fix loop. The task snapshot and audit/evidence stream
+record milestone planning, start, pass, failure, and cancellation events with
+bounded, redacted details. The task page shows each milestone's status while
+the existing UI log remains separately bounded.
+
+Cancellation preserves completed milestones and prevents future milestones
+from starting. Durable task cancellation controls and acceptance tracking are
+outside this milestone-execution task.
 
 ## Agent selection
 

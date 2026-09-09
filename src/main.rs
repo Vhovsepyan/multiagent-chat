@@ -14,6 +14,7 @@ mod evidence;
 mod execution_limits;
 mod implementer;
 mod inspection;
+mod milestone;
 mod process_environment;
 #[cfg(windows)]
 mod process_job;

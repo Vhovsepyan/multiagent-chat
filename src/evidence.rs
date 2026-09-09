@@ -96,6 +96,10 @@ pub enum EvidencePayload {
     WorkerExecution {
         role: WorkerRole,
         stage: WorkerStage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        milestone_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        milestone_title: Option<String>,
         tool: CodingTool,
         model: String,
         instruction: String,
@@ -168,6 +172,8 @@ impl EvidenceRecord {
                 }
             }
             EvidencePayload::WorkerExecution {
+                milestone_id,
+                milestone_title,
                 model,
                 instruction,
                 summary,
@@ -175,6 +181,12 @@ impl EvidenceRecord {
                 ..
             } => {
                 *truncated |= worker_output_truncated;
+                if let Some(id) = milestone_id {
+                    clean(id, truncated, &redact);
+                }
+                if let Some(title) = milestone_title {
+                    clean(title, truncated, &redact);
+                }
                 clean(model, truncated, &redact);
                 clean(instruction, truncated, &redact);
                 clean(summary, truncated, &redact);
@@ -499,6 +511,84 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             (title, details)
         }
         TaskEvent::WorkerCancelled { tool, model } => worker_lifecycle("cancelled", *tool, model),
+        TaskEvent::MilestonePlanCreated { milestones } => (
+            "Milestone plan created".into(),
+            milestones
+                .iter()
+                .map(|milestone| {
+                    format!(
+                        "{}: {} ({})",
+                        milestone.id,
+                        markdown_inline(&milestone.title),
+                        milestone.status.label()
+                    )
+                })
+                .collect(),
+        ),
+        TaskEvent::MilestoneStarted {
+            id,
+            order,
+            title,
+            worker_tool,
+            worker_model,
+        } => (
+            format!("Milestone {order} started: {}", markdown_inline(title)),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(id)),
+                format!(
+                    "Worker: {} / `{}`",
+                    worker_tool.label(),
+                    markdown_inline(worker_model)
+                ),
+            ],
+        ),
+        TaskEvent::MilestoneCompleted {
+            id,
+            order,
+            title,
+            verification,
+            worker_result_summary,
+        } => (
+            format!("Milestone {order} completed: {}", markdown_inline(title)),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(id)),
+                format!("Verification commands: {}", verification.len()),
+                format!("Worker result: {}", markdown_inline(worker_result_summary)),
+            ],
+        ),
+        TaskEvent::MilestoneFailed {
+            id,
+            order,
+            title,
+            verification,
+            worker_result_summary,
+            error,
+        } => {
+            let mut details = vec![
+                format!("Milestone id: `{}`", markdown_inline(id)),
+                format!("Verification commands: {}", verification.len()),
+                format!("Error: {}", markdown_inline(error)),
+            ];
+            if let Some(summary) = worker_result_summary {
+                details.push(format!("Worker result: {}", markdown_inline(summary)));
+            }
+            (
+                format!("Milestone {order} failed: {}", markdown_inline(title)),
+                details,
+            )
+        }
+        TaskEvent::MilestoneCancelled {
+            id,
+            order,
+            title,
+            reason,
+        } => (
+            format!("Milestone {order} cancelled: {}", markdown_inline(title)),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(id)),
+                format!("Reason: {}", markdown_inline(reason)),
+            ],
+        ),
         TaskEvent::Result { .. } => ("Task result captured".into(), vec![]),
         TaskEvent::Finished { status, error } => {
             let mut details = vec![format!("Status: {}", status_label(*status))];
@@ -586,6 +676,8 @@ fn describe_evidence(record: &EvidenceRecord) -> (String, Vec<String>) {
         EvidencePayload::WorkerExecution {
             tool,
             model,
+            milestone_id,
+            milestone_title,
             status,
             duration_ms,
             truncated,
@@ -596,6 +688,12 @@ fn describe_evidence(record: &EvidenceRecord) -> (String, Vec<String>) {
                 format!("Model: `{}`", markdown_inline(model)),
                 format!("Duration: {duration_ms} ms"),
             ];
+            if let Some(id) = milestone_id {
+                details.push(format!("Milestone id: `{}`", markdown_inline(id)));
+            }
+            if let Some(title) = milestone_title {
+                details.push(format!("Milestone: {}", markdown_inline(title)));
+            }
             if *truncated {
                 details.push("Evidence truncated: true".into());
             }
@@ -756,7 +854,7 @@ fn final_report(task: &Task) -> String {
             .any(|recorded| event_contains_truncation(&recorded.event));
 
     let mut markdown = format!(
-        "# Final Report\n\nTask title: {}\n\nTask type: {}\n\nTask description/objective:\n\n{}\n\nStart time: {}\n\nEnd time: {}\n\nFinal status: {}\n\nAgents used: Proposer {} / `{}`; Critic {} / `{}`; Worker {} / `{}`\n\nSpecification status: {}\n\nWorker result: {}\n\nVerification result: {}\n\nOutput/workspace: The temporary workspace is not exported. Any reviewable diff and verification result are retained in task result evidence.\n\n## Known errors/failures\n\n",
+        "# Final Report\n\nTask title: {}\n\nTask type: {}\n\nTask description/objective:\n\n{}\n\nStart time: {}\n\nEnd time: {}\n\nFinal status: {}\n\nAgents used: Proposer {} / `{}`; Critic {} / `{}`; Worker {} / `{}`\n\nSpecification status: {}\n\nWorker result: {}\n\nVerification result: {}\n\nOutput/workspace: The temporary workspace is not exported. Any reviewable diff and verification result are retained in task result evidence.\n\n",
         markdown_inline(&task.title),
         task.kind.label(),
         markdown_quote(&task.description),
@@ -775,6 +873,24 @@ fn final_report(task: &Task) -> String {
             .unwrap_or("Not run or no worker result recorded"),
         verification,
     );
+    if !task.milestones.is_empty() {
+        markdown.push_str("## Milestones\n\n");
+        for milestone in &task.milestones {
+            markdown.push_str(&format!(
+                "- `{}` — {} — {} (started: {}; completed: {})\n",
+                markdown_inline(&milestone.id),
+                markdown_inline(&milestone.title),
+                milestone.status.label(),
+                format_time(milestone.started_at),
+                format_time(milestone.completed_at),
+            ));
+            if let Some(summary) = &milestone.worker_result_summary {
+                markdown.push_str(&format!("  Worker result: {}\n", markdown_inline(summary)));
+            }
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str("## Known errors/failures\n\n");
     if errors.is_empty() {
         markdown.push_str("None recorded.\n");
     } else {
@@ -861,6 +977,7 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "Completed",
         TaskStatus::Rejected => "Rejected",
         TaskStatus::Failed => "Failed",
+        TaskStatus::Cancelled => "Cancelled",
     }
 }
 
@@ -1031,6 +1148,8 @@ mod tests {
         emitter.record_evidence(EvidencePayload::WorkerExecution {
             role: WorkerRole::Worker,
             stage: WorkerStage::Implementation,
+            milestone_id: None,
+            milestone_title: None,
             tool: CodingTool::ClaudeCode,
             model: "worker-model-v3".into(),
             instruction: "Implement approved-spec.md".into(),
@@ -1215,6 +1334,8 @@ mod tests {
             .record_evidence(EvidencePayload::WorkerExecution {
                 role: WorkerRole::Worker,
                 stage: WorkerStage::Implementation,
+                milestone_id: None,
+                milestone_title: None,
                 tool: CodingTool::ClaudeCode,
                 model: "worker".into(),
                 instruction: "implement".into(),
@@ -1243,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_tasks_export_honestly_without_a_cancelled_status_variant() {
+    fn cancelled_tasks_export_honestly_with_a_cancelled_status() {
         let manager = TaskManager::new();
         let task = manager.create("cancelled", "objective", "legacy");
         let emitter = manager.emitter(task.id);
