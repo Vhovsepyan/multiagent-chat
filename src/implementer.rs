@@ -16,13 +16,13 @@
 //!     line can also be published to the web UI.
 
 use std::path::Path;
+#[cfg(test)]
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::config::Config;
-use crate::task::{Emitter, TaskEvent};
+use crate::task::Emitter;
 use crate::ui;
 
 /// The CLI we shell out to. Resolved from PATH.
@@ -74,70 +74,38 @@ pub async fn run_with_prompt(
     }
     println!();
 
-    let mut child =
-        crate::process_environment::implementer_command(CLAUDE_BIN, &config.anthropic_api_key)
-            .current_dir(repo)
-            .arg("-p")
-            .arg(prompt(spec_path, task_prompt))
-            .arg("--model")
-            .arg(&config.implementer_model)
-            .arg("--permission-mode")
-            .arg(&config.permission_mode)
-            // Piped, not inherited, so every line can be forwarded to the web UI.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?"
-                )
-            })?;
-
-    // `take` moves the handles out of the child so they can be read on their
-    // own tasks while we wait for the process itself.
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    // Read both streams concurrently. Doing them in sequence would deadlock the
-    // moment Claude Code filled the pipe we were not reading.
-    let out_task = tokio::spawn(forward(stdout, emitter.clone(), false));
-    let err_task = tokio::spawn(forward(stderr, emitter.clone(), true));
-
-    let status = child
-        .wait()
-        .await
-        .context("failed while waiting for Claude Code to finish")?;
-
-    // Drain whatever is still buffered before reporting the exit status.
-    let _ = out_task.await;
-    let _ = err_task.await;
+    let mut command =
+        crate::process_environment::implementer_command(CLAUDE_BIN, &config.anthropic_api_key);
+    command
+        .current_dir(repo)
+        .arg("-p")
+        .arg(prompt(spec_path, task_prompt))
+        .arg("--model")
+        .arg(&config.implementer_model)
+        .arg("--permission-mode")
+        .arg(&config.permission_mode);
+    let output = crate::process_runner::run(
+        command,
+        config
+            .execution
+            .process(config.execution.implementer_timeout),
+        Some(emitter),
+    )
+    .await
+    .with_context(|| {
+        format!("could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?")
+    })?;
 
     println!();
-    match status.code() {
-        Some(0) => {
-            ui::success("Claude Code finished.");
-            Ok(())
-        }
-        Some(code) => bail!("Claude Code exited with status {code}"),
-        // On Windows this is unusual; on Unix it means a signal killed it.
-        None => bail!("Claude Code was terminated before it finished"),
+    if !output.success() {
+        let reason = output
+            .failure
+            .unwrap_or_else(|| format!("Claude Code exited with status {:?}", output.status));
+        emitter.warn(&reason);
+        bail!("{reason}");
     }
-}
-
-/// Print each line as it arrives and publish it as a build event.
-async fn forward<R>(reader: R, emitter: Emitter, is_stderr: bool)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if is_stderr {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-        }
-        emitter.emit(TaskEvent::Build { chunk: line });
-    }
+    ui::success("Claude Code finished.");
+    Ok(())
 }
 
 #[cfg(test)]

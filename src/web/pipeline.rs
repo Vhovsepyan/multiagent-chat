@@ -10,7 +10,7 @@ use crate::spec;
 use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus};
 use crate::technology::ProjectProfile;
 use crate::web::AppState;
-use crate::workspace::{TaskWorkspace, WorkspaceRequest, diff_result};
+use crate::workspace::{TaskWorkspace, WorkspaceRequest, diff_result_with_limits};
 
 pub fn spawn(state: AppState, id: TaskId) {
     tokio::spawn(async move {
@@ -18,7 +18,19 @@ pub fn spawn(state: AppState, id: TaskId) {
         let mut workspace = None;
         let result = run(&state, id, &emitter, &mut workspace).await;
 
-        finish_run(&state, id, &emitter, workspace.as_ref(), result);
+        let report = emitter.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            finish_run(&state, id, &emitter, workspace.as_ref(), result);
+        })
+        .await
+        {
+            report.emit(TaskEvent::Finished {
+                status: TaskStatus::Failed,
+                error: Some(format!(
+                    "task finalization failed: {error}; manual workspace recovery may be required"
+                )),
+            });
+        }
     });
 }
 
@@ -37,7 +49,7 @@ fn finish_run(
             .get(id)
             .is_some_and(|task| task.result.is_none())
     {
-        match diff_result(&workspace.path) {
+        match diff_result_with_limits(&workspace.path, &state.config.execution) {
             Ok(diff) => {
                 let verification = state
                     .manager
@@ -73,13 +85,52 @@ fn finish_run(
         && let Err(error) = state.workspaces.cleanup(workspace)
     {
         emitter.warn(format!("workspace cleanup failed: {error}"));
+        may_cleanup = false;
     }
-    if let Err(error) = result {
-        emitter.emit(TaskEvent::Finished {
-            status: TaskStatus::Failed,
-            error: Some(format!("{error:#}")),
-        });
+    if !may_cleanup && let Some(workspace) = workspace {
+        schedule_recovery_cleanup(state, workspace, emitter);
     }
+    let (status, error) = match result {
+        Err(error) => (TaskStatus::Failed, Some(format!("{error:#}"))),
+        Ok(()) => {
+            let rejected = state
+                .manager
+                .get(id)
+                .is_some_and(|task| task.status == TaskStatus::Rejected);
+            (
+                if rejected {
+                    TaskStatus::Rejected
+                } else {
+                    TaskStatus::Completed
+                },
+                None,
+            )
+        }
+    };
+    // Send terminal UI updates only after result/cleanup diagnostics are known.
+    emitter.emit(TaskEvent::Finished { status, error });
+}
+
+fn schedule_recovery_cleanup(state: &AppState, workspace: &TaskWorkspace, emitter: &Emitter) {
+    let retention = state.config.execution.recovery_retention;
+    emitter.warn(format!("workspace retained for recovery; cleanup retry in {} seconds. Recover needed files before that deadline", retention.as_secs()));
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        emitter.warn("no running cleanup scheduler; manual workspace cleanup required");
+        return;
+    };
+    let provider = state.workspaces.clone();
+    let workspace = workspace.clone();
+    let emitter = emitter.clone();
+    handle.spawn(async move {
+        tokio::time::sleep(retention).await;
+        let result = tokio::task::spawn_blocking(move || provider.cleanup(&workspace)).await;
+        match result {
+            Ok(Ok(())) => emitter.notice("recovery retention expired; temporary workspace cleaned"),
+            error => emitter.warn(format!(
+                "recovery cleanup failed; manual cleanup required: {error:?}"
+            )),
+        }
+    });
 }
 
 async fn run(
@@ -118,16 +169,23 @@ async fn run(
             let project = project
                 .as_ref()
                 .expect("validated existing task has project");
-            *workspace = Some(prepare_existing(state, id, project)?);
+            *workspace = Some(prepare_existing(state, id, project).await?);
             let prepared = workspace.as_ref().expect("workspace was prepared");
-            let inspection = inspect(
-                &prepared.path,
-                InspectionRequest {
-                    kind: task.kind,
-                    title: &task.title,
-                    description: &task.description,
-                },
-            )?;
+            let path = prepared.path.clone();
+            let title = task.title.clone();
+            let description = task.description.clone();
+            let kind = task.kind;
+            let inspection = tokio::task::spawn_blocking(move || {
+                inspect(
+                    &path,
+                    InspectionRequest {
+                        kind,
+                        title: &title,
+                        description: &description,
+                    },
+                )
+            })
+            .await??;
             let profile = inspection.profile.clone();
             state.projects.set_profile(project.id, profile.clone());
             let context = inspection.prompt_context();
@@ -178,19 +236,22 @@ async fn run(
     };
     if !decision.approve {
         emitter.notice("rejected; no repository changes were published");
-        emitter.emit(TaskEvent::Finished {
-            status: TaskStatus::Rejected,
-            error: None,
-        });
+        emitter.status(TaskStatus::Rejected);
         return Ok(());
     }
 
     if workspace.is_none() {
-        *workspace = Some(state.workspaces.prepare(WorkspaceRequest {
-            task_id: id,
-            source: None,
-            revision: None,
-        })?);
+        let provider = state.workspaces.clone();
+        *workspace = Some(
+            tokio::task::spawn_blocking(move || {
+                provider.prepare(WorkspaceRequest {
+                    task_id: id,
+                    source: None,
+                    revision: None,
+                })
+            })
+            .await??,
+        );
     }
     let workspace_ref = workspace.as_ref().expect("workspace was prepared");
     let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
@@ -210,7 +271,12 @@ async fn run(
     if commands.is_empty() {
         emitter.warn("no automatic verification commands were detected");
     }
-    let verification = crate::verification::run(&commands, &workspace_ref.path).await?;
+    let verification = crate::verification::run_with_limits(
+        &commands,
+        &workspace_ref.path,
+        &state.config.execution,
+    )
+    .await?;
     for result in &verification {
         emitter.emit(TaskEvent::Verification {
             result: result.clone(),
@@ -218,29 +284,38 @@ async fn run(
     }
 
     let failed = verification.iter().any(|result| !result.success);
+    let diff_path = workspace_ref.path.clone();
+    let limits = state.config.execution.clone();
+    let diff =
+        tokio::task::spawn_blocking(move || diff_result_with_limits(&diff_path, &limits)).await??;
     let result = TaskResult {
         source_revision: workspace_ref.revision.clone(),
         verification,
-        diff: diff_result(&workspace_ref.path)?,
+        diff,
     };
     emitter.emit(TaskEvent::Result { result });
     if failed {
         bail!("one or more verification commands failed");
     }
 
-    emitter.emit(TaskEvent::Finished {
-        status: TaskStatus::Completed,
-        error: None,
-    });
     Ok(())
 }
 
-fn prepare_existing(state: &AppState, id: TaskId, project: &Project) -> Result<TaskWorkspace> {
-    state.workspaces.prepare(WorkspaceRequest {
-        task_id: id,
-        source: Some(&project.source),
-        revision: Some(&project.default_branch),
+async fn prepare_existing(
+    state: &AppState,
+    id: TaskId,
+    project: &Project,
+) -> Result<TaskWorkspace> {
+    let provider = state.workspaces.clone();
+    let project = project.clone();
+    tokio::task::spawn_blocking(move || {
+        provider.prepare(WorkspaceRequest {
+            task_id: id,
+            source: Some(&project.source),
+            revision: Some(&project.default_branch),
+        })
     })
+    .await?
 }
 
 fn write_approved_spec(
@@ -256,6 +331,65 @@ fn write_approved_spec(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cleanup_failure_preserves_result_and_retries() {
+        use crate::workspace::{LocalWorkspaceProvider, WorkspaceProvider};
+        struct RetryCleanup {
+            provider: LocalWorkspaceProvider,
+            failed_once: std::sync::atomic::AtomicBool,
+        }
+        impl WorkspaceProvider for RetryCleanup {
+            fn prepare(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+                self.provider.prepare(request)
+            }
+            fn cleanup(&self, workspace: &TaskWorkspace) -> Result<()> {
+                if !self
+                    .failed_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    bail!("simulated cleanup failure");
+                }
+                self.provider.cleanup(workspace)
+            }
+        }
+        let (mut state, root) = crate::web::tests::test_state("cleanup-retry");
+        std::sync::Arc::make_mut(&mut state.config)
+            .execution
+            .recovery_retention = std::time::Duration::from_millis(50);
+        state.workspaces = std::sync::Arc::new(RetryCleanup {
+            provider: LocalWorkspaceProvider::new(root.join("task-workspaces")).unwrap(),
+            failed_once: std::sync::atomic::AtomicBool::new(false),
+        });
+        let task = state.manager.create("task", "description", "legacy");
+        let workspace = state
+            .workspaces
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        std::fs::write(workspace.path.join("partial.txt"), "recoverable content\n").unwrap();
+        finish_run(
+            &state,
+            task.id,
+            &state.manager.emitter(task.id),
+            Some(&workspace),
+            Err(anyhow::anyhow!("implementer failed")),
+        );
+        let task = state.manager.get(task.id).unwrap();
+        assert!(task.result.unwrap().diff.contains("+recoverable content"));
+        assert_eq!(task.error.as_deref(), Some("implementer failed"));
+        assert!(task.history.iter().any(|event| matches!(event, TaskEvent::Warning {message} if message.contains("simulated cleanup failure"))));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while workspace.root.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use crate::task::{Decision, TaskEvent};
     use uuid::Uuid;
@@ -435,5 +569,108 @@ mod tests {
         provider.cleanup(&workspace).unwrap();
         assert!(!spec_path.exists());
         std::fs::remove_dir_all(root).ok();
+    }
+}
+#[cfg(test)]
+mod failure_limit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn verification_failure_and_timeout_preserve_changes_and_diagnostics() {
+        for mode in ["fail", "timeout"] {
+            let (state, root) = crate::web::tests::test_state(&format!("verify-{mode}"));
+            let task = state.manager.create("task", "description", "legacy");
+            let emitter = state.manager.emitter(task.id);
+            let workspace = state
+                .workspaces
+                .prepare(WorkspaceRequest {
+                    task_id: task.id,
+                    source: None,
+                    revision: None,
+                })
+                .unwrap();
+            std::fs::write(workspace.path.join(".multiagent-test-probe"), mode).unwrap();
+            let command = crate::verification::VerificationCommand {
+                program: std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                args: vec![
+                    "--exact".into(),
+                    "process_runner::tests::child_probe".into(),
+                    "--nocapture".into(),
+                ],
+            };
+            let limits = crate::execution_limits::ExecutionLimits {
+                verification_timeout: std::time::Duration::from_millis(400),
+                ..Default::default()
+            };
+            let results =
+                crate::verification::run_with_limits(&[command], &workspace.path, &limits)
+                    .await
+                    .unwrap();
+            assert!(!results[0].success);
+            if mode == "timeout" {
+                assert!(results[0].output.contains("timed out"));
+                assert!(results[0].output.contains("partial before timeout"));
+            } else {
+                assert!(results[0].output.contains("useful failure output"));
+            }
+            emitter.emit(TaskEvent::Verification {
+                result: results[0].clone(),
+            });
+            finish_run(
+                &state,
+                task.id,
+                &emitter,
+                Some(&workspace),
+                Err(anyhow::anyhow!("verification failed")),
+            );
+            let stored = state.manager.get(task.id).unwrap();
+            assert_eq!(stored.status, TaskStatus::Failed);
+            let result = stored.result.unwrap();
+            assert!(result.diff.contains("+work before"));
+            assert_eq!(result.verification[0].output, results[0].output);
+            assert!(!workspace.root.exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_workspace_is_cleaned_after_the_configured_retention() {
+        let (mut state, root) = crate::web::tests::test_state("recovery-retention");
+        std::sync::Arc::make_mut(&mut state.config)
+            .execution
+            .recovery_retention = std::time::Duration::from_millis(25);
+        let task = state.manager.create("task", "description", "legacy");
+        let workspace = TaskWorkspace {
+            root: root.join("task-workspaces").join(task.id.to_string()),
+            path: root
+                .join("task-workspaces")
+                .join(task.id.to_string())
+                .join("repo"),
+            revision: None,
+        };
+        std::fs::create_dir_all(&workspace.path).unwrap();
+        std::fs::write(workspace.path.join("debug.txt"), "useful evidence").unwrap();
+        finish_run(
+            &state,
+            task.id,
+            &state.manager.emitter(task.id),
+            Some(&workspace),
+            Err(anyhow::anyhow!("execution failed")),
+        );
+        assert!(workspace.path.join("debug.txt").exists());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while workspace.root.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.manager.get(task.id).unwrap().error.as_deref(),
+            Some("execution failed")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

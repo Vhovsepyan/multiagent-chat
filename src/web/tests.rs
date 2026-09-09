@@ -25,6 +25,7 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
     std::fs::create_dir_all(&root).unwrap();
 
     let config = Config {
+        execution: Default::default(),
         gemini_api_key: "test".into(),
         anthropic_api_key: "test".into(),
         workspace_root: Some(root.clone()),

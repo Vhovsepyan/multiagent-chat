@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::execution_limits::{ExecutionLimits, GIT_OUTPUT_BYTES};
 use crate::project::ProjectSource;
 use crate::task::TaskId;
 
@@ -15,7 +16,7 @@ pub struct WorkspaceRequest<'a> {
     pub revision: Option<&'a str>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskWorkspace {
     /// Provider-owned lifecycle root; repository and artifacts are siblings.
     pub root: PathBuf,
@@ -94,17 +95,23 @@ pub trait WorkspaceProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LocalWorkspaceProvider {
     root: PathBuf,
+    limits: ExecutionLimits,
 }
 
 impl LocalWorkspaceProvider {
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)
             .with_context(|| format!("could not create task workspace root {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            limits: ExecutionLimits::default(),
+        })
     }
 
-    pub fn temporary() -> Result<Self> {
-        Self::new(std::env::temp_dir().join("multiagent-chat-workspaces"))
+    pub fn temporary_with_limits(limits: ExecutionLimits) -> Result<Self> {
+        let mut provider = Self::new(std::env::temp_dir().join("multiagent-chat-workspaces"))?;
+        provider.limits = limits;
+        Ok(provider)
     }
 
     fn task_path(&self, id: TaskId) -> PathBuf {
@@ -135,10 +142,8 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
                     if let Some(revision) = request.revision {
                         command.arg("--branch").arg(revision);
                     }
-                    let output = command
-                        .arg(source.clone_url())
-                        .arg(&path)
-                        .output()
+                    command.arg(source.clone_url()).arg(&path);
+                    let output = run_git(command, &self.limits)
                         .context("could not start git to prepare repository workspace")?;
                     if !output.status.success() {
                         bail!(
@@ -151,11 +156,9 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
                     fs::create_dir(&path).with_context(|| {
                         format!("could not create workspace {}", path.display())
                     })?;
-                    let output = crate::process_environment::command("git")
-                        .arg("init")
-                        .arg("--quiet")
-                        .current_dir(&path)
-                        .output()
+                    let mut command = crate::process_environment::command("git");
+                    command.arg("init").arg("--quiet").current_dir(&path);
+                    let output = run_git(command, &self.limits)
                         .context("could not initialize new-project workspace")?;
                     if !output.status.success() {
                         bail!("could not initialize new-project workspace");
@@ -163,9 +166,12 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
                 }
             }
 
-            let revision = git_output(&path, &["rev-parse", "HEAD"])
-                .ok()
-                .filter(|value| !value.is_empty());
+            let revision_output = git_command(&path, &["rev-parse", "HEAD"], &self.limits)?;
+            let revision = revision_output.status.success().then(|| {
+                String::from_utf8_lossy(&revision_output.stdout)
+                    .trim()
+                    .to_owned()
+            });
             Ok(TaskWorkspace {
                 root: root.clone(),
                 path,
@@ -192,28 +198,48 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
     }
 }
 
+#[cfg(test)]
 pub fn diff_result(root: &Path) -> Result<String> {
     Ok(change_set(root)?.render())
 }
 
+pub fn diff_result_with_limits(root: &Path, limits: &ExecutionLimits) -> Result<String> {
+    Ok(change_set_with_limits(root, limits)?.render())
+}
+
+#[cfg(test)]
 pub fn change_set(root: &Path) -> Result<ChangeSet> {
+    change_set_with_limits(root, &ExecutionLimits::default())
+}
+
+fn change_set_with_limits(root: &Path, limits: &ExecutionLimits) -> Result<ChangeSet> {
     let status = git_output_bytes(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        limits,
     )?;
     let files = parse_status(&status);
-    let has_head = git_command(root, &["rev-parse", "--verify", "HEAD"])
-        .is_ok_and(|output| output.status.success());
+    let has_head = git_command(root, &["rev-parse", "--verify", "HEAD"], limits)?
+        .status
+        .success();
     let tracked_diff = if has_head {
-        git_output(root, &["diff", "--no-ext-diff", "--find-renames", "HEAD"])?
+        git_output(
+            root,
+            &["diff", "--no-ext-diff", "--find-renames", "HEAD"],
+            limits,
+        )?
     } else {
         String::new()
     };
-    let untracked_diffs = files
-        .iter()
-        .filter(|change| change.untracked)
-        .map(|change| added_file_diff(root, &change.path))
-        .collect();
+    let mut remaining = GIT_OUTPUT_BYTES.saturating_sub(tracked_diff.len() + status.len());
+    let mut untracked_diffs = Vec::new();
+    for change in files.iter().filter(|change| change.untracked) {
+        let diff = added_file_diff(root, &change.path, remaining)?;
+        remaining = remaining.checked_sub(diff.len()).ok_or_else(|| {
+            anyhow::anyhow!("result size limit exceeded; workspace required for full recovery")
+        })?;
+        untracked_diffs.push(diff);
+    }
 
     Ok(ChangeSet {
         files,
@@ -264,34 +290,44 @@ fn parse_status(status: &[u8]) -> Vec<FileChange> {
     changes
 }
 
-fn added_file_diff(root: &Path, path: &str) -> String {
+fn added_file_diff(root: &Path, path: &str, budget: usize) -> Result<String> {
     let display = display_diff_path(path);
     let file_path = root.join(path);
     match fs::symlink_metadata(&file_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return format!(
+            return Ok(format!(
                 "diff --git /dev/null {display}\nnew file\nUnsupported file type; contents omitted."
-            );
+            ));
         }
         Err(error) => {
-            return format!(
+            return Ok(format!(
                 "diff --git /dev/null {display}\nnew file\nUnable to inspect added file: {error}"
-            );
+            ));
         }
         Ok(_) => {}
     }
-    let bytes = match fs::read(&file_path) {
+    use std::io::Read;
+    let content_limit = budget / 2;
+    let bytes = match crate::repository_file::open(root, &file_path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(content_limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return format!(
+            return Ok(format!(
                 "diff --git /dev/null {display}\nnew file\nUnable to read added file: {error}"
-            );
+            ));
         }
     };
+    if bytes.len() > content_limit {
+        bail!("result size limit exceeded; workspace required for full recovery");
+    }
     if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-        return format!(
+        return Ok(format!(
             "diff --git /dev/null {display}\nnew file\nBinary or unsupported file; contents omitted."
-        );
+        ));
     }
 
     let content = String::from_utf8(bytes).expect("UTF-8 was checked");
@@ -306,7 +342,7 @@ fn added_file_diff(root: &Path, path: &str) -> String {
     if !content.is_empty() && !content.ends_with('\n') {
         diff.push_str("\n\\ No newline at end of file\n");
     }
-    diff.trim_end().to_string()
+    Ok(diff.trim_end().to_string())
 }
 
 fn display_diff_path(path: &str) -> String {
@@ -320,32 +356,63 @@ fn display_diff_path(path: &str) -> String {
     }
 }
 
-fn git_output(root: &Path, args: &[&str]) -> Result<String> {
-    let output = git_command(root, args)?;
+fn git_output(root: &Path, args: &[&str], limits: &ExecutionLimits) -> Result<String> {
+    let output = git_command(root, args, limits)?;
     if !output.status.success() {
         bail!("git command failed in task workspace");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn git_output_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = git_command(root, args)?;
+fn git_output_bytes(root: &Path, args: &[&str], limits: &ExecutionLimits) -> Result<Vec<u8>> {
+    let output = git_command(root, args, limits)?;
     if !output.status.success() {
         bail!("git command failed in task workspace");
     }
     Ok(output.stdout)
 }
 
-fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    crate::process_environment::command("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .context("could not run git in task workspace")
+fn git_command(
+    root: &Path,
+    args: &[&str],
+    limits: &ExecutionLimits,
+) -> Result<std::process::Output> {
+    let mut command = crate::process_environment::command("git");
+    command.args(args).current_dir(root);
+    run_git(command, limits)
+}
+
+pub(crate) fn run_git(
+    command: std::process::Command,
+    limits: &ExecutionLimits,
+) -> Result<std::process::Output> {
+    let output = crate::process_runner::run_blocking(command, limits.git())?;
+    if let Some(failure) = output.failure {
+        bail!("{failure}: {}", output.stderr.text());
+    }
+    if output.stdout.truncated || output.stderr.truncated {
+        bail!("Git output limit exceeded; incomplete result must not be parsed");
+    }
+    Ok(std::process::Output {
+        status: output
+            .status
+            .ok_or_else(|| anyhow::anyhow!("Git exited without a status"))?,
+        stdout: output.stdout.bytes,
+        stderr: output.stderr.bytes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_added_file_fails_capture_without_removing_the_file() {
+        let root = test_repository();
+        fs::write(root.join("large.txt"), "large content".repeat(20)).unwrap();
+        let error = added_file_diff(&root, "large.txt", 64).unwrap_err();
+        assert!(error.to_string().contains("result size limit exceeded"));
+        assert!(root.join("large.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use uuid::Uuid;
 

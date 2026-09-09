@@ -41,10 +41,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         AppState {
-            manager: TaskManager::new(),
+            manager: TaskManager::with_history_limits(config.execution.history),
             projects: ProjectStore::default(),
             workspaces: Arc::new(
-                LocalWorkspaceProvider::temporary()
+                LocalWorkspaceProvider::temporary_with_limits(config.execution.clone())
                     .expect("temporary workspace root should be available"),
             ),
             config: Arc::new(config),
@@ -54,7 +54,7 @@ impl AppState {
     #[cfg(test)]
     pub fn with_workspace(config: Config, workspaces: Arc<dyn WorkspaceProvider>) -> Self {
         AppState {
-            manager: TaskManager::new(),
+            manager: TaskManager::with_history_limits(config.execution.history),
             projects: ProjectStore::default(),
             workspaces,
             config: Arc::new(config),

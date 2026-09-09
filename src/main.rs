@@ -9,9 +9,13 @@ mod approve;
 mod cli;
 mod config;
 mod debate;
+mod execution_limits;
 mod implementer;
 mod inspection;
 mod process_environment;
+#[cfg(windows)]
+mod process_job;
+mod process_runner;
 mod project;
 mod repository_file;
 #[cfg(test)]

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
+use crate::execution_limits::{HistoryLimits, bounded_text};
 use crate::project::ProjectId;
 use crate::technology::{ProjectProfile, TechStack};
 use crate::verification::VerificationResult;
@@ -241,6 +242,27 @@ pub enum TaskEvent {
     },
 }
 
+impl TaskEvent {
+    fn log_text(&self) -> Option<&str> {
+        match self {
+            Self::Build { chunk } => Some(chunk),
+            Self::Notice { message } | Self::Warning { message } => Some(message),
+            _ => None,
+        }
+    }
+
+    fn bounded(mut self, limits: HistoryLimits) -> Self {
+        match &mut self {
+            Self::Build { chunk } => *chunk = bounded_text(chunk, limits.event_bytes),
+            Self::Notice { message } | Self::Warning { message } => {
+                *message = bounded_text(message, limits.event_bytes)
+            }
+            _ => {}
+        }
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
@@ -290,8 +312,11 @@ pub struct Task {
     pub profile: Option<ProjectProfile>,
     pub result: Option<TaskResult>,
     pub status: TaskStatus,
-    /// Every event so far, so a browser opening late sees the whole debate.
+    /// Lifecycle events plus a bounded tail of repetitive logs.
     pub history: Vec<TaskEvent>,
+    pub discarded_log_events: usize,
+    #[serde(skip)]
+    history_limits: HistoryLimits,
     pub spec: Option<String>,
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
@@ -317,6 +342,8 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            discarded_log_events: 0,
+            history_limits: HistoryLimits::default(),
             spec: None,
             error: None,
             decision: None,
@@ -337,6 +364,8 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            discarded_log_events: 0,
+            history_limits: HistoryLimits::default(),
             spec: None,
             error: None,
             decision: None,
@@ -370,7 +399,28 @@ impl Task {
             }
             _ => {}
         }
-        self.history.push(event.clone());
+        self.history
+            .push(event.clone().bounded(self.history_limits));
+        let (mut count, mut bytes) = self
+            .history
+            .iter()
+            .filter_map(TaskEvent::log_text)
+            .fold((0, 0), |(count, bytes), text| {
+                (count + 1, bytes + text.len())
+            });
+        while count > self.history_limits.log_events || bytes > self.history_limits.log_bytes {
+            let Some(index) = self
+                .history
+                .iter()
+                .position(|event| event.log_text().is_some())
+            else {
+                break;
+            };
+            bytes -= self.history[index].log_text().expect("log event").len();
+            self.history.remove(index);
+            count -= 1;
+            self.discarded_log_events += 1;
+        }
     }
 }
 
@@ -401,6 +451,7 @@ impl Emitter {
     /// (the CLI has no subscribers at all). It must never abort the pipeline, so
     /// the result is deliberately discarded.
     pub fn emit(&self, event: TaskEvent) {
+        let event = event.bounded(self.inner.history_limits);
         self.inner.record(self.id, &event);
         let _ = self.inner.tx.send((self.id, event));
     }
@@ -439,6 +490,7 @@ impl Emitter {
 /// module can hold the lock or reach the channel directly.
 #[derive(Debug)]
 struct Inner {
+    history_limits: HistoryLimits,
     tasks: RwLock<HashMap<TaskId, Task>>,
     tx: broadcast::Sender<(TaskId, TaskEvent)>,
     /// One waker per task, used to unpark a pipeline sitting at Gate 2.
@@ -452,6 +504,7 @@ impl Inner {
         // that nobody heard it.
         let (tx, _rx) = broadcast::channel(EVENT_BUFFER);
         Inner {
+            history_limits: HistoryLimits::default(),
             tasks: RwLock::new(HashMap::new()),
             tx,
             gates: RwLock::new(HashMap::new()),
@@ -489,6 +542,13 @@ impl Default for TaskManager {
 }
 
 impl TaskManager {
+    pub fn with_history_limits(history_limits: HistoryLimits) -> Self {
+        let mut inner = Inner::new();
+        inner.history_limits = history_limits;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
     pub fn new() -> Self {
         TaskManager {
             inner: Arc::new(Inner::new()),
@@ -525,7 +585,8 @@ impl TaskManager {
         Ok(self.insert(task))
     }
 
-    fn insert(&self, task: Task) -> Task {
+    fn insert(&self, mut task: Task) -> Task {
+        task.history_limits = self.inner.history_limits;
         let mut tasks = self
             .inner
             .tasks
@@ -1215,5 +1276,121 @@ mod tests {
             ..request
         };
         assert!(request.validate().unwrap_err().contains("description"));
+    }
+}
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    #[test]
+    fn log_bounds_preserve_all_lifecycle_events_and_authoritative_spec() {
+        let manager = TaskManager::with_history_limits(HistoryLimits {
+            event_bytes: 64,
+            log_events: 3,
+            log_bytes: 100,
+        });
+        let task = manager.create("test", "description", "legacy");
+        let emitter = manager.emitter(task.id);
+        let lifecycle = [
+            TaskEvent::Status {
+                status: TaskStatus::Created,
+            },
+            TaskEvent::Proposal {
+                round: 1,
+                text: "full proposal".repeat(50),
+            },
+            TaskEvent::Critique {
+                round: 1,
+                text: "critique".into(),
+                verdict: None,
+                reason: None,
+            },
+            TaskEvent::Spec {
+                markdown: "exact specification".repeat(50),
+                path: "artifacts/approved-spec.md".into(),
+            },
+            TaskEvent::Status {
+                status: TaskStatus::WaitingForApproval,
+            },
+        ];
+        for event in &lifecycle {
+            emitter.emit(event.clone());
+        }
+        manager
+            .decide_checked(
+                task.id,
+                Decision {
+                    approve: true,
+                    spec: None,
+                },
+            )
+            .unwrap();
+        emitter.status(TaskStatus::Implementing);
+        for index in 0..1000 {
+            emitter.emit(TaskEvent::Build {
+                chunk: format!("log {index} {}", "🦀".repeat(50)),
+            });
+            emitter.notice("ordinary chatter");
+        }
+        emitter.emit(TaskEvent::Verification {
+            result: VerificationResult {
+                command: "test".into(),
+                success: false,
+                output: "useful failure".into(),
+            },
+        });
+        emitter.emit(TaskEvent::Result {
+            result: TaskResult {
+                source_revision: None,
+                verification: vec![],
+                diff: "+partial changes".into(),
+            },
+        });
+        emitter.emit(TaskEvent::Finished {
+            status: TaskStatus::Failed,
+            error: Some("failure details".into()),
+        });
+        let stored = manager.get(task.id).unwrap();
+        let logs: Vec<_> = stored
+            .history
+            .iter()
+            .filter_map(TaskEvent::log_text)
+            .collect();
+        assert!(logs.len() <= 3 && logs.iter().map(|text| text.len()).sum::<usize>() <= 100);
+        assert!(logs.iter().all(|text| text.len() <= 64));
+        assert!(stored.discarded_log_events > 0);
+        assert_eq!(stored.spec, Some("exact specification".repeat(50)));
+        assert_eq!(stored.error.as_deref(), Some("failure details"));
+        assert_eq!(stored.result.unwrap().diff, "+partial changes");
+        // Every lifecycle event, including approval and final result, survived.
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .filter(|event| event.log_text().is_none())
+                .count(),
+            lifecycle.len() + 5
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_log_is_bounded_before_broadcast_as_well_as_storage() {
+        let manager = TaskManager::with_history_limits(HistoryLimits {
+            event_bytes: 64,
+            log_events: 3,
+            log_bytes: 192,
+        });
+        let task = manager.create("test", "description", "legacy");
+        let mut subscriber = manager.subscribe();
+        manager.emitter(task.id).emit(TaskEvent::Build {
+            chunk: "x".repeat(10000),
+        });
+        let (_, event) = subscriber.recv().await.unwrap();
+        let text = event.log_text().unwrap();
+        assert_eq!(text.len(), 64);
+        assert!(text.ends_with(crate::execution_limits::TRUNCATED));
+        assert_eq!(
+            manager.get(task.id).unwrap().history[0].log_text(),
+            Some(text)
+        );
     }
 }

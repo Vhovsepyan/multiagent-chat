@@ -324,7 +324,14 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     };
     let mut debate = String::new();
     let mut spec = String::new();
-    let mut build = String::new();
+    let mut build = if task.discarded_log_events > 0 {
+        format!(
+            "<div class=\"notice\">[output truncated: history limit exceeded; {} older log events discarded]</div>",
+            task.discarded_log_events
+        )
+    } else {
+        String::new()
+    };
     let mut done = String::new();
     for event in &task.history {
         for (slot, html) in event_updates(id, event, task.spec.as_deref()) {

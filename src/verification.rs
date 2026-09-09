@@ -1,7 +1,6 @@
 //! Technology-aware verification planning and execution.
 
 use std::path::Path;
-use std::process::Stdio;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -101,15 +100,31 @@ fn node_commands(root: &Path) -> Vec<VerificationCommand> {
         .collect()
 }
 
+#[cfg(test)]
 pub async fn run(commands: &[VerificationCommand], root: &Path) -> Result<Vec<VerificationResult>> {
+    run_with_limits(
+        commands,
+        root,
+        &crate::execution_limits::ExecutionLimits::default(),
+    )
+    .await
+}
+
+pub async fn run_with_limits(
+    commands: &[VerificationCommand],
+    root: &Path,
+    limits: &crate::execution_limits::ExecutionLimits,
+) -> Result<Vec<VerificationResult>> {
     let mut results = Vec::new();
     for command in commands {
-        let output = match crate::process_environment::async_command(&command.program)
-            .args(&command.args)
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .output()
-            .await
+        let mut process = crate::process_environment::async_command(&command.program);
+        process.args(&command.args).current_dir(root);
+        let output = match crate::process_runner::run(
+            process,
+            limits.process(limits.verification_timeout),
+            None,
+        )
+        .await
         {
             Ok(output) => output,
             Err(error) => {
@@ -121,17 +136,13 @@ pub async fn run(commands: &[VerificationCommand], root: &Path) -> Result<Vec<Ve
                 break;
             }
         };
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let combined = output.text();
         results.push(VerificationResult {
             command: command.display(),
-            success: output.status.success(),
-            output: combined.chars().take(16_000).collect(),
+            success: output.success(),
+            output: combined,
         });
-        if !output.status.success() {
+        if !output.success() {
             break;
         }
     }

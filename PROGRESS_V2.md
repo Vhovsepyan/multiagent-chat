@@ -20,6 +20,26 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- Execution limits (2026-09-08): Shared process runner drains stdout/stderr
+  concurrently with bounded capture and explicit truncation markers. Defaults:
+  30 minutes for implementation, 10 minutes per verification command, 5 minutes
+  per Git command, and 64 KiB per diagnostic stream. Configuration is centralized
+  in execution_limits.rs; existing child environment filtering is preserved.
+- Windows uses a kill-on-close Job Object per command (failure to attach stops
+  execution); Unix timeouts target a new process group and then the direct child.
+  Pipe draining is covered by the deadline. No strong execution sandbox is claimed.
+- Build/Notice/Warning history is a bounded tail (256 events / 256 KiB; 4 KiB per
+  event). Task state records discarded-log counts; lifecycle events, approved
+  text, verification, and final results are preserved rather than silently cut.
+- Git output and result-content capture have an 8 MiB budget. Incomplete Git
+  output is never parsed as a complete result. Failed capture keeps the workspace
+  for a configurable recovery window (24 hours), followed by a cleanup retry.
+  Failures retain available output, verification details, and changes before
+  cleanup. Timers are not durable; restart leftovers need manual cleanup.
+- Workspace preparation, inspection, diff capture, and finalization now run on
+  blocking workers so bounded synchronous provider/Git adapters do not occupy
+  the HTTP runtime workers. Persistence, SSE replay, auth, and cloud work remain
+  out of scope.
 - Pre-persistence security (2026-09-08): Provider-owned task roots now contain
   sibling `repo/` and `artifacts/` directories. The authoritative approved text
   is written to `artifacts/approved-spec.md` and passed by explicit absolute path

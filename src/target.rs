@@ -50,7 +50,7 @@ pub fn resolve(config: &Config, topic: &str) -> Result<PathBuf> {
     }
 
     fs::create_dir_all(&path).with_context(|| format!("could not create {}", path.display()))?;
-    git_init(&path)?;
+    git_init(&path, &config.execution)?;
     ui::success(&format!("created {}", path.display()));
 
     Ok(path)
@@ -116,7 +116,7 @@ pub fn ensure_project(config: &Config, name: &str) -> Result<PathBuf> {
     }
 
     fs::create_dir_all(&path).with_context(|| format!("could not create {}", path.display()))?;
-    git_init(&path)?;
+    git_init(&path, &config.execution)?;
     Ok(path)
 }
 
@@ -158,12 +158,10 @@ fn slug_from_topic(topic: &str) -> String {
 
 /// `git init` in a freshly created folder. A failure here is not fatal — the
 /// spec can still be written — so we only warn.
-fn git_init(path: &Path) -> Result<()> {
-    match crate::process_environment::command("git")
-        .arg("init")
-        .current_dir(path)
-        .output()
-    {
+fn git_init(path: &Path, limits: &crate::execution_limits::ExecutionLimits) -> Result<()> {
+    let mut command = crate::process_environment::command("git");
+    command.arg("init").current_dir(path);
+    match crate::workspace::run_git(command, limits) {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             ui::warn(&format!(

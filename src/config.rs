@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 /// All settings for one run of the app.
 #[derive(Clone)]
 pub struct Config {
+    pub execution: crate::execution_limits::ExecutionLimits,
     pub gemini_api_key: String,
     pub anthropic_api_key: String,
     /// Folder that holds all of the user's projects. The repo for one run is
@@ -95,6 +96,7 @@ impl Config {
         };
 
         Ok(Config {
+            execution: crate::execution_limits::ExecutionLimits::load()?,
             gemini_api_key: required("GEMINI_API_KEY")?,
             anthropic_api_key: required("ANTHROPIC_API_KEY")?,
             workspace_root,
@@ -133,6 +135,7 @@ fn optional(name: &str, default: &str) -> String {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
+            .field("execution", &self.execution)
             .field("gemini_api_key", &"<redacted>")
             .field("anthropic_api_key", &"<redacted>")
             .field("workspace_root", &self.workspace_root)

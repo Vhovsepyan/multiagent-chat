@@ -60,8 +60,10 @@ user authentication or an execution sandbox.
 
 If implementation or verification fails, available changes are captured in the
 task result before workspace cleanup. If result capture itself fails, cleanup
-is skipped and the server retains the UUID-named task workspace for manual
-recovery. Results otherwise remain in memory until persistence is implemented.
+is delayed and the server retains the UUID-named task workspace for manual
+recovery until the configured recovery deadline (24 hours by default). Cleanup
+failures also schedule a retry. Recover needed files before this deadline.
+Results otherwise remain in memory until persistence is implemented.
 
 Inspection skips linked repository files, including instructions and metadata.
 Each task workspace has separate `repo/` and `artifacts/` directories. The exact
@@ -87,6 +89,50 @@ the project in a UUID-named temporary artifact directory. It prints that path
 and retains it for manual review/recovery; `--implement-only` continues to read
 a project-owned `SPEC.md` without overwriting it. These CLI artifacts require
 manual cleanup and are not durable storage.
+
+## Execution limits
+
+Child execution has configurable time and diagnostic-output limits. Set these
+environment variables when starting the server (all must be positive integers):
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `IMPLEMENTER_TIMEOUT_SECS` | 1800 | Claude Code deadline |
+| `VERIFICATION_TIMEOUT_SECS` | 600 | Deadline per verification command |
+| `GIT_TIMEOUT_SECS` | 300 | Deadline per Git command |
+| `PROCESS_STDOUT_BYTES` | 65536 | Retained stdout bytes per command |
+| `PROCESS_STDERR_BYTES` | 65536 | Retained stderr bytes per command |
+| `LOG_EVENT_BYTES` | 4096 | Maximum repetitive log-event payload, including its marker |
+| `TASK_LOG_EVENTS` | 256 | Retained repetitive log-event count per task |
+| `TASK_LOG_BYTES` | 262144 | Retained repetitive log text bytes per task |
+| `WORKSPACE_RECOVERY_SECS` | 86400 | Recovery window before delayed cleanup retry |
+
+The runner drains both pipes concurrently, discarding excess bytes rather than
+buffering the entire output. Truncated streams include
+`[output truncated: limit exceeded]`; markers and UTF-8 decoding add a small
+bounded overhead to raw stream capture. Oversized lines are split into bounded
+events. `LOG_EVENT_BYTES` must be large enough to hold the marker.
+
+The timeout covers process exit and pipe draining. Partial diagnostics and
+available changes survive failure/timeout. Windows Job Objects manage child
+tree lifetimes; Unix timeouts kill the process group, with a bounded direct-child
+termination fallback. This does not prevent intentionally escaping processes or
+provide filesystem, network, CPU, or memory isolation.
+
+Task history retains the newest Build/Notice/Warning logs, with a discarded-log
+counter and an explanation on page reload. Proposals, critiques, specifications,
+approval, state transitions, verification, failure/completion, and final results
+are not evicted by that log limit. This is not a global memory limit: task count
+and lifecycle documents still need durable persistence and retention policies.
+
+Git capture uses a separate 8 MiB stdout/result-content budget. Over-budget Git
+output is rejected rather than parsed as a complete diff; large added files also
+fail capture safely, retaining the workspace for recovery. Workspace preparation,
+inspection, diff capture, and cleanup run off the HTTP runtime workers.
+
+Delayed cleanup is in-process only. A server restart loses its timers; failed
+cleanup retries and workspaces left by a restart require manual cleanup. These
+limits do not make untrusted repositories safe to execute.
 
 ## Supported technology profiles
 
@@ -178,6 +224,9 @@ src/
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code process and streamed output
   process_environment.rs explicit child-process environment policy
+  execution_limits.rs centralized timeout, output, history, recovery settings
+  process_runner.rs bounded process execution and output streaming
+  process_job.rs    Windows child-process lifetime management
   web/             axum API, pipeline, SSE, and production UI
 ```
 

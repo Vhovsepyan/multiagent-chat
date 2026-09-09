@@ -26,3 +26,6 @@ tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
