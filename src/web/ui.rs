@@ -112,12 +112,23 @@ fn actions_html(id: TaskId) -> String {
     )
 }
 
+/// The milestone card. Its inner `#milestones` region is replaced on every
+/// milestone event (task 0008 follow-up), so the badges track task state live
+/// instead of only accumulating text.
 fn milestones_html(task: &Task) -> String {
-    if task.milestones.is_empty() {
-        return r#"<div id="milestones" class="card" sse-swap="milestones" hx-swap="beforeend"><h2 class="section">Milestones</h2><div class="hint">The ordered milestone plan will appear after approval.</div></div>"#.into();
+    format!(
+        r#"<div class="card"><h2 class="section">Milestones</h2><div id="milestones" hx-swap="innerHTML">{}</div></div>"#,
+        milestone_list_html(&task.milestones)
+    )
+}
+
+/// Rendered from current task state, never from one event in isolation.
+fn milestone_list_html(milestones: &[crate::milestone::Milestone]) -> String {
+    if milestones.is_empty() {
+        return r#"<div class="hint">The ordered milestone plan will appear after approval.</div>"#
+            .into();
     }
-    let rows = task
-        .milestones
+    let rows = milestones
         .iter()
         .map(|milestone| {
             let class = match milestone.status {
@@ -135,9 +146,7 @@ fn milestones_html(task: &Task) -> String {
             )
         })
         .collect::<String>();
-    format!(
-        r#"<div id="milestones" class="card" sse-swap="milestones" hx-swap="beforeend"><h2 class="section">Milestones</h2><ol class="milestones">{rows}</ol></div>"#
-    )
+    format!(r#"<ol class="milestones">{rows}</ol>"#)
 }
 
 fn gate_html(id: TaskId, spec: &str) -> String {
@@ -420,32 +429,23 @@ fn event_html(
             ),
         )),
         TaskEvent::MilestonePlanCreated { milestones } => Some((
-            "milestones",
+            "build",
             format!(
-                r#"<div class="notice ok">Milestone plan created Â· {} milestones</div>{}"#,
-                milestones.len(),
-                milestones
-                    .iter()
-                    .map(|milestone| format!(
-                        "<div>{}. {} Â· {}</div>",
-                        milestone.order,
-                        esc(&milestone.title),
-                        milestone.status.label()
-                    ))
-                    .collect::<String>()
+                r#"<div class="notice ok">Milestone plan created · {} milestones</div>"#,
+                milestones.len()
             ),
         )),
         TaskEvent::MilestoneStarted { order, title, .. } => Some((
-            "milestones",
+            "build",
             format!(
-                r#"<div class="notice">Milestone {order} started Â· {}</div>"#,
+                r#"<div class="notice">Milestone {order} started · {}</div>"#,
                 esc(title)
             ),
         )),
         TaskEvent::MilestoneCompleted { order, title, .. } => Some((
-            "milestones",
+            "build",
             format!(
-                r#"<div class="notice ok">Milestone {order} passed Â· {}</div>"#,
+                r#"<div class="notice ok">Milestone {order} passed · {}</div>"#,
                 esc(title)
             ),
         )),
@@ -455,9 +455,9 @@ fn event_html(
             error,
             ..
         } => Some((
-            "milestones",
+            "build",
             format!(
-                r#"<div class="notice err">Milestone {order} failed Â· {} Â· {}</div>"#,
+                r#"<div class="notice err">Milestone {order} failed · {} · {}</div>"#,
                 esc(title),
                 esc(error)
             ),
@@ -468,9 +468,9 @@ fn event_html(
             reason,
             ..
         } => Some((
-            "milestones",
+            "build",
             format!(
-                r#"<div class="notice warn">Milestone {order} cancelled Â· {} Â· {}</div>"#,
+                r#"<div class="notice warn">Milestone {order} cancelled · {} · {}</div>"#,
                 esc(title),
                 esc(reason)
             ),
@@ -533,22 +533,43 @@ fn timestamp_html(recorded: &RecordedEvent) -> String {
 }
 
 /// A single domain event may affect several independent live UI regions.
+///
+/// `milestones` is the task's CURRENT plan state, so a milestone event refreshes
+/// the visible pending/running/passed/failed/cancelled badges instead of only
+/// appending a line of text (task 0008 follow-up). The extra updates travel as
+/// out-of-band swaps on the same SSE message, so ordering is unchanged.
 fn event_updates(
     id: TaskId,
     recorded: &RecordedEvent,
     current_spec: Option<&str>,
     agents: &AgentSelection,
+    milestones: &[crate::milestone::Milestone],
 ) -> Vec<(&'static str, String)> {
     let Some((name, html)) = event_html(id, recorded, agents) else {
         return Vec::new();
     };
     if let TaskEvent::Finished { status, .. } = &recorded.event {
-        let mut updates = vec![("status", timeline_html(*status)), (name, html)];
-        updates.push(("spec", spec_readonly_html(current_spec)));
-        updates
-    } else {
-        vec![(name, html)]
+        return vec![
+            ("status", timeline_html(*status)),
+            (name, html),
+            ("spec", spec_readonly_html(current_spec)),
+            ("milestones", milestone_list_html(milestones)),
+        ];
     }
+    if matches!(
+        recorded.event,
+        TaskEvent::MilestonePlanCreated { .. }
+            | TaskEvent::MilestoneStarted { .. }
+            | TaskEvent::MilestoneCompleted { .. }
+            | TaskEvent::MilestoneFailed { .. }
+            | TaskEvent::MilestoneCancelled { .. }
+    ) {
+        return vec![
+            (name, html),
+            ("milestones", milestone_list_html(milestones)),
+        ];
+    }
+    vec![(name, html)]
 }
 
 fn live_event(updates: Vec<(&'static str, String)>) -> Option<Event> {
@@ -756,7 +777,15 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     };
     let mut done = String::new();
     for event in task.display_history() {
-        for (slot, html) in event_updates(id, event, task.spec.as_deref(), &task.agents) {
+        // The page renders the milestone card from state below, so the
+        // "milestones" slot is ignored while replaying history.
+        for (slot, html) in event_updates(
+            id,
+            event,
+            task.spec.as_deref(),
+            &task.agents,
+            &task.milestones,
+        ) {
             match slot {
                 "debate" => debate.push_str(&html),
                 "spec" => spec = html,
@@ -829,11 +858,16 @@ pub async fn stream(
                     .as_ref()
                     .map(|task| task.agents.clone())
                     .unwrap_or_else(AgentSelection::compiled_defaults);
+                let milestones = task
+                    .as_ref()
+                    .map(|task| task.milestones.clone())
+                    .unwrap_or_default();
                 event_updates(
                     id,
                     &event,
                     task.as_ref().and_then(|task| task.spec.as_deref()),
                     &agents,
+                    &milestones,
                 )
             }
             Ok(_) => return None,

@@ -281,6 +281,9 @@ pub async fn export_evidence(
         .await
         .map_err(|error| ApiError::internal(format!("evidence export task failed: {error}")))?
         .map_err(|error| ApiError::internal(format!("could not export evidence: {error:#}")))?;
+    // Only a generated archive is an export: recording earlier would leave a
+    // successful-looking audit event behind a failed download.
+    state.manager.record_evidence_export(id);
     let disposition =
         HeaderValue::from_str(&format!("attachment; filename=\"{}\"", package.filename))
             .map_err(|_| ApiError::internal("could not create evidence download filename"))?;

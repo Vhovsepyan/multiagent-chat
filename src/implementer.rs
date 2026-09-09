@@ -30,17 +30,45 @@ use crate::ui;
 /// The CLI we shell out to. Resolved from PATH.
 const CLAUDE_BIN: &str = "claude";
 
+/// The placeholder that stands in for the workspace-specific artifact path when
+/// this same prompt is recorded as evidence (task 0007).
+pub const SPEC_PATH_PLACEHOLDER: &str = "<APPROVED_SPEC_PATH>";
+
 /// Common artifact instructions stay separate from task-specific behavior.
+///
+/// Since task 0008 this prompt does NOT tell the worker to work through the
+/// specification's Steps section: with milestone execution the caller's
+/// instructions decide the scope of one run, and a second, broader instruction
+/// here would contradict them.
 pub fn prompt(spec_path: &Path, task_prompt: &str) -> String {
+    prompt_with_reference(
+        &serde_json::to_string(&spec_path.to_string_lossy()).expect("path serializes"),
+        task_prompt,
+    )
+}
+
+/// The identical prompt with the server's absolute artifact path replaced by a
+/// stable placeholder. Evidence records the real instruction this way rather
+/// than a second, separately maintained description that could drift from it.
+pub fn evidence_prompt(task_prompt: &str) -> String {
+    prompt_with_reference(
+        &serde_json::to_string(SPEC_PATH_PLACEHOLDER).expect("placeholder serializes"),
+        task_prompt,
+    )
+}
+
+fn prompt_with_reference(spec_reference: &str, task_prompt: &str) -> String {
     format!(
-        "Read the approved specification at this external path: {}\n\n\
-         This orchestration artifact is authoritative. Do not copy it into the \
-         repository or overwrite a project-owned SPEC.md with it.\n\n\
-         Work through the Steps section in order. Follow the existing \
-         conventions of this repository if it already has code. When you are \
-         done, run the project's tests if it has any, and summarise what you \
-         built and anything from the approved specification you did not implement.\n\n{task_prompt}",
-        serde_json::to_string(&spec_path.to_string_lossy()).expect("path serializes")
+        "Read the approved specification at this external path: {spec_reference}\n\n\
+         This orchestration artifact is authoritative background context for the \
+         task as a whole. Do not copy it into the repository or overwrite a \
+         project-owned SPEC.md with it.\n\n\
+         The instructions below are authoritative for what to implement in THIS \
+         run: do exactly what they ask and nothing beyond their scope. Follow the \
+         existing conventions of this repository if it already has code. When you \
+         are done, run the project's tests if it has any, and summarise what you \
+         changed and anything the instructions asked for that you did not \
+         implement.\n\n{task_prompt}"
     )
 }
 
@@ -203,6 +231,35 @@ mod tests {
         assert!(p.contains("/task with spaces/artifacts/approved-spec.md"));
         assert!(p.contains("Fix the root cause."));
         assert!(!p.contains("Read SPEC.md"));
-        assert!(p.contains("Steps"));
+    }
+
+    /// Task 0008: the common prompt must not widen the scope of a run. Only the
+    /// caller's instructions say what to implement.
+    #[test]
+    fn the_common_prompt_does_not_order_the_whole_steps_section() {
+        let p = prompt(Path::new("/tmp/artifacts/approved-spec.md"), "Do X.");
+
+        assert!(!p.contains("Steps"), "prompt still scopes by Steps: {p}");
+        assert!(!p.to_lowercase().contains("work through"), "{p}");
+        assert!(p.contains("authoritative for what to implement in THIS"));
+    }
+
+    /// Task 0007: evidence must show the real instruction, so the two builders
+    /// may differ only in the artifact path.
+    #[test]
+    fn the_evidence_prompt_is_the_real_prompt_with_a_placeholder_path() {
+        let path = Path::new("/srv/tmp/task-9/artifacts/approved-spec.md");
+        let real = prompt(path, "Implement milestone m1.");
+
+        let evidence = evidence_prompt("Implement milestone m1.");
+
+        assert_eq!(
+            real.replace(
+                "/srv/tmp/task-9/artifacts/approved-spec.md",
+                SPEC_PATH_PLACEHOLDER
+            ),
+            evidence
+        );
+        assert!(!evidence.contains("/srv/tmp"), "path leaked: {evidence}");
     }
 }

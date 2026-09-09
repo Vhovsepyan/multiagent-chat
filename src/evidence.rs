@@ -220,13 +220,14 @@ pub fn chat_prompt(system: Option<&str>, messages: &[Message]) -> String {
     prompt
 }
 
-/// Safe representation of the request handed to the worker abstraction. The
-/// server's absolute temporary paths are deliberately not retained.
+/// The actual instruction handed to the coding agent, with the server's
+/// absolute artifact path replaced by a stable placeholder.
+///
+/// This delegates to the prompt builder the worker itself uses, so evidence
+/// cannot drift from what was really sent (task 0007). Redaction and the
+/// evidence size cap are applied when the record is retained.
 pub fn worker_instruction(instructions: &str) -> String {
-    format!(
-        "Read the authoritative approved specification artifact ({}) and implement it.\n\nTask-specific instructions:\n{instructions}",
-        crate::spec::APPROVED_SPEC_FILENAME
-    )
+    crate::implementer::evidence_prompt(instructions)
 }
 
 pub fn elapsed_ms(started: Instant) -> u64 {
@@ -1383,22 +1384,54 @@ mod tests {
         assert!(report.contains("Worker result: Cancelled"));
     }
 
+    /// What the HTTP handler does: render the archive, and only then record
+    /// that an export happened.
+    fn export_once(manager: &crate::task::TaskManager, id: crate::task::TaskId) -> EvidencePackage {
+        let package = export(&manager.evidence_snapshot(id).unwrap()).unwrap();
+        manager.record_evidence_export(id);
+        package
+    }
+
+    fn export_events(manager: &crate::task::TaskManager, id: crate::task::TaskId) -> usize {
+        manager
+            .get(id)
+            .unwrap()
+            .history
+            .iter()
+            .filter(|recorded| matches!(recorded.event, TaskEvent::EvidenceExported { .. }))
+            .count()
+    }
+
     #[test]
     fn repeat_export_is_deterministic_and_the_audit_event_is_idempotent() {
         let (manager, id) = task_with_evidence("configured-secret-value");
-        let first = export(&manager.evidence_snapshot(id).unwrap()).unwrap();
-        let second = export(&manager.evidence_snapshot(id).unwrap()).unwrap();
-        assert_eq!(first.bytes, second.bytes);
-        assert_eq!(first.files, second.files);
-        let stored = manager.get(id).unwrap();
-        assert_eq!(
-            stored
-                .history
-                .iter()
-                .filter(|recorded| { matches!(recorded.event, TaskEvent::EvidenceExported { .. }) })
-                .count(),
-            1
-        );
+
+        let first = export_once(&manager, id);
+        let second = export_once(&manager, id);
+        let third = export_once(&manager, id);
+
+        // The event is recorded after the archive it describes, so it appears
+        // from the second export onwards — and every later export matches.
+        assert_ne!(first.bytes, second.bytes);
+        assert_eq!(second.bytes, third.bytes);
+        assert_eq!(second.files, third.files);
+        assert_eq!(export_events(&manager, id), 1);
+    }
+
+    /// Task 0007 follow-up: a snapshot on its own is not an export. If archive
+    /// generation fails, no successful export event may remain behind.
+    #[test]
+    fn a_failed_export_leaves_no_evidence_exported_event() {
+        let (manager, id) = task_with_evidence("configured-secret-value");
+
+        // Snapshot taken, archive never produced: the handler skips the record.
+        let _snapshot = manager.evidence_snapshot(id).unwrap();
+
+        assert_eq!(export_events(&manager, id), 0);
+
+        // A later successful export still records exactly one event.
+        export_once(&manager, id);
+        assert_eq!(export_events(&manager, id), 1);
     }
 
     #[test]

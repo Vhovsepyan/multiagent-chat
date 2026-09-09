@@ -244,6 +244,36 @@ h3.section.agents-title {
   letter-spacing: 0.05em;
 }
 .agent .who { color: var(--text); }
+/* --- milestone plan and live status badges (task 0008) ------------------ */
+
+ol.milestones {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+ol.milestones li { display: block; }
+ol.milestones strong { font-weight: 600; }
+
+.milestone-status {
+  display: inline-block;
+  min-width: 74px;
+  margin-right: 10px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  text-align: center;
+  color: var(--muted);
+}
+.milestone-status.active { border-color: var(--accent); color: var(--accent); }
+.milestone-status.ok { border-color: var(--ok); color: var(--ok); }
+.milestone-status.err { border-color: var(--bad); color: var(--bad); }
+.milestone-status.pending { color: var(--muted); }
+
 .agent code {
   background: var(--panel-2);
   border: 1px solid var(--line);

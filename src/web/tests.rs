@@ -1651,3 +1651,245 @@ async fn malformed_json_bodies_use_the_standard_error_response() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Task 0008 follow-up: milestone badges update live
+// ---------------------------------------------------------------------------
+
+fn milestone_plan() -> Vec<crate::milestone::Milestone> {
+    ["Project bootstrap", "Persistence layer"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, title)| crate::milestone::Milestone {
+            id: format!("m{}", index + 1),
+            order: u32::try_from(index + 1).unwrap(),
+            title: title.into(),
+            objective: format!("{title} objective"),
+            verification_instructions: vec!["cargo test".into()],
+            status: crate::milestone::MilestoneStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            worker_result_summary: None,
+        })
+        .collect()
+}
+
+/// Every milestone lifecycle event must carry the refreshed badge list built
+/// from current task state, not just another line of text.
+#[tokio::test]
+async fn milestone_events_refresh_the_status_badges_live() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("ui-milestone-live");
+    let task = state.manager.create("t", "d", "p");
+    let emitter = state.manager.emitter(task.id);
+
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    let plan = milestone_plan();
+    emitter.emit(TaskEvent::MilestonePlanCreated {
+        milestones: plan.clone(),
+    });
+    let created = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    // The textual notice stays in the run log; the badge region is swapped
+    // out-of-band on the same message, so SSE ordering is unchanged.
+    assert!(created.contains("event: build"), "got: {created}");
+    assert!(created.contains("Milestone plan created"), "got: {created}");
+    assert!(
+        created.contains(r#"<div id="milestones" hx-swap-oob="innerHTML">"#),
+        "plan did not refresh the badge region: {created}"
+    );
+    assert_eq!(created.matches("milestone-status pending").count(), 2);
+
+    emitter.emit(TaskEvent::MilestoneStarted {
+        id: "m1".into(),
+        order: 1,
+        title: "Project bootstrap".into(),
+        worker_tool: crate::agent::CodingTool::ClaudeCode,
+        worker_model: "test-worker-model".into(),
+    });
+    let started = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        started.contains(r#"<span class="milestone-status active">running</span>"#),
+        "running badge missing: {started}"
+    );
+    assert!(started.contains("milestone-status pending"), "{started}");
+
+    emitter.emit(TaskEvent::MilestoneCompleted {
+        id: "m1".into(),
+        order: 1,
+        title: "Project bootstrap".into(),
+        verification: Vec::new(),
+        worker_result_summary: "done".into(),
+    });
+    let completed = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        completed.contains(r#"<span class="milestone-status ok">passed</span>"#),
+        "passed badge missing: {completed}"
+    );
+
+    emitter.emit(TaskEvent::MilestoneFailed {
+        id: "m2".into(),
+        order: 2,
+        title: "Persistence layer".into(),
+        verification: Vec::new(),
+        worker_result_summary: None,
+        error: "verification failed".into(),
+    });
+    let failed = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        failed.contains(r#"<span class="milestone-status err">failed</span>"#),
+        "failed badge missing: {failed}"
+    );
+    assert!(failed.contains("verification failed"), "{failed}");
+
+    // A reload shows the same state the live badges already showed.
+    let page = body_text(
+        router(state)
+            .oneshot(get(&format!("/task/{}", task.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        page.contains(r#"<div id="milestones" hx-swap="innerHTML">"#),
+        "{page}"
+    );
+    assert!(page.contains(r#"<span class="milestone-status ok">passed</span>"#));
+    assert!(page.contains(r#"<span class="milestone-status err">failed</span>"#));
+    assert!(
+        page.contains("Milestone plan created"),
+        "history is missing"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A cancelled milestone must reach the badges too.
+#[tokio::test]
+async fn a_cancelled_milestone_updates_its_badge() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("ui-milestone-cancel");
+    let task = state.manager.create("t", "d", "p");
+    let emitter = state.manager.emitter(task.id);
+    emitter.emit(TaskEvent::MilestonePlanCreated {
+        milestones: milestone_plan(),
+    });
+
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    emitter.emit(TaskEvent::MilestoneCancelled {
+        id: "m1".into(),
+        order: 1,
+        title: "Project bootstrap".into(),
+        reason: "task cancelled before milestone start".into(),
+    });
+
+    let cancelled = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        cancelled.contains(r#"<span class="milestone-status err">cancelled</span>"#),
+        "cancelled badge missing: {cancelled}"
+    );
+    assert!(cancelled.contains("Milestone 1 cancelled"), "{cancelled}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Task 0007 follow-up: the export event follows a generated archive
+// ---------------------------------------------------------------------------
+
+/// Downloading records exactly one `EvidenceExported`, and only once the
+/// archive exists. A task nobody exported has none.
+#[tokio::test]
+async fn evidence_export_records_one_audit_event_after_the_archive() {
+    let (state, root) = test_state("evidence-audit");
+    let task = state.manager.create("Evidence", "audit", "legacy");
+    let app = router(state.clone());
+
+    let exported = |state: &AppState| {
+        state
+            .manager
+            .get(task.id)
+            .unwrap()
+            .history
+            .iter()
+            .filter(|recorded| matches!(recorded.event, TaskEvent::EvidenceExported { .. }))
+            .count()
+    };
+
+    assert_eq!(exported(&state), 0, "no export happened yet");
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(get(&format!("/api/tasks/{}/evidence", task.id)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // Recording happens after generation, so a downloaded archive always
+        // exists when the event is present.
+        assert!(!bytes.is_empty());
+        assert_eq!(exported(&state), 1);
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}

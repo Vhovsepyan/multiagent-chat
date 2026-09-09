@@ -23,6 +23,22 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-26 (2026-09-09, tasks 0007/0008 follow-up): one scope statement per worker
+  run. The common Claude Code prompt no longer says "Work through the Steps
+  section in order"; it presents the approved specification as background
+  context and defers scope to the caller, and `workflow::milestone_prompt`
+  supplies the single authoritative instruction naming only the current
+  milestone. Evidence reuses that real prompt via
+  `implementer::evidence_prompt`, which substitutes `<APPROVED_SPEC_PATH>` for
+  the workspace path, so recorded instructions cannot drift from what was sent
+  and no temporary absolute path is retained. `EvidenceExported` is recorded by
+  `TaskManager::record_evidence_export` only after the archive is generated —
+  a failed export leaves no successful event — and remains idempotent, so the
+  event is visible from the second export onwards and repeated exports after
+  that are byte-identical. Milestone lifecycle events now refresh the
+  `#milestones` badge region from current task state through an out-of-band
+  swap on the same SSE message, with the textual notice appended to the run log
+  instead of replacing the plan view.
 - DP-25 (2026-09-09, task 0008): approved specifications must contain a
   non-empty `## Steps` section; those ordered entries become frozen milestone
   records without an additional LLM call. Each milestone invokes the task's

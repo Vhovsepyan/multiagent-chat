@@ -302,7 +302,7 @@ async fn run(
     emitter.emit(TaskEvent::MilestonePlanCreated {
         milestones: milestones.clone(),
     });
-    let base_prompt = crate::workflow::implementation_prompt(task.kind, &profile);
+    let total = milestones.len();
     let mut all_verification = Vec::new();
     for milestone in milestones {
         if state.manager.is_cancelled(id) {
@@ -321,12 +321,14 @@ async fn run(
             worker_tool: task.agents.worker.tool,
             worker_model: task.agents.worker.model.clone(),
         });
-        let instructions = format!(
-            "{base_prompt}\n\nRepository context:\n{repository_context}\n\nCurrent milestone {}: {}\nObjective: {}\nVerification instructions: {}\nDo not implement future milestones.",
-            milestone.id,
-            milestone.title,
-            milestone.objective,
-            milestone.verification_instructions.join("; ")
+        // One authoritative instruction per milestone (task 0008): scope lives
+        // here, not in the common worker prompt.
+        let instructions = crate::workflow::milestone_prompt(
+            task.kind,
+            &profile,
+            &milestone,
+            total,
+            &repository_context,
         );
         if let Err(error) = execute_worker_for_milestone(
             agents.worker.as_ref(),

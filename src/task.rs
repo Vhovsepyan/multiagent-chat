@@ -1231,32 +1231,54 @@ impl TaskManager {
         tasks.get(&id).cloned()
     }
 
-    /// Record the export action once, then return a fully sanitized snapshot.
-    /// The idempotent event makes the first and later exports of a stable task
-    /// deterministic while still auditing that export occurred.
+    /// A fully sanitized snapshot to render an evidence archive from.
+    ///
+    /// Reading is side-effect free: the audit event belongs to a SUCCESSFUL
+    /// export, so it is recorded afterwards by `record_evidence_export`. A
+    /// failed archive generation therefore leaves no trace of a successful one.
     pub fn evidence_snapshot(&self, id: TaskId) -> Option<Task> {
+        let tasks = self
+            .inner
+            .tasks
+            .read()
+            .expect("task registry lock poisoned");
+        let mut snapshot = tasks.get(&id)?.clone();
+        snapshot.sanitize_for_export(&self.inner.redactor);
+        Some(snapshot)
+    }
+
+    /// Record that an evidence archive was successfully generated.
+    ///
+    /// Idempotent: the event is recorded at most once per task, so repeated
+    /// downloads of a finished task keep producing the same archive. As the
+    /// event is recorded after the archive it describes, it becomes visible in
+    /// the NEXT export, never in the one that produced it.
+    ///
+    /// Returns whether this call was the one that recorded the event.
+    pub fn record_evidence_export(&self, id: TaskId) -> bool {
         let mut tasks = self
             .inner
             .tasks
             .write()
             .expect("task registry lock poisoned");
-        let task = tasks.get_mut(&id)?;
-        if !task
+        let Some(task) = tasks.get_mut(&id) else {
+            return false;
+        };
+        if task
             .history
             .iter()
             .any(|recorded| matches!(recorded.event, TaskEvent::EvidenceExported { .. }))
         {
-            let event = TaskEvent::EvidenceExported {
-                artifact: crate::evidence::archive_filename(id),
-            }
-            .sanitized(&self.inner.redactor)
-            .bounded(self.inner.history_limits);
-            let recorded = task.record_event(event);
-            let _ = self.inner.tx.send((id, recorded));
+            return false;
         }
-        let mut snapshot = task.clone();
-        snapshot.sanitize_for_export(&self.inner.redactor);
-        Some(snapshot)
+        let event = TaskEvent::EvidenceExported {
+            artifact: crate::evidence::archive_filename(id),
+        }
+        .sanitized(&self.inner.redactor)
+        .bounded(self.inner.history_limits);
+        let recorded = task.record_event(event);
+        let _ = self.inner.tx.send((id, recorded));
+        true
     }
 
     /// Snapshots of every task.
