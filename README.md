@@ -1,6 +1,8 @@
 # multiagent-chat
 
-A Rust web application for repository-backed, multi-agent software engineering. Gemini proposes a solution, Claude critiques it, the application produces an editable specification, and Claude Code implements the user-approved result in an isolated task workspace.
+A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace.
+
+Each task chooses its own agents: the proposer and critic can run on any configured chat provider (currently Gemini or Anthropic) with any configured model, and the worker runs a coding tool (currently Claude Code) with its own model. The choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the configured defaults — proposer Gemini, critic Anthropic, worker Claude Code — which is how the application behaved before selection existed. See [Agent selection](#agent-selection).
 
 Multiagent Chat supports three task kinds:
 
@@ -15,7 +17,9 @@ GitHub public repositories are the initial existing-project source. Each task us
 - Rust stable with `cargo`.
 - Git on `PATH` for repository-backed tasks.
 - Claude Code CLI on `PATH` for implementation.
-- Google AI Studio and Anthropic API keys.
+- An API key for each chat provider you want to use: `GEMINI_API_KEY` (Google AI
+  Studio) and/or `ANTHROPIC_API_KEY` (Anthropic). Neither is required to start
+  the application; each one enables its own provider.
 
 ## Setup
 
@@ -25,7 +29,10 @@ cd multiagent-chat
 cp .env.example .env
 ```
 
-Set `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` in `.env`. Do not commit this file or expose its values.
+Set the keys for the providers you intend to use in `.env`. Do not commit this
+file or expose its values. Both keys are needed only for the default
+proposer/critic wiring; see [Agent selection](#agent-selection) for what a
+single-provider installation can do.
 
 `WORKSPACE_ROOT` is no longer required by the web application. It remains an optional compatibility setting for the original CLI workflow.
 
@@ -75,7 +82,8 @@ the project's diff. Cleanup covers both directories.
 Git, verification tools, and Claude Code start with cleared environments and
 an explicit runtime-variable allowlist (OS paths, home/temp locations, locale,
 and supported toolchain locations). Claude Code additionally receives only the
-configured `ANTHROPIC_API_KEY`; other provider keys, database/cloud credentials,
+configured `ANTHROPIC_API_KEY`, and none at all when that key is not configured
+— it then uses its own stored login; other provider keys, database/cloud credentials,
 alternate provider endpoints/tokens, and arbitrary tool options are not inherited.
 Custom setups relying on other environment variables may need a reviewed policy
 change. This reduces environment exposure, but is **not a sandbox**: child
@@ -134,6 +142,81 @@ Delayed cleanup is in-process only. A server restart loses its timers; failed
 cleanup retries and workspaces left by a restart require manual cleanup. These
 limits do not make untrusted repositories safe to execute.
 
+## Agent selection
+
+Three roles are configured independently per task:
+
+| Role | Kind | Currently supported |
+| --- | --- | --- |
+| Proposer | chat provider + model | Gemini, Anthropic |
+| Critic | chat provider + model | Gemini, Anthropic |
+| Worker | coding tool + model | Claude Code |
+
+### Provider availability
+
+A chat provider is offered only when its own credential is configured:
+
+- Gemini is available when `GEMINI_API_KEY` is set.
+- Anthropic is available when `ANTHROPIC_API_KEY` is set.
+
+The application starts with one key, both, or neither. `GET /api/agents` and the
+task form list only the available providers, and a task that asks for an
+unavailable one is refused with a message naming the variable to set. An invalid
+selection is never silently replaced by a working one.
+
+The default wiring is proposer Gemini, critic Anthropic, worker Claude Code, so
+those defaults need their corresponding providers configured. When a default
+role has no available provider, `GET /api/agents` returns `"defaults": null`
+with an `unavailable` explanation, and a task created without an explicit choice
+for that role fails validation instead of running on a substitute. A
+single-provider installation can still run tasks by naming the configured
+provider for both chat roles.
+
+The Claude Code worker authenticates itself using its own stored login, so it
+does not need `ANTHROPIC_API_KEY` for worker execution: with no key configured,
+Claude Code is launched without one and uses its own credentials. When the key
+is configured, it is passed to Claude Code as before. This is why the worker
+stays available — and `cargo run -- --cli --implement-only` keeps working — on
+an installation with no chat provider at all.
+
+### Models
+
+Each provider or tool offers its configured default model plus any extra models
+listed in `GEMINI_MODELS`, `ANTHROPIC_MODELS` and `CLAUDE_CODE_MODELS`
+(comma-separated). The role defaults remain `GEMINI_MODEL`, `CRITIC_MODEL` and
+`IMPLEMENTER_MODEL`, and a default is always offered by its provider. Model
+names come from configuration; the application does not ask providers which
+models an account may use.
+
+### Choosing agents
+
+The web form shows a provider/tool and a model selector per role, populated from
+`GET /api/agents`; changing a provider reloads its models and drops a selection
+that provider does not offer. The task page then shows the agents the run
+actually uses. Omitting the `agents` block, or leaving the selectors alone, uses
+the configured defaults. The legacy CLI has no selectors and always runs the
+defaults.
+
+```json
+{
+  "kind": "new_project",
+  "title": "Create an event processor",
+  "description": "Process events idempotently and expose health checks.",
+  "technology": "rust",
+  "output": "reviewable_result",
+  "agents": {
+    "proposer": { "provider": "gemini", "model": "gemini-3.6-flash" },
+    "critic": { "provider": "anthropic", "model": "claude-sonnet-4-6" },
+    "worker": { "tool": "claude_code", "model": "claude-opus-4-8" }
+  }
+}
+```
+
+Every field is optional: an omitted provider/tool or model falls back to the
+configured default, while an unsupported provider, tool or model — or an
+explicitly empty model — is rejected with HTTP 400 and an `error` message. No
+credential is ever exposed through the configuration API or an error message.
+
 ## Supported technology profiles
 
 The application currently detects or accepts:
@@ -149,9 +232,11 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
 ## API overview
 
 - `GET /api/health` — service health.
+- `GET /api/agents` — available chat providers, coding tools, their configured
+  models, and the default selection. Names only; never credentials.
 - `GET /api/projects` — registered Projects.
 - `POST /api/projects` — register a GitHub Project.
-- `POST /api/tasks` — create a typed task.
+- `POST /api/tasks` — create a typed task, optionally with an `agents` selection.
 - `GET /api/tasks/{id}` — task snapshot and history.
 - `GET /api/tasks/{id}/events` — live JSON SSE events.
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
@@ -241,12 +326,13 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
-- Chat providers are available only when their own key is configured. The
-  default roles are proposer/Gemini and critic/Anthropic, so a single-key
-  installation must choose the configured provider explicitly per task.
-- Agent model options come from environment configuration; the application does
-  not query providers for the models an account can actually use, so a
-  misconfigured model name fails when the task runs rather than when it is
+- A single-provider installation must name the configured provider explicitly
+  for both chat roles on every task; there is no per-installation override of
+  the default proposer/critic wiring. See [Agent selection](#agent-selection).
+- Provider availability is decided by the presence of a key, not its validity,
+  and agent model options come from environment configuration: the application
+  does not query providers for the models an account can actually use, so a
+  wrong key or model name fails when the task runs rather than when it is
   offered. The CLI always runs the configured defaults.
 
 ## Development
