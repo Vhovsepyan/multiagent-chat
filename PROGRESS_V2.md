@@ -20,6 +20,24 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-23 (2026-09-09, task 0006): significant task events are immutable
+  `RecordedEvent` envelopes with a per-task sequence starting at 1, a
+  backend-authored `DateTime<Utc>` serialized as RFC3339, and the tagged
+  `TaskEvent`. The existing task-registry write lock assigns, stores, and
+  broadcasts each envelope before release, so concurrent emitters cannot reuse
+  a sequence or reverse stored/SSE order. `Task::history` is append-only;
+  repetitive Build/Notice/Warning output moved to a separately bounded
+  `log_tail`, and the UI merges the two by sequence. Explicit task, agent,
+  specification, worker, verification, failure, completion, rejection, and
+  cancellation event types prepare later evidence export without implementing
+  it. Chat lifecycle metadata comes from the resolved `ChatAgent` (which was
+  created from the task's frozen selection), and worker metadata comes directly
+  from that stored selection. Configured credential values plus common
+  assignment/authorization forms are redacted centrally before storage and
+  broadcast. JSON snapshots and SSE now expose the stable
+  sequence/timestamp/event envelope; the server-rendered UI shows UTC event
+  times. There is still no user-facing task cancellation endpoint or durable
+  event persistence.
 - DP-22 (2026-09-09, task 0005 follow-up): provider availability is per
   provider. `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` are optional and startup
   requires neither; `AgentCatalogue` offers only providers whose own credential

@@ -362,6 +362,10 @@ async fn a_created_task_can_be_fetched_back() {
     let fetched = body_json(response).await;
     assert_eq!(fetched["id"], task.id.to_string());
     assert_eq!(fetched["status"], "created");
+    assert_eq!(fetched["history"][0]["sequence"], 1);
+    assert_eq!(fetched["history"][0]["event"]["type"], "task_created");
+    let timestamp = fetched["history"][0]["timestamp"].as_str().unwrap();
+    assert!(timestamp.ends_with('Z'), "not a UTC timestamp: {timestamp}");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -623,6 +627,9 @@ async fn the_stream_carries_events_for_this_task_only() {
     let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
 
     assert!(chunk.contains("\"type\":\"proposal\""), "got: {chunk}");
+    assert!(chunk.contains("\"sequence\":"), "got: {chunk}");
+    assert!(chunk.contains("\"timestamp\":"), "got: {chunk}");
+    assert!(chunk.contains("\"event\":{"), "got: {chunk}");
     assert!(chunk.contains("use Rust"), "got: {chunk}");
     assert!(
         !chunk.contains("not for you"),
@@ -716,6 +723,12 @@ async fn the_task_page_renders_history_and_attaches_the_stream() {
         round: 1,
         text: "use Rust".into(),
     });
+    emitter.emit(TaskEvent::Critique {
+        round: 1,
+        text: "add tests".into(),
+        verdict: Some("needs_work".into()),
+        reason: Some("coverage".into()),
+    });
 
     let response = router(state)
         .oneshot(get(&format!("/task/{}", task.id)))
@@ -726,6 +739,10 @@ async fn the_task_page_renders_history_and_attaches_the_stream() {
     let html = body_text(response).await;
     // History is rendered inline, which is what closes the subscribe race.
     assert!(html.contains("use Rust"), "history should be replayed");
+    assert!(html.find("use Rust").unwrap() < html.find("add tests").unwrap());
+    assert!(html.contains("class=\"event-time\""));
+    assert!(html.contains("data-sequence=\"2\""));
+    assert!(html.contains("data-sequence=\"3\""));
     assert!(html.contains(&format!(r#"sse-connect="/ui/tasks/{}/stream""#, task.id)));
     std::fs::remove_dir_all(&root).ok();
 }
@@ -885,6 +902,8 @@ async fn the_ui_stream_sends_named_html_events() {
     // HTMX routes by the SSE event name, so it must be present.
     assert!(chunk.contains("event: build"), "got: {chunk}");
     assert!(chunk.contains("compiling"), "got: {chunk}");
+    assert!(chunk.contains("class=\"event-time\""), "got: {chunk}");
+    assert!(chunk.contains("data-sequence=\"2\""), "got: {chunk}");
     std::fs::remove_dir_all(&root).ok();
 }
 

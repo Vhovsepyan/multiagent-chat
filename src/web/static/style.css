@@ -159,6 +159,13 @@ button.danger { background: transparent; color: var(--bad); border: 1px solid va
 .notice.warn { color: var(--critic); }
 .notice.err { color: var(--bad); }
 
+.event-time {
+  display: block;
+  color: var(--muted);
+  font: 11px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+  margin: 8px 0 3px;
+}
+
 /* --- spec + terminal ----------------------------------------------------- */
 
 .spec-body {

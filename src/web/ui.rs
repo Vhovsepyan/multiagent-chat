@@ -18,7 +18,8 @@ use crate::agent::{
 };
 use crate::project::{Project, ProjectSource};
 use crate::task::{
-    Decision, OutputTarget, Task, TaskEvent, TaskId, TaskKind, TaskRequest, TaskStatus,
+    Decision, OutputTarget, RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRequest,
+    TaskStatus,
 };
 use crate::technology::TechStack;
 use crate::web::{AppState, pipeline};
@@ -115,14 +116,118 @@ fn gate_html(id: TaskId, spec: &str) -> String {
 
 fn event_html(
     id: TaskId,
-    event: &TaskEvent,
+    recorded: &RecordedEvent,
     agents: &AgentSelection,
 ) -> Option<(&'static str, String)> {
-    match event {
+    let result = match &recorded.event {
+        TaskEvent::TaskCreated { kind } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice">Task created · {}</div>"#,
+                kind.label()
+            ),
+        )),
+        TaskEvent::TaskStarted => {
+            Some(("debate", r#"<div class="notice">Task started</div>"#.into()))
+        }
         TaskEvent::Status { status } => Some(("status", timeline_html(*status))),
         TaskEvent::RoundStarted { round, of } => Some((
             "debate",
             format!(r#"<h2 class="section">Round {round} of {of}</h2>"#),
+        )),
+        TaskEvent::ProposerStarted {
+            stage,
+            round,
+            provider,
+            model,
+        }
+        | TaskEvent::ProposerCompleted {
+            stage,
+            round,
+            provider,
+            model,
+        } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice">Proposer {} · {:?}{} · {} / {}</div>"#,
+                if matches!(&recorded.event, TaskEvent::ProposerStarted { .. }) {
+                    "started"
+                } else {
+                    "completed"
+                },
+                stage,
+                round
+                    .map(|round| format!(" round {round}"))
+                    .unwrap_or_default(),
+                esc(provider.label()),
+                esc(model)
+            ),
+        )),
+        TaskEvent::ProposerFailed {
+            stage,
+            round,
+            provider,
+            model,
+            error,
+        } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice err">Proposer failed · {:?}{} · {} / {} · {}</div>"#,
+                stage,
+                round
+                    .map(|round| format!(" round {round}"))
+                    .unwrap_or_default(),
+                esc(provider.label()),
+                esc(model),
+                esc(error)
+            ),
+        )),
+        TaskEvent::CriticStarted {
+            stage,
+            round,
+            provider,
+            model,
+        }
+        | TaskEvent::CriticCompleted {
+            stage,
+            round,
+            provider,
+            model,
+        } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice">Critic {} · {:?}{} · {} / {}</div>"#,
+                if matches!(&recorded.event, TaskEvent::CriticStarted { .. }) {
+                    "started"
+                } else {
+                    "completed"
+                },
+                stage,
+                round
+                    .map(|round| format!(" round {round}"))
+                    .unwrap_or_default(),
+                esc(provider.label()),
+                esc(model)
+            ),
+        )),
+        TaskEvent::CriticFailed {
+            stage,
+            round,
+            provider,
+            model,
+            error,
+        } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice err">Critic failed · {:?}{} · {} / {} · {}</div>"#,
+                stage,
+                round
+                    .map(|round| format!(" round {round}"))
+                    .unwrap_or_default(),
+                esc(provider.label()),
+                esc(model),
+                esc(error)
+            ),
         )),
         TaskEvent::Proposal { text, .. } => Some((
             "debate",
@@ -169,6 +274,18 @@ fn event_html(
                 esc(markdown)
             ),
         )),
+        TaskEvent::SpecGenerated => Some((
+            "debate",
+            r#"<div class="notice">Specification generated</div>"#.into(),
+        )),
+        TaskEvent::SpecUpdated => Some((
+            "debate",
+            r#"<div class="notice">Specification updated at approval</div>"#.into(),
+        )),
+        TaskEvent::SpecRejected => Some((
+            "debate",
+            r#"<div class="notice warn">Specification rejected</div>"#.into(),
+        )),
         TaskEvent::AgentsSelected { agents } => Some((
             "debate",
             format!(
@@ -212,6 +329,57 @@ fn event_html(
                 if result.success { "passed" } else { "failed" }
             ),
         )),
+        TaskEvent::VerificationStarted { commands } => Some((
+            "build",
+            format!("<div>Verification started · {commands} command(s)</div>"),
+        )),
+        TaskEvent::VerificationCompleted { commands } => Some((
+            "build",
+            format!("<div>Verification completed · {commands} command(s)</div>"),
+        )),
+        TaskEvent::VerificationFailed { command, error } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Verification failed{} · {}</div>"#,
+                command
+                    .as_deref()
+                    .map(|command| format!(" · {}", esc(command)))
+                    .unwrap_or_default(),
+                esc(error)
+            ),
+        )),
+        TaskEvent::WorkerStarted { tool, model } | TaskEvent::WorkerCompleted { tool, model } => {
+            Some((
+                "build",
+                format!(
+                    "<div>Worker {} · {} / {}</div>",
+                    if matches!(&recorded.event, TaskEvent::WorkerStarted { .. }) {
+                        "started"
+                    } else {
+                        "completed"
+                    },
+                    esc(tool.label()),
+                    esc(model)
+                ),
+            ))
+        }
+        TaskEvent::WorkerFailed { tool, model, error } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Worker failed · {} / {} · {}</div>"#,
+                esc(tool.label()),
+                esc(model),
+                esc(error)
+            ),
+        )),
+        TaskEvent::WorkerCancelled { tool, model } => Some((
+            "build",
+            format!(
+                r#"<div class="notice warn">Worker cancelled · {} / {}</div>"#,
+                esc(tool.label()),
+                esc(model)
+            ),
+        )),
         TaskEvent::Result { result } => {
             Some(("build", format!("<pre>{}</pre>", esc(&result.diff))))
         }
@@ -244,20 +412,35 @@ fn event_html(
                 format!(r#"<div class="done-banner {class}">{text}</div>"#),
             ))
         }
-    }
+        TaskEvent::TaskCompleted | TaskEvent::TaskFailed { .. } | TaskEvent::TaskCancelled => None,
+    };
+    result.map(|(slot, html)| (slot, format!("{}{}", timestamp_html(recorded), html)))
+}
+
+fn timestamp_html(recorded: &RecordedEvent) -> String {
+    let machine = recorded
+        .timestamp
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let readable = recorded.timestamp.format("%Y-%m-%d %H:%M:%S%.3f UTC");
+    format!(
+        r#"<time class="event-time" datetime="{}" data-sequence="{}">{}</time>"#,
+        esc(&machine),
+        recorded.sequence,
+        readable
+    )
 }
 
 /// A single domain event may affect several independent live UI regions.
 fn event_updates(
     id: TaskId,
-    event: &TaskEvent,
+    recorded: &RecordedEvent,
     current_spec: Option<&str>,
     agents: &AgentSelection,
 ) -> Vec<(&'static str, String)> {
-    let Some((name, html)) = event_html(id, event, agents) else {
+    let Some((name, html)) = event_html(id, recorded, agents) else {
         return Vec::new();
     };
-    if let TaskEvent::Finished { status, .. } = event {
+    if let TaskEvent::Finished { status, .. } = &recorded.event {
         let mut updates = vec![("status", timeline_html(*status)), (name, html)];
         updates.push(("spec", spec_readonly_html(current_spec)));
         updates
@@ -470,7 +653,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         String::new()
     };
     let mut done = String::new();
-    for event in &task.history {
+    for event in task.display_history() {
         for (slot, html) in event_updates(id, event, task.spec.as_deref(), &task.agents) {
             match slot {
                 "debate" => debate.push_str(&html),

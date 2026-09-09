@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use crate::agent::ChatAgent;
 use crate::api::push_user;
 use crate::debate::Transcript;
-use crate::task::Emitter;
+use crate::task::{AgentStage, Emitter, TaskEvent};
 use crate::ui;
 
 /// Legacy, project-owned input for `--implement-only`. Never written by us.
@@ -72,12 +72,39 @@ pub async fn build(
 
     ui::system("drafting specification (Proposer)...");
     emitter.notice("drafting specification (Proposer)...");
+    emitter.emit(TaskEvent::ProposerStarted {
+        stage: AgentStage::Specification,
+        round: None,
+        provider: proposer.provider(),
+        model: proposer.model().to_string(),
+    });
     let mut messages = transcript.for_proposer();
     push_user(&mut messages, request);
-    let draft = proposer
+    let draft = match proposer
         .complete_text(Some(DRAFT_SYSTEM), &messages)
         .await
-        .context("the Proposer failed to draft the spec")?;
+        .context("the Proposer failed to draft the spec")
+    {
+        Ok(draft) => {
+            emitter.emit(TaskEvent::ProposerCompleted {
+                stage: AgentStage::Specification,
+                round: None,
+                provider: proposer.provider(),
+                model: proposer.model().to_string(),
+            });
+            draft
+        }
+        Err(error) => {
+            emitter.emit(TaskEvent::ProposerFailed {
+                stage: AgentStage::Specification,
+                round: None,
+                provider: proposer.provider(),
+                model: proposer.model().to_string(),
+                error: format!("{error:#}"),
+            });
+            return Err(error);
+        }
+    };
 
     // If the debate never reached APPROVED, the objections the Critic raised
     // are still live. They must survive into the document rather than being
@@ -92,6 +119,12 @@ pub async fn build(
 
     ui::system("checking specification against the debate (Critic)...");
     emitter.notice("checking specification against the debate (Critic)...");
+    emitter.emit(TaskEvent::CriticStarted {
+        stage: AgentStage::Specification,
+        round: None,
+        provider: critic.provider(),
+        model: critic.model().to_string(),
+    });
     let mut messages = transcript.for_critic();
     push_user(
         &mut messages,
@@ -101,10 +134,31 @@ pub async fn build(
              Required sections:\n\n{SECTIONS}{unresolved}\n\n---\n\n{draft}"
         ),
     );
-    let checked = critic
+    let checked = match critic
         .complete_text(Some(CHECK_SYSTEM), &messages)
         .await
-        .context("the Critic failed to check the spec")?;
+        .context("the Critic failed to check the spec")
+    {
+        Ok(checked) => {
+            emitter.emit(TaskEvent::CriticCompleted {
+                stage: AgentStage::Specification,
+                round: None,
+                provider: critic.provider(),
+                model: critic.model().to_string(),
+            });
+            checked
+        }
+        Err(error) => {
+            emitter.emit(TaskEvent::CriticFailed {
+                stage: AgentStage::Specification,
+                round: None,
+                provider: critic.provider(),
+                model: critic.model().to_string(),
+                error: format!("{error:#}"),
+            });
+            return Err(error);
+        }
+    };
 
     Ok(strip_code_fence(&checked))
 }
@@ -218,12 +272,14 @@ corrected
 ```"],
         );
 
+        let manager = crate::task::TaskManager::new();
+        let task = manager.create("audit", "specification", "legacy");
         let document = build(
             &proposer,
             &critic,
             &transcript(),
             true,
-            &crate::task::Emitter::detached(),
+            &manager.emitter(task.id),
         )
         .await
         .unwrap();
@@ -234,6 +290,21 @@ corrected
 corrected"
         );
         assert!(critic.call(0).1.last().unwrap().content.contains("drafted"));
+        let stored = manager.get(task.id).unwrap();
+        assert!(stored.history.iter().any(|recorded| matches!(
+            recorded.event,
+            TaskEvent::ProposerStarted {
+                stage: AgentStage::Specification,
+                ..
+            }
+        )));
+        assert!(stored.history.iter().any(|recorded| matches!(
+            recorded.event,
+            TaskEvent::CriticCompleted {
+                stage: AgentStage::Specification,
+                ..
+            }
+        )));
     }
 
     /// An unapproved debate must tell the Critic to keep its live objections

@@ -131,11 +131,48 @@ tree lifetimes; Unix timeouts kill the process group, with a bounded direct-chil
 termination fallback. This does not prevent intentionally escaping processes or
 provide filesystem, network, CPU, or memory isolation.
 
-Task history retains the newest Build/Notice/Warning logs, with a discarded-log
-counter and an explanation on page reload. Proposals, critiques, specifications,
-approval, state transitions, verification, failure/completion, and final results
-are not evicted by that log limit. This is not a global memory limit: task count
-and lifecycle documents still need durable persistence and retention policies.
+The UI log tail retains the newest Build/Notice/Warning events, with a
+discarded-log counter and an explanation on page reload. Proposals, critiques,
+specifications, approval, state transitions, verification, failure/completion,
+and final results are kept in the separate audit history and are not evicted by
+that log limit. This is not a global memory limit: task count and lifecycle
+documents still need durable persistence and retention policies.
+
+## Audit history
+
+Every significant task event is stored in an immutable envelope containing a
+per-task sequence number, a backend-authored RFC3339 UTC timestamp, and the
+tagged event payload. Sequence numbers start at 1 and are assigned under the
+same task-manager lock that stores and broadcasts the event, so snapshot and SSE
+ordering agree even when asynchronous producers report concurrently.
+
+```json
+{
+  "sequence": 12,
+  "timestamp": "2026-09-09T10:24:51.412Z",
+  "event": {
+    "type": "critic_completed",
+    "stage": "debate",
+    "round": 1,
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6"
+  }
+}
+```
+
+`history` is the append-only significant-event audit trail. Repetitive
+`build`, `notice`, and `warning` output uses the separately bounded `log_tail`;
+the task page merges both by backend sequence without changing either stored
+order. Lifecycle events cover task start/completion/failure, proposer and critic
+calls, specification generation/editing/approval/rejection, worker execution,
+and verification. Provider/tool and model metadata comes from the selection
+frozen on the task.
+
+Configured provider credential values and common secret-bearing assignment or
+authorization forms are redacted before events enter task state or SSE. Event
+metadata never includes API keys, environment snapshots, or authorization
+headers. This is defense in depth and does not turn task history into durable
+evidence storage; task state is still lost when the process restarts.
 
 Git capture uses a separate 8 MiB stdout/result-content budget. Over-budget Git
 output is rejected rather than parsed as a complete diff; large added files also
@@ -242,8 +279,9 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
 - `GET /api/projects` — registered Projects.
 - `POST /api/projects` — register a GitHub Project.
 - `POST /api/tasks` — create a typed task, optionally with an `agents` selection.
-- `GET /api/tasks/{id}` — task snapshot and history.
-- `GET /api/tasks/{id}/events` — live JSON SSE events.
+- `GET /api/tasks/{id}` — task snapshot, append-only audit `history`, and the
+  bounded `log_tail`; every entry has sequence/timestamp/event fields.
+- `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
 
 Example Project registration:
@@ -310,7 +348,7 @@ src/
   technology.rs    evidence-based technology profiles
   workflow.rs      task-kind-specific agent instructions
   verification.rs profile-aware command planning and execution
-  task.rs          task state, validation, history, and result model
+  task.rs          task state, recorded audit events, redaction, and ordering
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
@@ -331,6 +369,9 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
+- There is no user-facing task-cancellation endpoint yet. Cancellation event
+  types exist for supported execution paths, while current worker/process
+  timeouts retain their established failed-task behavior.
 - A single-provider installation must name the configured provider explicitly
   for both chat roles on every task; there is no per-installation override of
   the default proposer/critic wiring. See [Agent selection](#agent-selection).

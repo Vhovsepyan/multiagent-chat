@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
@@ -165,6 +166,14 @@ impl TaskStatus {
 // Events
 // ---------------------------------------------------------------------------
 
+/// Which part of a run caused a chat-agent call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStage {
+    Debate,
+    Specification,
+}
+
 /// Everything worth telling a watcher about, as it happens.
 ///
 /// `#[serde(tag = "type")]` puts a discriminator in the JSON, so the browser
@@ -172,6 +181,11 @@ impl TaskStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskEvent {
+    TaskCreated {
+        kind: TaskKind,
+    },
+    TaskStarted,
+
     /// The task moved to a new stage. Drives the pipeline timeline.
     Status {
         status: TaskStatus,
@@ -181,6 +195,46 @@ pub enum TaskEvent {
     RoundStarted {
         round: u32,
         of: u32,
+    },
+
+    ProposerStarted {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+    },
+    ProposerCompleted {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+    },
+    ProposerFailed {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+        error: String,
+    },
+
+    CriticStarted {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+    },
+    CriticCompleted {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+    },
+    CriticFailed {
+        stage: AgentStage,
+        round: Option<u32>,
+        provider: crate::agent::ChatProvider,
+        model: String,
+        error: String,
     },
 
     /// The Proposer's full turn.
@@ -211,6 +265,9 @@ pub enum TaskEvent {
     SpecApproved {
         markdown: String,
     },
+    SpecGenerated,
+    SpecUpdated,
+    SpecRejected,
 
     /// The agents this run will use, published once before the debate starts
     /// so the event stream carries role/provider/model too (task 0005).
@@ -225,6 +282,34 @@ pub enum TaskEvent {
 
     Verification {
         result: VerificationResult,
+    },
+    VerificationStarted {
+        commands: usize,
+    },
+    VerificationCompleted {
+        commands: usize,
+    },
+    VerificationFailed {
+        command: Option<String>,
+        error: String,
+    },
+
+    WorkerStarted {
+        tool: crate::agent::CodingTool,
+        model: String,
+    },
+    WorkerCompleted {
+        tool: crate::agent::CodingTool,
+        model: String,
+    },
+    WorkerFailed {
+        tool: crate::agent::CodingTool,
+        model: String,
+        error: String,
+    },
+    WorkerCancelled {
+        tool: crate::agent::CodingTool,
+        model: String,
     },
 
     Result {
@@ -251,6 +336,11 @@ pub enum TaskEvent {
         status: TaskStatus,
         error: Option<String>,
     },
+    TaskCompleted,
+    TaskFailed {
+        error: String,
+    },
+    TaskCancelled,
 }
 
 impl TaskEvent {
@@ -272,6 +362,164 @@ impl TaskEvent {
         }
         self
     }
+
+    fn sanitized(mut self, redactor: &AuditRedactor) -> Self {
+        let clean = |text: &mut String| *text = redactor.redact(text);
+        match &mut self {
+            Self::Proposal { text, .. } => clean(text),
+            Self::Critique { text, reason, .. } => {
+                clean(text);
+                if let Some(reason) = reason {
+                    clean(reason);
+                }
+            }
+            Self::Spec { markdown, path } => {
+                clean(markdown);
+                clean(path);
+            }
+            Self::SpecApproved { markdown } => clean(markdown),
+            Self::ProposerStarted { model, .. }
+            | Self::ProposerCompleted { model, .. }
+            | Self::CriticStarted { model, .. }
+            | Self::CriticCompleted { model, .. }
+            | Self::WorkerStarted { model, .. }
+            | Self::WorkerCompleted { model, .. }
+            | Self::WorkerCancelled { model, .. } => clean(model),
+            Self::ProposerFailed { model, error, .. }
+            | Self::CriticFailed { model, error, .. }
+            | Self::WorkerFailed { model, error, .. } => {
+                clean(model);
+                clean(error);
+            }
+            Self::Inspection {
+                source_revision, ..
+            } => {
+                if let Some(source_revision) = source_revision {
+                    clean(source_revision);
+                }
+            }
+            Self::Verification { result } => {
+                clean(&mut result.command);
+                clean(&mut result.output);
+            }
+            Self::VerificationFailed { command, error } => {
+                if let Some(command) = command {
+                    clean(command);
+                }
+                clean(error);
+            }
+            Self::Result { result } => {
+                if let Some(source_revision) = &mut result.source_revision {
+                    clean(source_revision);
+                }
+                clean(&mut result.diff);
+                for verification in &mut result.verification {
+                    clean(&mut verification.command);
+                    clean(&mut verification.output);
+                }
+            }
+            Self::Build { chunk } => clean(chunk),
+            Self::Notice { message } | Self::Warning { message } => clean(message),
+            Self::Finished { error, .. } => {
+                if let Some(error) = error {
+                    clean(error);
+                }
+            }
+            Self::TaskFailed { error } => clean(error),
+            Self::AgentsSelected { agents } => {
+                clean(&mut agents.proposer.model);
+                clean(&mut agents.critic.model);
+                clean(&mut agents.worker.model);
+            }
+            Self::TaskCreated { .. }
+            | Self::TaskStarted
+            | Self::Status { .. }
+            | Self::RoundStarted { .. }
+            | Self::SpecGenerated
+            | Self::SpecUpdated
+            | Self::SpecRejected
+            | Self::VerificationStarted { .. }
+            | Self::VerificationCompleted { .. }
+            | Self::TaskCompleted
+            | Self::TaskCancelled => {}
+        }
+        self
+    }
+}
+
+/// Backend-authored metadata shared by every stored and streamed event.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedEvent {
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub event: TaskEvent,
+}
+
+/// Values and common credential syntax removed before an event enters task
+/// state or the live stream. Debug output intentionally never exposes values.
+#[derive(Clone, Default)]
+struct AuditRedactor {
+    values: Vec<String>,
+}
+
+impl std::fmt::Debug for AuditRedactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditRedactor")
+            .field("values", &format_args!("<{} redacted>", self.values.len()))
+            .finish()
+    }
+}
+
+impl AuditRedactor {
+    fn new(values: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            values: values
+                .into_iter()
+                // Real provider credentials are long. Ignoring tiny test or
+                // placeholder values avoids corrupting ordinary words such as
+                // "test" while generic KEY=/Bearer syntax is still covered.
+                .filter(|value| value.len() >= 8)
+                .collect(),
+        }
+    }
+
+    fn redact(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for value in &self.values {
+            redacted = redacted.replace(value, "[REDACTED]");
+        }
+        redacted
+            .split_inclusive('\n')
+            .map(redact_credential_line)
+            .collect()
+    }
+}
+
+fn redact_credential_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let assignment_markers = [
+        "api_key=",
+        "api-key=",
+        "access_token=",
+        "access-token=",
+        "authorization=",
+        "authorization:",
+        "password=",
+        "secret=",
+    ];
+    if let Some(index) = assignment_markers
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+    {
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        return format!("{}[REDACTED]{newline}", &line[..index]);
+    }
+    if lower.contains("bearer ") {
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        return format!("[REDACTED authorization]{newline}");
+    }
+    line.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -326,11 +574,15 @@ pub struct Task {
     pub profile: Option<ProjectProfile>,
     pub result: Option<TaskResult>,
     pub status: TaskStatus,
-    /// Lifecycle events plus a bounded tail of repetitive logs.
-    pub history: Vec<TaskEvent>,
+    /// Significant events are append-only for the lifetime of this task.
+    pub history: Vec<RecordedEvent>,
+    /// Repetitive UI output remains bounded independently from the audit log.
+    pub log_tail: Vec<RecordedEvent>,
     pub discarded_log_events: usize,
     #[serde(skip)]
     history_limits: HistoryLimits,
+    #[serde(skip)]
+    next_event_sequence: u64,
     pub spec: Option<String>,
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
@@ -357,8 +609,10 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            log_tail: Vec::new(),
             discarded_log_events: 0,
             history_limits: HistoryLimits::default(),
+            next_event_sequence: 1,
             spec: None,
             error: None,
             decision: None,
@@ -382,8 +636,10 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            log_tail: Vec::new(),
             discarded_log_events: 0,
             history_limits: HistoryLimits::default(),
+            next_event_sequence: 1,
             spec: None,
             error: None,
             decision: None,
@@ -402,43 +658,84 @@ impl Task {
         }
     }
 
-    /// Fold an event into the task, so `history` and the summary fields agree.
+    /// Fold an event into the task, assigning its immutable audit envelope.
     pub fn apply(&mut self, event: &TaskEvent) {
+        self.record_event(event.clone());
+    }
+
+    fn record_event(&mut self, event: TaskEvent) -> RecordedEvent {
         match event {
-            TaskEvent::Status { status } => self.status = *status,
-            TaskEvent::Spec { markdown, .. } | TaskEvent::SpecApproved { markdown } => {
+            TaskEvent::Status { status } => self.status = status,
+            TaskEvent::Spec { ref markdown, .. } | TaskEvent::SpecApproved { ref markdown } => {
                 self.spec = Some(markdown.clone());
             }
-            TaskEvent::Inspection { profile, .. } => self.profile = Some(profile.clone()),
-            TaskEvent::Result { result } => self.result = Some(result.clone()),
-            TaskEvent::Finished { status, error } => {
-                self.status = *status;
+            TaskEvent::Inspection { ref profile, .. } => self.profile = Some(profile.clone()),
+            TaskEvent::Result { ref result } => self.result = Some(result.clone()),
+            TaskEvent::Finished { status, ref error } => {
+                self.status = status;
                 self.error = error.clone();
+            }
+            TaskEvent::TaskCompleted => {
+                self.status = TaskStatus::Completed;
+                self.error = None;
+            }
+            TaskEvent::TaskFailed { ref error } => {
+                self.status = TaskStatus::Failed;
+                self.error = Some(error.clone());
             }
             _ => {}
         }
-        self.history
-            .push(event.clone().bounded(self.history_limits));
+        let recorded = RecordedEvent {
+            sequence: self.next_event_sequence,
+            timestamp: DateTime::<Utc>::from(std::time::SystemTime::now()),
+            event,
+        };
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .expect("task event sequence exhausted");
+        if recorded.event.log_text().is_some() {
+            self.log_tail.push(recorded.clone());
+        } else {
+            self.history.push(recorded.clone());
+        }
         let (mut count, mut bytes) = self
-            .history
+            .log_tail
             .iter()
-            .filter_map(TaskEvent::log_text)
+            .filter_map(|recorded| recorded.event.log_text())
             .fold((0, 0), |(count, bytes), text| {
                 (count + 1, bytes + text.len())
             });
         while count > self.history_limits.log_events || bytes > self.history_limits.log_bytes {
             let Some(index) = self
-                .history
+                .log_tail
                 .iter()
-                .position(|event| event.log_text().is_some())
+                .position(|recorded| recorded.event.log_text().is_some())
             else {
                 break;
             };
-            bytes -= self.history[index].log_text().expect("log event").len();
-            self.history.remove(index);
+            bytes -= self.log_tail[index]
+                .event
+                .log_text()
+                .expect("log event")
+                .len();
+            self.log_tail.remove(index);
             count -= 1;
             self.discarded_log_events += 1;
         }
+        recorded
+    }
+
+    /// Significant events followed by the bounded UI log tail, in backend
+    /// recording order. This is a snapshot iterator; it never changes storage.
+    pub fn display_history(&self) -> Vec<&RecordedEvent> {
+        let mut events = self
+            .history
+            .iter()
+            .chain(self.log_tail.iter())
+            .collect::<Vec<_>>();
+        events.sort_unstable_by_key(|event| event.sequence);
+        events
     }
 }
 
@@ -469,9 +766,7 @@ impl Emitter {
     /// (the CLI has no subscribers at all). It must never abort the pipeline, so
     /// the result is deliberately discarded.
     pub fn emit(&self, event: TaskEvent) {
-        let event = event.bounded(self.inner.history_limits);
-        self.inner.record(self.id, &event);
-        let _ = self.inner.tx.send((self.id, event));
+        self.inner.record_and_publish(self.id, event);
     }
 
     pub fn status(&self, status: TaskStatus) {
@@ -510,7 +805,8 @@ impl Emitter {
 struct Inner {
     history_limits: HistoryLimits,
     tasks: RwLock<HashMap<TaskId, Task>>,
-    tx: broadcast::Sender<(TaskId, TaskEvent)>,
+    tx: broadcast::Sender<(TaskId, RecordedEvent)>,
+    redactor: AuditRedactor,
     /// One waker per task, used to unpark a pipeline sitting at Gate 2.
     gates: RwLock<HashMap<TaskId, Arc<Notify>>>,
 }
@@ -525,6 +821,7 @@ impl Inner {
             history_limits: HistoryLimits::default(),
             tasks: RwLock::new(HashMap::new()),
             tx,
+            redactor: AuditRedactor::default(),
             gates: RwLock::new(HashMap::new()),
         }
     }
@@ -535,11 +832,14 @@ impl Inner {
         Arc::clone(gates.entry(id).or_insert_with(|| Arc::new(Notify::new())))
     }
 
-    /// Fold an event into the stored task, if that task still exists.
-    fn record(&self, id: TaskId, event: &TaskEvent) {
+    /// Assign sequence/timestamp, store, and publish while holding one lock.
+    /// This makes recording order and broadcast order identical for a task.
+    fn record_and_publish(&self, id: TaskId, event: TaskEvent) {
         let mut tasks = self.tasks.write().expect("task registry lock poisoned");
         if let Some(task) = tasks.get_mut(&id) {
-            task.apply(event);
+            let event = event.sanitized(&self.redactor).bounded(self.history_limits);
+            let recorded = task.record_event(event);
+            let _ = self.tx.send((id, recorded));
         }
     }
 }
@@ -561,8 +861,16 @@ impl Default for TaskManager {
 
 impl TaskManager {
     pub fn with_history_limits(history_limits: HistoryLimits) -> Self {
+        Self::with_history_limits_and_secrets(history_limits, std::iter::empty::<String>())
+    }
+
+    pub fn with_history_limits_and_secrets(
+        history_limits: HistoryLimits,
+        secrets: impl IntoIterator<Item = String>,
+    ) -> Self {
         let mut inner = Inner::new();
         inner.history_limits = history_limits;
+        inner.redactor = AuditRedactor::new(secrets);
         Self {
             inner: Arc::new(inner),
         }
@@ -615,6 +923,10 @@ impl TaskManager {
 
     fn insert(&self, mut task: Task) -> Task {
         task.history_limits = self.inner.history_limits;
+        let created = TaskEvent::TaskCreated { kind: task.kind }
+            .sanitized(&self.inner.redactor)
+            .bounded(self.inner.history_limits);
+        task.record_event(created);
         let mut tasks = self
             .inner
             .tasks
@@ -675,7 +987,7 @@ impl TaskManager {
 
     /// Validate and consume the approval gate under the same write lock.
     pub fn decide_checked(&self, id: TaskId, mut decision: Decision) -> Result<(), DecisionError> {
-        let approved_event = {
+        {
             let mut tasks = self
                 .inner
                 .tasks
@@ -686,7 +998,9 @@ impl TaskManager {
                     if task.status != TaskStatus::WaitingForApproval || task.decision.is_some() {
                         return Err(DecisionError::NotWaiting);
                     }
-                    let event = if decision.approve {
+                    let mut events = Vec::new();
+                    if decision.approve {
+                        let previous_spec = task.spec.clone();
                         decision.spec = decision.spec.or_else(|| task.spec.clone());
                         if decision
                             .spec
@@ -695,24 +1009,29 @@ impl TaskManager {
                         {
                             return Err(DecisionError::InvalidSpec);
                         }
-                        decision.spec.clone().map(|markdown| {
-                            let event = TaskEvent::SpecApproved { markdown };
-                            task.apply(&event);
-                            event
-                        })
+                        decision.spec = decision
+                            .spec
+                            .map(|markdown| self.inner.redactor.redact(&markdown));
+                        if decision.spec != previous_spec {
+                            events.push(task.record_event(TaskEvent::SpecUpdated));
+                        }
+                        let markdown = decision.spec.clone().expect("validated specification");
+                        let event = TaskEvent::SpecApproved { markdown }
+                            .sanitized(&self.inner.redactor)
+                            .bounded(self.inner.history_limits);
+                        events.push(task.record_event(event));
                     } else {
                         decision.spec = None;
-                        None
-                    };
+                        events.push(task.record_event(TaskEvent::SpecRejected));
+                    }
                     task.decision = Some(decision);
-                    event
+                    for event in &events {
+                        let _ = self.inner.tx.send((id, event.clone()));
+                    }
                 }
                 None => return Err(DecisionError::NotFound),
             }
         };
-        if let Some(event) = approved_event {
-            let _ = self.inner.tx.send((id, event));
-        }
         // notify_one, NOT notify_waiters: notify_one stores a permit if nobody
         // is parked yet, so an answer that arrives before the pipeline reaches
         // the gate is still delivered. notify_waiters would drop it silently.
@@ -769,7 +1088,7 @@ impl TaskManager {
     /// Subscribing only sees events sent from now on, which is exactly why
     /// `Task::history` exists — the browser loads the snapshot first, then
     /// subscribes for the rest.
-    pub fn subscribe(&self) -> broadcast::Receiver<(TaskId, TaskEvent)> {
+    pub fn subscribe(&self) -> broadcast::Receiver<(TaskId, RecordedEvent)> {
         self.inner.tx.subscribe()
     }
 }
@@ -824,6 +1143,126 @@ mod tests {
     }
 
     #[test]
+    fn recorded_events_have_stable_sequence_utc_time_and_append_only_history() {
+        let manager = TaskManager::new();
+        let task = manager.create("audit", "events", "legacy");
+        let emitter = manager.emitter(task.id);
+        let first = manager.get(task.id).unwrap().history[0].clone();
+
+        emitter.status(TaskStatus::Debating);
+        emitter.emit(TaskEvent::RoundStarted { round: 1, of: 2 });
+
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.history.len(), 3);
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            serde_json::to_value(&stored.history[0]).unwrap(),
+            serde_json::to_value(first).unwrap(),
+            "later records must not mutate an earlier envelope"
+        );
+        for recorded in &stored.history {
+            assert_eq!(recorded.timestamp.timezone(), Utc);
+            let json = serde_json::to_value(recorded).unwrap();
+            let timestamp = json["timestamp"].as_str().unwrap();
+            assert!(timestamp.ends_with('Z'), "not UTC RFC3339: {timestamp}");
+            assert!(json["event"]["type"].is_string());
+        }
+    }
+
+    #[test]
+    fn concurrent_recording_assigns_unique_ordered_sequences() {
+        let manager = TaskManager::new();
+        let task = manager.create("audit", "concurrency", "legacy");
+        let handles = (0..16)
+            .map(|round| {
+                let emitter = manager.emitter(task.id);
+                std::thread::spawn(move || {
+                    emitter.emit(TaskEvent::RoundStarted { round, of: 16 });
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let sequences = manager
+            .get(task.id)
+            .unwrap()
+            .history
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=17).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cancellation_events_are_chronological_and_never_claim_success() {
+        let manager = TaskManager::new();
+        let task = manager.create("audit", "cancel", "legacy");
+        let emitter = manager.emitter(task.id);
+        let worker = task.agents.worker.clone();
+        emitter.emit(TaskEvent::WorkerStarted {
+            tool: worker.tool,
+            model: worker.model.clone(),
+        });
+        emitter.emit(TaskEvent::WorkerCancelled {
+            tool: worker.tool,
+            model: worker.model,
+        });
+        emitter.emit(TaskEvent::TaskCancelled);
+
+        let stored = manager.get(task.id).unwrap();
+        let kinds = stored
+            .history
+            .iter()
+            .map(|recorded| serde_json::to_value(&recorded.event).unwrap()["type"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &kinds[1..],
+            ["worker_started", "worker_cancelled", "task_cancelled"]
+        );
+        assert!(!kinds.iter().any(|kind| kind == "task_completed"));
+    }
+
+    #[test]
+    fn event_recording_redacts_known_and_structured_credentials() {
+        let secret = "anthropic-live-secret-value";
+        let manager = TaskManager::with_history_limits_and_secrets(
+            HistoryLimits::default(),
+            [secret.to_string()],
+        );
+        let task = manager.create("audit", "redaction", "legacy");
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::TaskFailed {
+            error: format!("provider echoed {secret}"),
+        });
+        emitter.emit(TaskEvent::Result {
+            result: TaskResult {
+                source_revision: None,
+                verification: vec![VerificationResult {
+                    command: "probe".into(),
+                    success: false,
+                    output: "ANTHROPIC_API_KEY=another-secret".into(),
+                }],
+                diff: "Authorization: Bearer hidden-token".into(),
+            },
+        });
+
+        let json = serde_json::to_string(&manager.get(task.id).unwrap()).unwrap();
+        assert!(!json.contains(secret));
+        assert!(!json.contains("another-secret"));
+        assert!(!json.contains("hidden-token"));
+        assert!(json.contains("REDACTED"));
+    }
+
+    #[test]
     fn approval_without_edits_promotes_the_generated_spec() {
         let manager = TaskManager::new();
         let task = manager.create("t", "d", "p");
@@ -851,7 +1290,7 @@ mod tests {
         );
         assert!(matches!(
             manager.get(task.id).unwrap().history.last(),
-            Some(TaskEvent::SpecApproved { markdown }) if markdown == "generated"
+            Some(RecordedEvent { event: TaskEvent::SpecApproved { markdown }, .. }) if markdown == "generated"
         ));
     }
 
@@ -878,6 +1317,17 @@ mod tests {
         let stored = manager.get(task.id).unwrap();
         assert_eq!(stored.spec.as_deref(), Some("edited and approved"));
         assert_eq!(manager.approved_spec(task.id), stored.spec);
+        let updated = stored
+            .history
+            .iter()
+            .position(|event| matches!(event.event, TaskEvent::SpecUpdated))
+            .unwrap();
+        let approved = stored
+            .history
+            .iter()
+            .position(|event| matches!(event.event, TaskEvent::SpecApproved { .. }))
+            .unwrap();
+        assert!(updated < approved);
     }
 
     #[test]
@@ -908,7 +1358,13 @@ mod tests {
             !stored
                 .history
                 .iter()
-                .any(|event| matches!(event, TaskEvent::SpecApproved { .. }))
+                .any(|event| matches!(event.event, TaskEvent::SpecApproved { .. }))
+        );
+        assert!(
+            stored
+                .history
+                .iter()
+                .any(|event| matches!(event.event, TaskEvent::SpecRejected))
         );
     }
 
@@ -1035,7 +1491,7 @@ mod tests {
         assert_eq!(
             task.history
                 .iter()
-                .filter(|event| matches!(event, TaskEvent::SpecApproved { .. }))
+                .filter(|event| matches!(event.event, TaskEvent::SpecApproved { .. }))
                 .count(),
             1
         );
@@ -1191,7 +1647,7 @@ mod tests {
         let (id, event) = rx.recv().await.expect("event should arrive");
         assert_eq!(id, task.id);
         assert!(matches!(
-            event,
+            event.event,
             TaskEvent::Status {
                 status: TaskStatus::Debating
             }
@@ -1209,11 +1665,11 @@ mod tests {
         manager.emitter(task.id).notice("hello");
 
         assert!(matches!(
-            first.recv().await.unwrap().1,
+            first.recv().await.unwrap().1.event,
             TaskEvent::Notice { .. }
         ));
         assert!(matches!(
-            second.recv().await.unwrap().1,
+            second.recv().await.unwrap().1.event,
             TaskEvent::Notice { .. }
         ));
     }
@@ -1382,9 +1838,9 @@ mod limit_tests {
         });
         let stored = manager.get(task.id).unwrap();
         let logs: Vec<_> = stored
-            .history
+            .log_tail
             .iter()
-            .filter_map(TaskEvent::log_text)
+            .filter_map(|event| event.event.log_text())
             .collect();
         assert!(logs.len() <= 3 && logs.iter().map(|text| text.len()).sum::<usize>() <= 100);
         assert!(logs.iter().all(|text| text.len() <= 64));
@@ -1397,9 +1853,9 @@ mod limit_tests {
             stored
                 .history
                 .iter()
-                .filter(|event| event.log_text().is_none())
+                .filter(|event| event.event.log_text().is_none())
                 .count(),
-            lifecycle.len() + 5
+            lifecycle.len() + 6
         );
     }
 
@@ -1416,11 +1872,11 @@ mod limit_tests {
             chunk: "x".repeat(10000),
         });
         let (_, event) = subscriber.recv().await.unwrap();
-        let text = event.log_text().unwrap();
+        let text = event.event.log_text().unwrap();
         assert_eq!(text.len(), 64);
         assert!(text.ends_with(crate::execution_limits::TRUNCATED));
         assert_eq!(
-            manager.get(task.id).unwrap().history[0].log_text(),
+            manager.get(task.id).unwrap().log_tail[0].event.log_text(),
             Some(text)
         );
     }

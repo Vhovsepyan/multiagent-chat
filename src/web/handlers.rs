@@ -267,8 +267,9 @@ pub async fn get_task(
 
 /// `GET /api/tasks/{id}/events` — live `TaskEvent`s as Server-Sent Events.
 ///
-/// Each message is one JSON-encoded `TaskEvent`, so the browser can
-/// `JSON.parse(e.data)` and switch on `type`.
+/// Each message is one JSON-encoded `RecordedEvent`; its nested `event` keeps
+/// the tagged `TaskEvent` payload while sequence and timestamp are assigned by
+/// the backend.
 ///
 /// This streams events from the moment you connect. The full backlog lives on
 /// `GET /api/tasks/{id}` as `history`, so the client fetches the snapshot first

@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::agent::ChatAgent;
 use crate::api::Message;
-use crate::task::{Emitter, TaskEvent};
+use crate::task::{AgentStage, Emitter, TaskEvent};
 use crate::ui;
 
 // ---------------------------------------------------------------------------
@@ -241,9 +241,36 @@ pub async fn run(
         });
 
         ui::system("waiting for the Proposer...");
-        let proposal = proposer
+        emitter.emit(TaskEvent::ProposerStarted {
+            stage: AgentStage::Debate,
+            round: Some(round),
+            provider: proposer.provider(),
+            model: proposer.model().to_string(),
+        });
+        let proposal = match proposer
             .complete_text(Some(PROPOSER_SYSTEM), &transcript.for_proposer())
-            .await?;
+            .await
+        {
+            Ok(proposal) => {
+                emitter.emit(TaskEvent::ProposerCompleted {
+                    stage: AgentStage::Debate,
+                    round: Some(round),
+                    provider: proposer.provider(),
+                    model: proposer.model().to_string(),
+                });
+                proposal
+            }
+            Err(error) => {
+                emitter.emit(TaskEvent::ProposerFailed {
+                    stage: AgentStage::Debate,
+                    round: Some(round),
+                    provider: proposer.provider(),
+                    model: proposer.model().to_string(),
+                    error: format!("{error:#}"),
+                });
+                return Err(error);
+            }
+        };
         ui::proposer(&proposal);
         emitter.emit(TaskEvent::Proposal {
             round,
@@ -252,9 +279,36 @@ pub async fn run(
         transcript.push(Speaker::Proposer, proposal);
 
         ui::system("waiting for the Critic...");
-        let critique = critic
+        emitter.emit(TaskEvent::CriticStarted {
+            stage: AgentStage::Debate,
+            round: Some(round),
+            provider: critic.provider(),
+            model: critic.model().to_string(),
+        });
+        let critique = match critic
             .complete_text(Some(CRITIC_SYSTEM), &transcript.for_critic())
-            .await?;
+            .await
+        {
+            Ok(critique) => {
+                emitter.emit(TaskEvent::CriticCompleted {
+                    stage: AgentStage::Debate,
+                    round: Some(round),
+                    provider: critic.provider(),
+                    model: critic.model().to_string(),
+                });
+                critique
+            }
+            Err(error) => {
+                emitter.emit(TaskEvent::CriticFailed {
+                    stage: AgentStage::Debate,
+                    round: Some(round),
+                    provider: critic.provider(),
+                    model: critic.model().to_string(),
+                    error: format!("{error:#}"),
+                });
+                return Err(error);
+            }
+        };
         ui::critic(&critique);
         transcript.push(Speaker::Critic, &critique);
 
@@ -393,6 +447,113 @@ VERDICT: NEEDS_WORK"],
         assert!(!outcome.approved);
         assert_eq!(outcome.rounds_used, 1);
         assert_eq!(outcome.last_reason.as_deref(), Some("still unsafe"));
+    }
+
+    #[tokio::test]
+    async fn audit_events_follow_agent_call_order_and_frozen_metadata() {
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["a concrete plan"]);
+        let critic = ScriptedAgent::new(
+            ChatProvider::Anthropic,
+            &["REASON: buildable\nVERDICT: APPROVED"],
+        );
+        let manager = crate::task::TaskManager::new();
+        let mut selection = crate::agent::AgentSelection::compiled_defaults();
+        selection.proposer.model = proposer.model().to_string();
+        selection.critic.model = critic.model().to_string();
+        let task = manager
+            .create_from_request(
+                crate::task::TaskRequest {
+                    kind: crate::task::TaskKind::NewProject,
+                    title: "audit".into(),
+                    description: "debate".into(),
+                    project_id: None,
+                    technology: Some(crate::technology::TechStack::Rust),
+                    output: Some(crate::task::OutputTarget::ReviewableResult),
+                    agents: None,
+                },
+                selection,
+            )
+            .unwrap();
+
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::TaskStarted);
+        run(&proposer, &critic, "credit applications", 1, &emitter)
+            .await
+            .unwrap();
+
+        let stored = manager.get(task.id).unwrap();
+        let types = stored
+            .history
+            .iter()
+            .map(|recorded| {
+                serde_json::to_value(&recorded.event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for pair in [
+            ("task_started", "proposer_started"),
+            ("proposer_started", "proposer_completed"),
+            ("proposer_completed", "proposal"),
+            ("critic_started", "critic_completed"),
+            ("critic_completed", "critique"),
+        ] {
+            let before = types.iter().position(|kind| kind == pair.0).unwrap();
+            let after = types.iter().position(|kind| kind == pair.1).unwrap();
+            assert!(before < after, "unexpected lifecycle: {types:?}");
+        }
+        let proposer_event = stored
+            .history
+            .iter()
+            .find(|recorded| matches!(recorded.event, TaskEvent::ProposerStarted { .. }))
+            .unwrap();
+        assert!(matches!(
+            &proposer_event.event,
+            TaskEvent::ProposerStarted { provider, model, .. }
+                if *provider == task.agents.proposer.provider
+                    && model == &task.agents.proposer.model
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_agent_call_records_failure_without_false_completion() {
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &[]);
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[]);
+        let manager = crate::task::TaskManager::new();
+        let task = manager.create("audit", "failure", "legacy");
+
+        assert!(
+            run(
+                &proposer,
+                &critic,
+                "credit applications",
+                1,
+                &manager.emitter(task.id),
+            )
+            .await
+            .is_err()
+        );
+
+        let stored = manager.get(task.id).unwrap();
+        assert!(
+            stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::ProposerStarted { .. }))
+        );
+        assert!(
+            stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::ProposerFailed { .. }))
+        );
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::ProposerCompleted { .. }))
+        );
     }
 
     async fn debate_with(

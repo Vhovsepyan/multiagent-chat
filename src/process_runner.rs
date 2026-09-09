@@ -405,9 +405,9 @@ pub(crate) mod tests {
         assert!(task.history.len() <= 3);
         assert!(task.discarded_log_events > 0);
         assert!(
-            task.history
-                .iter()
-                .all(|event| matches!(event, TaskEvent::Build {chunk} if chunk.len() <= 128))
+            task.log_tail.iter().all(
+                |event| matches!(&event.event, TaskEvent::Build {chunk} if chunk.len() <= 128)
+            )
         );
     }
 }

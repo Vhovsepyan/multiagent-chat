@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::agent::CodingTaskRequest;
+use crate::agent::{CodingAgent, CodingAgentConfig, CodingTaskRequest};
 use crate::inspection::{InspectionRequest, inspect};
 use crate::project::Project;
 use crate::spec;
@@ -23,12 +23,14 @@ pub fn spawn(state: AppState, id: TaskId) {
         })
         .await
         {
+            let error = format!(
+                "task finalization failed: {error}; manual workspace recovery may be required"
+            );
             report.emit(TaskEvent::Finished {
                 status: TaskStatus::Failed,
-                error: Some(format!(
-                    "task finalization failed: {error}; manual workspace recovery may be required"
-                )),
+                error: Some(error.clone()),
             });
+            report.emit(TaskEvent::TaskFailed { error });
         }
     });
 }
@@ -56,7 +58,7 @@ fn finish_run(
                     .map(|task| {
                         task.history
                             .into_iter()
-                            .filter_map(|event| match event {
+                            .filter_map(|recorded| match recorded.event {
                                 TaskEvent::Verification { result } => Some(result),
                                 _ => None,
                             })
@@ -107,7 +109,18 @@ fn finish_run(
         }
     };
     // Send terminal UI updates only after result/cleanup diagnostics are known.
-    emitter.emit(TaskEvent::Finished { status, error });
+    emitter.emit(TaskEvent::Finished {
+        status,
+        error: error.clone(),
+    });
+    match status {
+        TaskStatus::Completed => emitter.emit(TaskEvent::TaskCompleted),
+        TaskStatus::Failed => emitter.emit(TaskEvent::TaskFailed {
+            error: error.unwrap_or_else(|| "task failed".into()),
+        }),
+        TaskStatus::Rejected => {}
+        _ => {}
+    }
 }
 
 fn schedule_recovery_cleanup(state: &AppState, workspace: &TaskWorkspace, emitter: &Emitter) {
@@ -142,6 +155,7 @@ async fn run(
         Some(task) => task,
         None => return Ok(()),
     };
+    emitter.emit(TaskEvent::TaskStarted);
 
     // Task 0005: the run uses the selection frozen on the task, and it is
     // resolved BEFORE any workspace or API work so an unavailable provider
@@ -239,6 +253,7 @@ async fn run(
         markdown: document,
         path: format!("artifacts/{}", spec::APPROVED_SPEC_FILENAME),
     });
+    emitter.emit(TaskEvent::SpecGenerated);
 
     emitter.status(TaskStatus::WaitingForApproval);
     let Some(decision) = state.manager.await_decision(id).await else {
@@ -268,34 +283,29 @@ async fn run(
 
     emitter.status(TaskStatus::Implementing);
     let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
-    agents
-        .worker
-        .execute(
-            CodingTaskRequest {
-                workspace: &workspace_ref.path,
-                spec_path: &spec_path,
-                instructions: &prompt,
-            },
-            emitter,
-        )
-        .await?;
+    execute_worker(
+        agents.worker.as_ref(),
+        &task.agents.worker,
+        CodingTaskRequest {
+            workspace: &workspace_ref.path,
+            spec_path: &spec_path,
+            instructions: &prompt,
+        },
+        emitter,
+    )
+    .await?;
 
     let commands = crate::verification::plan(&profile, &workspace_ref.path);
     if commands.is_empty() {
         emitter.warn("no automatic verification commands were detected");
     }
-    let verification = crate::verification::run_with_limits(
+    let verification = execute_verification(
         &commands,
         &workspace_ref.path,
         &state.config.execution,
+        emitter,
     )
     .await?;
-    for result in &verification {
-        emitter.emit(TaskEvent::Verification {
-            result: result.clone(),
-        });
-    }
-
     let failed = verification.iter().any(|result| !result.success);
     let diff_path = workspace_ref.path.clone();
     let limits = state.config.execution.clone();
@@ -311,6 +321,68 @@ async fn run(
         bail!("one or more verification commands failed");
     }
 
+    Ok(())
+}
+
+async fn execute_verification(
+    commands: &[crate::verification::VerificationCommand],
+    root: &std::path::Path,
+    limits: &crate::execution_limits::ExecutionLimits,
+    emitter: &Emitter,
+) -> Result<Vec<crate::verification::VerificationResult>> {
+    emitter.emit(TaskEvent::VerificationStarted {
+        commands: commands.len(),
+    });
+    let verification = match crate::verification::run_with_limits(commands, root, limits).await {
+        Ok(verification) => verification,
+        Err(error) => {
+            emitter.emit(TaskEvent::VerificationFailed {
+                command: None,
+                error: format!("{error:#}"),
+            });
+            return Err(error);
+        }
+    };
+    for result in &verification {
+        emitter.emit(TaskEvent::Verification {
+            result: result.clone(),
+        });
+    }
+    if let Some(failed) = verification.iter().find(|result| !result.success) {
+        emitter.emit(TaskEvent::VerificationFailed {
+            command: Some(failed.command.clone()),
+            error: "one or more verification commands failed".into(),
+        });
+    } else {
+        emitter.emit(TaskEvent::VerificationCompleted {
+            commands: verification.len(),
+        });
+    }
+    Ok(verification)
+}
+
+async fn execute_worker(
+    worker: &dyn CodingAgent,
+    selection: &CodingAgentConfig,
+    request: CodingTaskRequest<'_>,
+    emitter: &Emitter,
+) -> Result<()> {
+    emitter.emit(TaskEvent::WorkerStarted {
+        tool: selection.tool,
+        model: selection.model.clone(),
+    });
+    if let Err(error) = worker.execute(request, emitter).await {
+        emitter.emit(TaskEvent::WorkerFailed {
+            tool: selection.tool,
+            model: selection.model.clone(),
+            error: format!("{error:#}"),
+        });
+        return Err(error);
+    }
+    emitter.emit(TaskEvent::WorkerCompleted {
+        tool: selection.tool,
+        model: selection.model.clone(),
+    });
     Ok(())
 }
 
@@ -344,6 +416,34 @@ fn write_approved_spec(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn successful_finalization_records_completion_after_finished_state() {
+        let (state, root) = crate::web::tests::test_state("audit-completed");
+        let task = state.manager.create("task", "description", "legacy");
+        finish_run(
+            &state,
+            task.id,
+            &state.manager.emitter(task.id),
+            None,
+            Ok(()),
+        );
+
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Completed);
+        let finished = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::Finished { .. }))
+            .unwrap();
+        let completed = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::TaskCompleted))
+            .unwrap();
+        assert!(finished < completed);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn cleanup_failure_preserves_result_and_retries() {
         use crate::workspace::{LocalWorkspaceProvider, WorkspaceProvider};
@@ -393,7 +493,7 @@ mod tests {
         let task = state.manager.get(task.id).unwrap();
         assert!(task.result.unwrap().diff.contains("+recoverable content"));
         assert_eq!(task.error.as_deref(), Some("implementer failed"));
-        assert!(task.history.iter().any(|event| matches!(event, TaskEvent::Warning {message} if message.contains("simulated cleanup failure"))));
+        assert!(task.log_tail.iter().any(|event| matches!(&event.event, TaskEvent::Warning {message} if message.contains("simulated cleanup failure"))));
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while workspace.root.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -406,6 +506,117 @@ mod tests {
     use super::*;
     use crate::task::{Decision, TaskEvent};
     use uuid::Uuid;
+
+    struct FailingWorker;
+
+    #[async_trait::async_trait]
+    impl CodingAgent for FailingWorker {
+        fn tool(&self) -> crate::agent::CodingTool {
+            crate::agent::CodingTool::ClaudeCode
+        }
+
+        fn model(&self) -> &str {
+            "worker-audit-model"
+        }
+
+        async fn execute(
+            &self,
+            _request: CodingTaskRequest<'_>,
+            _emitter: &Emitter,
+        ) -> Result<crate::agent::CodingTaskResult> {
+            bail!("worker execution failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_failure_records_started_then_failed_with_no_completion() {
+        let manager = TaskManager::new();
+        let task = manager.create("task", "description", "legacy");
+        let selection =
+            CodingAgentConfig::new(crate::agent::CodingTool::ClaudeCode, "worker-audit-model");
+        let root = std::env::temp_dir();
+
+        let result = execute_worker(
+            &FailingWorker,
+            &selection,
+            CodingTaskRequest {
+                workspace: &root,
+                spec_path: &root.join("approved-spec.md"),
+                instructions: "implement",
+            },
+            &manager.emitter(task.id),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let stored = manager.get(task.id).unwrap();
+        let started = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::WorkerStarted { .. }))
+            .unwrap();
+        let failed = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::WorkerFailed { .. }))
+            .unwrap();
+        assert!(started < failed);
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::WorkerCompleted { .. }))
+        );
+        assert!(matches!(
+            &stored.history[started].event,
+            TaskEvent::WorkerStarted { tool, model }
+                if *tool == selection.tool && model == &selection.model
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_failure_records_started_then_failed_without_completion() {
+        let manager = TaskManager::new();
+        let task = manager.create("task", "description", "legacy");
+        let root = std::env::temp_dir();
+        let commands = [crate::verification::VerificationCommand {
+            program: root
+                .join(format!("missing-audit-verifier-{}", Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+        }];
+
+        let results = execute_verification(
+            &commands,
+            &root,
+            &crate::execution_limits::ExecutionLimits::default(),
+            &manager.emitter(task.id),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        let stored = manager.get(task.id).unwrap();
+        let started = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::VerificationStarted { .. }))
+            .unwrap();
+        let failed = stored
+            .history
+            .iter()
+            .position(|recorded| matches!(recorded.event, TaskEvent::VerificationFailed { .. }))
+            .unwrap();
+        assert!(started < failed);
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::VerificationCompleted { .. }))
+        );
+    }
 
     #[test]
     fn partial_implementation_failure_captures_changes_before_cleanup() {
@@ -433,6 +644,18 @@ mod tests {
         assert_eq!(stored.status, TaskStatus::Failed);
         assert!(
             stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::TaskFailed { .. }))
+        );
+        assert!(
+            !stored
+                .history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::TaskCompleted))
+        );
+        assert!(
+            stored
                 .result
                 .unwrap()
                 .diff
@@ -442,12 +665,12 @@ mod tests {
         let result_index = stored
             .history
             .iter()
-            .position(|event| matches!(event, TaskEvent::Result { .. }))
+            .position(|event| matches!(event.event, TaskEvent::Result { .. }))
             .unwrap();
         let finished_index = stored
             .history
             .iter()
-            .position(|event| matches!(event, TaskEvent::Finished { .. }))
+            .position(|event| matches!(event.event, TaskEvent::Finished { .. }))
             .unwrap();
         assert!(result_index < finished_index);
         std::fs::remove_dir_all(root).ok();
@@ -525,7 +748,7 @@ mod tests {
         );
         let stored = state.manager.get(task.id).unwrap();
         assert_eq!(stored.status, TaskStatus::Failed);
-        assert!(stored.history.iter().any(|event| matches!(event, TaskEvent::Warning { message } if message.contains("retained for recovery"))));
+        assert!(stored.log_tail.iter().any(|event| matches!(&event.event, TaskEvent::Warning { message } if message.contains("retained for recovery"))));
         std::fs::remove_dir_all(root).ok();
     }
 

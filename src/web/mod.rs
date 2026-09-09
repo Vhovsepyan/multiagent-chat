@@ -45,8 +45,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let manager = task_manager(&config);
         AppState {
-            manager: TaskManager::with_history_limits(config.execution.history),
+            manager,
             projects: ProjectStore::default(),
             workspaces: Arc::new(
                 LocalWorkspaceProvider::temporary_with_limits(config.execution.clone())
@@ -59,14 +60,27 @@ impl AppState {
 
     #[cfg(test)]
     pub fn with_workspace(config: Config, workspaces: Arc<dyn WorkspaceProvider>) -> Self {
+        let manager = task_manager(&config);
         AppState {
-            manager: TaskManager::with_history_limits(config.execution.history),
+            manager,
             projects: ProjectStore::default(),
             workspaces,
             catalogue: Arc::new(AgentCatalogue::from_config(&config)),
             config: Arc::new(config),
         }
     }
+}
+
+fn task_manager(config: &Config) -> TaskManager {
+    TaskManager::with_history_limits_and_secrets(
+        config.execution.history,
+        [
+            config.gemini_api_key.clone(),
+            config.anthropic_api_key.clone(),
+        ]
+        .into_iter()
+        .flatten(),
+    )
 }
 
 /// Where the frontend assets live, relative to the working directory (DP-13).
