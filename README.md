@@ -2,7 +2,7 @@
 
 A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace.
 
-Each task chooses its own agents: the proposer and critic can run on any configured chat provider (currently Gemini or Anthropic) with any configured model, and the worker runs a coding tool (currently Claude Code) with its own model. The choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the configured defaults — proposer Gemini, critic Anthropic, worker Claude Code — which is how the application behaved before selection existed. See [Agent selection](#agent-selection).
+The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (currently Gemini or Anthropic); the worker uses a configured coding tool and model (currently Claude Code). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
 
 Multiagent Chat supports three task kinds:
 
@@ -20,6 +20,8 @@ GitHub public repositories are the initial existing-project source. Each task us
 - An API key for each chat provider you want to use: `GEMINI_API_KEY` (Google AI
   Studio) and/or `ANTHROPIC_API_KEY` (Anthropic). Neither is required to start
   the application; each one enables its own provider.
+- A Claude Code stored login for worker execution when `ANTHROPIC_API_KEY` is
+  not configured. The worker does not require that key solely to run.
 
 ## Setup
 
@@ -29,10 +31,12 @@ cd multiagent-chat
 cp .env.example .env
 ```
 
-Set the keys for the providers you intend to use in `.env`. Do not commit this
-file or expose its values. Both keys are needed only for the default
-proposer/critic wiring; see [Agent selection](#agent-selection) for what a
-single-provider installation can do.
+Set the key for each chat provider you intend to use in `.env`; providers
+without keys are not offered. Do not commit this file or expose its values.
+Both keys are needed only when using the default proposer/critic wiring; a
+single-provider installation can explicitly select that provider for both chat
+roles. Claude Code may instead use its own stored login for worker execution.
+See [Agent selection](#agent-selection) for details.
 
 `WORKSPACE_ROOT` is no longer required by the web application. It remains an optional compatibility setting for the original CLI workflow.
 
@@ -164,13 +168,14 @@ task form list only the available providers, and a task that asks for an
 unavailable one is refused with a message naming the variable to set. An invalid
 selection is never silently replaced by a working one.
 
-The default wiring is proposer Gemini, critic Anthropic, worker Claude Code, so
-those defaults need their corresponding providers configured. When a default
-role has no available provider, `GET /api/agents` returns `"defaults": null`
-with an `unavailable` explanation, and a task created without an explicit choice
-for that role fails validation instead of running on a substitute. A
-single-provider installation can still run tasks by naming the configured
-provider for both chat roles.
+The default proposer/critic wiring is Gemini/Anthropic, so using those chat
+defaults requires both corresponding providers to be configured. When a
+default role has no available provider, `GET /api/agents` returns
+`"defaults": null` with an `unavailable` explanation, and a task created
+without an explicit choice for that role fails validation instead of running
+on a substitute. A single-provider installation can still run tasks by naming
+the configured provider for both chat roles. The default Claude Code worker
+does not add an `ANTHROPIC_API_KEY` requirement.
 
 The Claude Code worker authenticates itself using its own stored login, so it
 does not need `ANTHROPIC_API_KEY` for worker execution: with no key configured,
