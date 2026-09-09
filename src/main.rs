@@ -10,6 +10,7 @@ mod approve;
 mod cli;
 mod config;
 mod debate;
+mod evidence;
 mod execution_limits;
 mod implementer;
 mod inspection;

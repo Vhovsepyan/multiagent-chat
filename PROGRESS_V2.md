@@ -7,6 +7,8 @@ kinds, isolated disposable task workspaces, bounded repository inspection,
 evidence-based technology profiles, task-specific prompts, stack-aware
 verification, and reviewable task results. The original v2 state machine, SSE
 streaming, editable approval gate, and Claude Code implementation stage remain.
+Tasks now also retain redacted proposer/critic and worker evidence and expose a
+deterministic five-file evidence ZIP from the task page/API.
 
 The legacy CLI remains available behind `--cli`; only that compatibility path
 uses optional `WORKSPACE_ROOT`. Production web forms and APIs do not accept
@@ -20,6 +22,23 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-24 (2026-09-09, task 0007): detailed `EvidenceRecord` entries retain each
+  real proposer/critic call (prompt, response/error, stage, round, frozen
+  provider/model, status, and duration) and each worker execution (safe
+  instruction, frozen tool/model, summary, status, and duration). Evidence is
+  omitted from ordinary task JSON/SSE and stays separate from the bounded UI
+  `log_tail`, but it receives sequence/timestamp metadata from the same locked
+  per-task allocator as `RecordedEvent`. Every retained text field passes
+  through the established audit redactor before storage and has an explicit
+  256 KiB cap; worker process truncation propagates to the worker evidence flag.
+  `GET /api/tasks/{id}/evidence` creates an in-memory, constant-entry ZIP with
+  JSONL plus development, decision, agent-usage, and final-report Markdown.
+  Rendering is deterministic from stored data and makes no LLM call. The first
+  export records one idempotent `EvidenceExported` event before its snapshot, so
+  stable repeat exports include the same audit fact without recursively growing
+  history. Evidence remains process-memory state; raw worker stdout/stderr stays
+  in the existing bounded UI/process paths rather than becoming an unlimited
+  transcript.
 - DP-23 (2026-09-09, task 0006): significant task events are immutable
   `RecordedEvent` envelopes with a per-task sequence starting at 1, a
   backend-authored `DateTime<Utc>` serialized as RFC3339, and the tagged

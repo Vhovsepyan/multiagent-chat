@@ -101,6 +101,12 @@ fn agents_html(agents: &AgentSelection) -> String {
     )
 }
 
+fn actions_html(id: TaskId) -> String {
+    format!(
+        r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{id}/evidence" download>Export Evidence</a><div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#
+    )
+}
+
 fn gate_html(id: TaskId, spec: &str) -> String {
     format!(
         r#"<div class="card"><h2 class="section">Specification — your call</h2>
@@ -412,7 +418,10 @@ fn event_html(
                 format!(r#"<div class="done-banner {class}">{text}</div>"#),
             ))
         }
-        TaskEvent::TaskCompleted | TaskEvent::TaskFailed { .. } | TaskEvent::TaskCancelled => None,
+        TaskEvent::TaskCompleted
+        | TaskEvent::TaskFailed { .. }
+        | TaskEvent::TaskCancelled
+        | TaskEvent::EvidenceExported { .. } => None,
     };
     result.map(|(slot, html)| (slot, format!("{}{}", timestamp_html(recorded), html)))
 }
@@ -702,8 +711,9 @@ fn page_html(
     build: &str,
     done: &str,
 ) -> String {
+    let actions = actions_html(task.id);
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{actions}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
         id = task.id,
         title = esc(&task.title),
         kind = task.kind.label(),

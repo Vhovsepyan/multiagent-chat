@@ -21,6 +21,7 @@ use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 use crate::agent::{AgentSelection, AgentSelectionRequest};
+use crate::evidence::{EvidencePayload, EvidenceRecord};
 use crate::execution_limits::{HistoryLimits, bounded_text};
 use crate::project::ProjectId;
 use crate::technology::{ProjectProfile, TechStack};
@@ -341,6 +342,9 @@ pub enum TaskEvent {
         error: String,
     },
     TaskCancelled,
+    EvidenceExported {
+        artifact: String,
+    },
 }
 
 impl TaskEvent {
@@ -426,6 +430,7 @@ impl TaskEvent {
                 }
             }
             Self::TaskFailed { error } => clean(error),
+            Self::EvidenceExported { artifact } => clean(artifact),
             Self::AgentsSelected { agents } => {
                 clean(&mut agents.proposer.model);
                 clean(&mut agents.critic.model);
@@ -458,7 +463,7 @@ pub struct RecordedEvent {
 /// Values and common credential syntax removed before an event enters task
 /// state or the live stream. Debug output intentionally never exposes values.
 #[derive(Clone, Default)]
-struct AuditRedactor {
+pub(crate) struct AuditRedactor {
     values: Vec<String>,
 }
 
@@ -483,7 +488,7 @@ impl AuditRedactor {
         }
     }
 
-    fn redact(&self, text: &str) -> String {
+    pub(crate) fn redact(&self, text: &str) -> String {
         let mut redacted = text.to_string();
         for value in &self.values {
             redacted = redacted.replace(value, "[REDACTED]");
@@ -500,12 +505,23 @@ fn redact_credential_line(line: &str) -> String {
     let assignment_markers = [
         "api_key=",
         "api-key=",
+        "api key ",
+        "api key:",
         "access_token=",
         "access-token=",
+        "auth_token=",
+        "github_token=",
+        "gh_token=",
         "authorization=",
         "authorization:",
         "password=",
+        "password:",
         "secret=",
+        "secret:",
+        "database_url=",
+        "database-url=",
+        "aws_secret_access_key=",
+        "google_application_credentials=",
     ];
     if let Some(index) = assignment_markers
         .iter()
@@ -519,7 +535,29 @@ fn redact_credential_line(line: &str) -> String {
         let newline = if line.ends_with('\n') { "\n" } else { "" };
         return format!("[REDACTED authorization]{newline}");
     }
-    line.to_string()
+    redact_token_prefixes(line)
+}
+
+fn redact_token_prefixes(line: &str) -> String {
+    let mut redacted = line.to_string();
+    for prefix in ["sk-", "ghp_", "github_pat_", "AIza"] {
+        let mut search_from = 0;
+        while let Some(relative) = redacted[search_from..].find(prefix) {
+            let start = search_from + relative;
+            let end = redacted[start..]
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '\"' | '\'' | '`' | ','))
+                .map(|offset| start + offset)
+                .unwrap_or(redacted.len());
+            // Avoid turning ordinary short prose fragments into secrets.
+            if end.saturating_sub(start) >= 12 {
+                redacted.replace_range(start..end, "[REDACTED]");
+                search_from = start + "[REDACTED]".len();
+            } else {
+                search_from = end;
+            }
+        }
+    }
+    redacted
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +614,10 @@ pub struct Task {
     pub status: TaskStatus,
     /// Significant events are append-only for the lifetime of this task.
     pub history: Vec<RecordedEvent>,
+    /// Detailed agent/worker evidence is durable for this in-memory task but is
+    /// deliberately omitted from ordinary task snapshots and the live UI.
+    #[serde(skip)]
+    pub evidence: Vec<EvidenceRecord>,
     /// Repetitive UI output remains bounded independently from the audit log.
     pub log_tail: Vec<RecordedEvent>,
     pub discarded_log_events: usize,
@@ -583,6 +625,8 @@ pub struct Task {
     history_limits: HistoryLimits,
     #[serde(skip)]
     next_event_sequence: u64,
+    #[serde(skip)]
+    worker_output_truncated: bool,
     pub spec: Option<String>,
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
@@ -609,10 +653,12 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            evidence: Vec::new(),
             log_tail: Vec::new(),
             discarded_log_events: 0,
             history_limits: HistoryLimits::default(),
             next_event_sequence: 1,
+            worker_output_truncated: false,
             spec: None,
             error: None,
             decision: None,
@@ -636,10 +682,12 @@ impl Task {
             result: None,
             status: TaskStatus::Created,
             history: Vec::new(),
+            evidence: Vec::new(),
             log_tail: Vec::new(),
             discarded_log_events: 0,
             history_limits: HistoryLimits::default(),
             next_event_sequence: 1,
+            worker_output_truncated: false,
             spec: None,
             error: None,
             decision: None,
@@ -685,15 +733,16 @@ impl Task {
             }
             _ => {}
         }
+        if matches!(&event, TaskEvent::Build { chunk } if chunk.contains(crate::execution_limits::TRUNCATED))
+        {
+            self.worker_output_truncated = true;
+        }
+        let (sequence, timestamp) = self.next_audit_metadata();
         let recorded = RecordedEvent {
-            sequence: self.next_event_sequence,
-            timestamp: DateTime::<Utc>::from(std::time::SystemTime::now()),
+            sequence,
+            timestamp,
             event,
         };
-        self.next_event_sequence = self
-            .next_event_sequence
-            .checked_add(1)
-            .expect("task event sequence exhausted");
         if recorded.event.log_text().is_some() {
             self.log_tail.push(recorded.clone());
         } else {
@@ -724,6 +773,60 @@ impl Task {
             self.discarded_log_events += 1;
         }
         recorded
+    }
+
+    fn record_evidence(
+        &mut self,
+        payload: EvidencePayload,
+        redactor: &AuditRedactor,
+    ) -> EvidenceRecord {
+        let (sequence, timestamp) = self.next_audit_metadata();
+        let record = EvidenceRecord::new(sequence, timestamp, payload)
+            .sanitized_and_bounded(|text| redactor.redact(text), self.worker_output_truncated);
+        self.evidence.push(record.clone());
+        record
+    }
+
+    fn next_audit_metadata(&mut self) -> (u64, DateTime<Utc>) {
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .expect("task audit sequence exhausted");
+        (
+            sequence,
+            DateTime::<Utc>::from(std::time::SystemTime::now()),
+        )
+    }
+
+    fn sanitize_for_export(&mut self, redactor: &AuditRedactor) {
+        let clean = |text: &mut String| *text = redactor.redact(text);
+        clean(&mut self.title);
+        clean(&mut self.description);
+        clean(&mut self.agents.proposer.model);
+        clean(&mut self.agents.critic.model);
+        clean(&mut self.agents.worker.model);
+        if let Some(spec) = &mut self.spec {
+            clean(spec);
+        }
+        if let Some(error) = &mut self.error {
+            clean(error);
+        }
+        if let Some(decision) = &mut self.decision
+            && let Some(spec) = &mut decision.spec
+        {
+            clean(spec);
+        }
+        if let Some(result) = &mut self.result {
+            if let Some(revision) = &mut result.source_revision {
+                clean(revision);
+            }
+            clean(&mut result.diff);
+            for verification in &mut result.verification {
+                clean(&mut verification.command);
+                clean(&mut verification.output);
+            }
+        }
     }
 
     /// Significant events followed by the bounded UI log tail, in backend
@@ -785,6 +888,12 @@ impl Emitter {
         });
     }
 
+    /// Retain detailed export evidence without publishing it to the bounded UI
+    /// stream. Ordering still comes from the task's shared audit allocator.
+    pub fn record_evidence(&self, payload: EvidencePayload) {
+        self.inner.record_evidence(self.id, payload);
+    }
+
     /// An emitter attached to no task, for tests and for CLI code paths that do
     /// not care. `emit` stays harmless: nothing is recorded, nobody listens.
     pub fn detached() -> Self {
@@ -840,6 +949,13 @@ impl Inner {
             let event = event.sanitized(&self.redactor).bounded(self.history_limits);
             let recorded = task.record_event(event);
             let _ = self.tx.send((id, recorded));
+        }
+    }
+
+    fn record_evidence(&self, id: TaskId, payload: EvidencePayload) {
+        let mut tasks = self.tasks.write().expect("task registry lock poisoned");
+        if let Some(task) = tasks.get_mut(&id) {
+            task.record_evidence(payload, &self.redactor);
         }
     }
 }
@@ -944,6 +1060,34 @@ impl TaskManager {
             .read()
             .expect("task registry lock poisoned");
         tasks.get(&id).cloned()
+    }
+
+    /// Record the export action once, then return a fully sanitized snapshot.
+    /// The idempotent event makes the first and later exports of a stable task
+    /// deterministic while still auditing that export occurred.
+    pub fn evidence_snapshot(&self, id: TaskId) -> Option<Task> {
+        let mut tasks = self
+            .inner
+            .tasks
+            .write()
+            .expect("task registry lock poisoned");
+        let task = tasks.get_mut(&id)?;
+        if !task
+            .history
+            .iter()
+            .any(|recorded| matches!(recorded.event, TaskEvent::EvidenceExported { .. }))
+        {
+            let event = TaskEvent::EvidenceExported {
+                artifact: crate::evidence::archive_filename(id),
+            }
+            .sanitized(&self.inner.redactor)
+            .bounded(self.inner.history_limits);
+            let recorded = task.record_event(event);
+            let _ = self.inner.tx.send((id, recorded));
+        }
+        let mut snapshot = task.clone();
+        snapshot.sanitize_for_export(&self.inner.redactor);
+        Some(snapshot)
     }
 
     /// Snapshots of every task.

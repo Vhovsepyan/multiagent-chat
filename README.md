@@ -56,6 +56,7 @@ In the web UI:
 4. Review or edit the generated specification.
 5. Approve implementation.
 6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
+7. Select **Export Evidence** at any point to download the run's redacted evidence package.
 
 Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output configuration. The initial output is a reviewable task result; repository publishing is intentionally deferred.
 
@@ -168,11 +169,64 @@ calls, specification generation/editing/approval/rejection, worker execution,
 and verification. Provider/tool and model metadata comes from the selection
 frozen on the task.
 
-Configured provider credential values and common secret-bearing assignment or
-authorization forms are redacted before events enter task state or SSE. Event
+Configured provider credential values and common secret-bearing assignment,
+authorization, token, password, and database-credential forms are redacted
+before events or detailed evidence enter task state. Prompts, responses, worker
+summaries, errors, and export metadata use the same redaction layer. Event
 metadata never includes API keys, environment snapshots, or authorization
-headers. This is defense in depth and does not turn task history into durable
-evidence storage; task state is still lost when the process restarts.
+headers. This is defense in depth; task and evidence state are still lost when
+the process restarts.
+
+## Evidence export
+
+Each task retains a detailed evidence stream separately from `history` and the
+bounded `log_tail`. Proposer and critic records contain the actual role-level
+prompt, response or error, provider, model, stage, round, status, duration, UTC
+timestamp, and task audit sequence. Worker records contain the safe instruction
+handed to the coding-agent abstraction, tool and model as separate fields,
+status, bounded/redacted summary, duration, and truncation state. These records
+use the same sequence allocator and clock as `RecordedEvent`; they do not create
+a second ordering system and are not exposed through ordinary task snapshots or
+SSE.
+
+`GET /api/tasks/{id}/evidence` returns an in-memory ZIP download containing only:
+
+```text
+agent-session.jsonl
+DEVELOPMENT_LOG.md
+DECISIONS.md
+AGENT_USAGE.md
+FINAL_REPORT.md
+```
+
+`agent-session.jsonl` is UTF-8 JSON Lines, with one standalone object per line,
+ordered by the shared task sequence. Its stable record kinds are:
+
+- `task_event`: `sequence`, `timestamp`, `kind`, and the tagged `event` payload.
+- `agent_interaction`: `sequence`, `timestamp`, `kind`, `stage`, `role`, optional
+  `round`, `provider`, `model`, `prompt`, optional `response`, `status`, optional
+  `error`, `duration_ms`, and `truncated`.
+- `worker_execution`: `sequence`, `timestamp`, `kind`, `role`, `stage`, `tool`,
+  `model`, `instruction`, `summary`, `status`, `duration_ms`, and `truncated`.
+- `verification`: `sequence`, `timestamp`, `kind`, `command`, `success`, `output`,
+  and `truncated`.
+
+The Markdown files are generated deterministically from stored task, event, and
+interaction data. `DECISIONS.md` conservatively uses only recorded
+`Agreed solution`/`Architecture` specification sections and critic reasons; it
+marks unrecorded rationale instead of inventing it. Export performs no LLM call.
+Prompts, responses, summaries, and errors are redacted before retention and each
+evidence text field is capped at 256 KiB with `truncated: true` and the standard
+truncation marker. Verification/process output retains its existing limits.
+Low-level Build/Notice/Warning lines remain only in the bounded UI `log_tail` and
+are not promoted to unlimited evidence storage; the worker evidence contains a
+safe outcome summary instead of raw stdout/stderr.
+
+The archive is built in memory with constant entry names and a UUID-derived
+download name, so task titles and request data cannot control a server path.
+The first accepted export records one immutable `evidence_exported` event before
+the snapshot; later exports reuse that event, making stable repeated exports
+deterministic and avoiding recursive export history.
 
 Git capture uses a separate 8 MiB stdout/result-content budget. Over-budget Git
 output is rejected rather than parsed as a complete diff; large added files also
@@ -282,6 +336,7 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
 - `GET /api/tasks/{id}` — task snapshot, append-only audit `history`, and the
   bounded `log_tail`; every entry has sequence/timestamp/event fields.
 - `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
+- `GET /api/tasks/{id}/evidence` — download the redacted five-file evidence ZIP.
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
 
 Example Project registration:
@@ -349,6 +404,7 @@ src/
   workflow.rs      task-kind-specific agent instructions
   verification.rs profile-aware command planning and execution
   task.rs          task state, recorded audit events, redaction, and ordering
+  evidence.rs      detailed interaction records and deterministic evidence ZIP
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
@@ -365,6 +421,9 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 
 - Only public GitHub repositories are supported; no OAuth or GitHub App authentication exists yet.
 - Projects and task history are lost when the process restarts.
+- Evidence retention is in memory and is lost on restart. Raw worker
+  stdout/stderr is intentionally not retained in the evidence transcript; the
+  existing bounded UI log and process capture remain separate.
 - The initial New Project output is a reviewable result, not a downloadable archive or pushed repository.
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.

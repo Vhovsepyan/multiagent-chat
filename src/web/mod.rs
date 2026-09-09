@@ -104,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
         .route("/api/tasks/{id}/events", get(handlers::task_events))
+        .route("/api/tasks/{id}/evidence", get(handlers::export_evidence))
         // --- the browser UI (DP-14: HTMX swaps HTML, so these render HTML) ---
         .route("/task/{id}", get(ui::task_page))
         .route("/ui/projects", get(ui::projects))

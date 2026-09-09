@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
@@ -263,6 +263,39 @@ pub async fn get_task(
         .get(id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no task {id}")))
+}
+
+/// `GET /api/tasks/{id}/evidence` — generate the five-file evidence package.
+///
+/// The archive is rendered in memory from an application-owned task snapshot;
+/// no title or caller-supplied path participates in filesystem access.
+pub async fn export_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> ApiResult<Response> {
+    let task = state
+        .manager
+        .evidence_snapshot(id)
+        .ok_or_else(|| ApiError::not_found(format!("no task {id}")))?;
+    let package = tokio::task::spawn_blocking(move || crate::evidence::export(&task))
+        .await
+        .map_err(|error| ApiError::internal(format!("evidence export task failed: {error}")))?
+        .map_err(|error| ApiError::internal(format!("could not export evidence: {error:#}")))?;
+    let disposition =
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", package.filename))
+            .map_err(|_| ApiError::internal("could not create evidence download filename"))?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/zip"),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        package.bytes,
+    )
+        .into_response())
 }
 
 /// `GET /api/tasks/{id}/events` — live `TaskEvent`s as Server-Sent Events.

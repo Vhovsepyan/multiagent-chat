@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use crate::agent::ChatAgent;
 use crate::api::push_user;
 use crate::debate::Transcript;
+use crate::evidence::{EvidencePayload, EvidenceRole, EvidenceStatus};
 use crate::task::{AgentStage, Emitter, TaskEvent};
 use crate::ui;
 
@@ -80,12 +81,27 @@ pub async fn build(
     });
     let mut messages = transcript.for_proposer();
     push_user(&mut messages, request);
+    let prompt = crate::evidence::chat_prompt(Some(DRAFT_SYSTEM), &messages);
+    let started = std::time::Instant::now();
     let draft = match proposer
         .complete_text(Some(DRAFT_SYSTEM), &messages)
         .await
         .context("the Proposer failed to draft the spec")
     {
         Ok(draft) => {
+            emitter.record_evidence(EvidencePayload::AgentInteraction {
+                stage: AgentStage::Specification,
+                role: EvidenceRole::Proposer,
+                round: None,
+                provider: proposer.provider(),
+                model: proposer.model().to_string(),
+                prompt,
+                response: Some(draft.clone()),
+                status: EvidenceStatus::Completed,
+                error: None,
+                duration_ms: crate::evidence::elapsed_ms(started),
+                truncated: false,
+            });
             emitter.emit(TaskEvent::ProposerCompleted {
                 stage: AgentStage::Specification,
                 round: None,
@@ -95,12 +111,26 @@ pub async fn build(
             draft
         }
         Err(error) => {
+            let message = format!("{error:#}");
+            emitter.record_evidence(EvidencePayload::AgentInteraction {
+                stage: AgentStage::Specification,
+                role: EvidenceRole::Proposer,
+                round: None,
+                provider: proposer.provider(),
+                model: proposer.model().to_string(),
+                prompt,
+                response: None,
+                status: EvidenceStatus::Failed,
+                error: Some(message.clone()),
+                duration_ms: crate::evidence::elapsed_ms(started),
+                truncated: false,
+            });
             emitter.emit(TaskEvent::ProposerFailed {
                 stage: AgentStage::Specification,
                 round: None,
                 provider: proposer.provider(),
                 model: proposer.model().to_string(),
-                error: format!("{error:#}"),
+                error: message,
             });
             return Err(error);
         }
@@ -134,12 +164,27 @@ pub async fn build(
              Required sections:\n\n{SECTIONS}{unresolved}\n\n---\n\n{draft}"
         ),
     );
+    let prompt = crate::evidence::chat_prompt(Some(CHECK_SYSTEM), &messages);
+    let started = std::time::Instant::now();
     let checked = match critic
         .complete_text(Some(CHECK_SYSTEM), &messages)
         .await
         .context("the Critic failed to check the spec")
     {
         Ok(checked) => {
+            emitter.record_evidence(EvidencePayload::AgentInteraction {
+                stage: AgentStage::Specification,
+                role: EvidenceRole::Critic,
+                round: None,
+                provider: critic.provider(),
+                model: critic.model().to_string(),
+                prompt,
+                response: Some(checked.clone()),
+                status: EvidenceStatus::Completed,
+                error: None,
+                duration_ms: crate::evidence::elapsed_ms(started),
+                truncated: false,
+            });
             emitter.emit(TaskEvent::CriticCompleted {
                 stage: AgentStage::Specification,
                 round: None,
@@ -149,12 +194,26 @@ pub async fn build(
             checked
         }
         Err(error) => {
+            let message = format!("{error:#}");
+            emitter.record_evidence(EvidencePayload::AgentInteraction {
+                stage: AgentStage::Specification,
+                role: EvidenceRole::Critic,
+                round: None,
+                provider: critic.provider(),
+                model: critic.model().to_string(),
+                prompt,
+                response: None,
+                status: EvidenceStatus::Failed,
+                error: Some(message.clone()),
+                duration_ms: crate::evidence::elapsed_ms(started),
+                truncated: false,
+            });
             emitter.emit(TaskEvent::CriticFailed {
                 stage: AgentStage::Specification,
                 round: None,
                 provider: critic.provider(),
                 model: critic.model().to_string(),
-                error: format!("{error:#}"),
+                error: message,
             });
             return Err(error);
         }
@@ -305,6 +364,17 @@ corrected"
                 ..
             }
         )));
+        assert_eq!(stored.evidence.len(), 2);
+        assert!(matches!(
+            &stored.evidence[1].payload,
+            crate::evidence::EvidencePayload::AgentInteraction {
+                stage: AgentStage::Specification,
+                role: crate::evidence::EvidenceRole::Critic,
+                prompt,
+                response: Some(response),
+                ..
+            } if prompt.contains("drafted") && response.contains("corrected")
+        ));
     }
 
     /// An unapproved debate must tell the Critic to keep its live objections

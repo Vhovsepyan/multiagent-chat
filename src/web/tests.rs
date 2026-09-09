@@ -744,6 +744,67 @@ async fn the_task_page_renders_history_and_attaches_the_stream() {
     assert!(html.contains("data-sequence=\"2\""));
     assert!(html.contains("data-sequence=\"3\""));
     assert!(html.contains(&format!(r#"sse-connect="/ui/tasks/{}/stream""#, task.id)));
+    assert!(html.contains("Export Evidence"));
+    assert!(html.contains(&format!("/api/tasks/{}/evidence", task.id)));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn evidence_endpoint_downloads_the_five_file_archive() {
+    let (state, root) = test_state("evidence-download");
+    let task = state.manager.create("Evidence", "download", "legacy");
+
+    let response = router(state)
+        .oneshot(get(&format!("/api/tasks/{}/evidence", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/zip");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains(&task.id.to_string())
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(archive.len(), 5);
+    for name in [
+        "agent-session.jsonl",
+        "DEVELOPMENT_LOG.md",
+        "DECISIONS.md",
+        "AGENT_USAGE.md",
+        "FINAL_REPORT.md",
+    ] {
+        assert!(archive.by_name(name).is_ok(), "archive is missing {name}");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn evidence_endpoint_rejects_unknown_and_malformed_ids() {
+    let (state, root) = test_state("evidence-errors");
+    let app = router(state);
+
+    let response = app
+        .clone()
+        .oneshot(get(&format!(
+            "/api/tasks/{}/evidence",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .oneshot(get("/api/tasks/../../escape/evidence"))
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
     std::fs::remove_dir_all(&root).ok();
 }
 

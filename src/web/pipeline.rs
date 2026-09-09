@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::agent::{CodingAgent, CodingAgentConfig, CodingTaskRequest};
+use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
 use crate::inspection::{InspectionRequest, inspect};
 use crate::project::Project;
 use crate::spec;
@@ -367,18 +368,43 @@ async fn execute_worker(
     request: CodingTaskRequest<'_>,
     emitter: &Emitter,
 ) -> Result<()> {
+    let instruction = crate::evidence::worker_instruction(request.instructions);
     emitter.emit(TaskEvent::WorkerStarted {
         tool: selection.tool,
         model: selection.model.clone(),
     });
+    let started = std::time::Instant::now();
     if let Err(error) = worker.execute(request, emitter).await {
+        let message = format!("{error:#}");
+        emitter.record_evidence(EvidencePayload::WorkerExecution {
+            role: WorkerRole::Worker,
+            stage: WorkerStage::Implementation,
+            tool: selection.tool,
+            model: selection.model.clone(),
+            instruction,
+            summary: message.clone(),
+            status: EvidenceStatus::Failed,
+            duration_ms: crate::evidence::elapsed_ms(started),
+            truncated: false,
+        });
         emitter.emit(TaskEvent::WorkerFailed {
             tool: selection.tool,
             model: selection.model.clone(),
-            error: format!("{error:#}"),
+            error: message,
         });
         return Err(error);
     }
+    emitter.record_evidence(EvidencePayload::WorkerExecution {
+        role: WorkerRole::Worker,
+        stage: WorkerStage::Implementation,
+        tool: selection.tool,
+        model: selection.model.clone(),
+        instruction,
+        summary: "Worker completed successfully.".into(),
+        status: EvidenceStatus::Completed,
+        duration_ms: crate::evidence::elapsed_ms(started),
+        truncated: false,
+    });
     emitter.emit(TaskEvent::WorkerCompleted {
         tool: selection.tool,
         model: selection.model.clone(),
@@ -571,6 +597,15 @@ mod tests {
             &stored.history[started].event,
             TaskEvent::WorkerStarted { tool, model }
                 if *tool == selection.tool && model == &selection.model
+        ));
+        assert!(matches!(
+            &stored.evidence[0].payload,
+            crate::evidence::EvidencePayload::WorkerExecution {
+                instruction,
+                status: crate::evidence::EvidenceStatus::Failed,
+                summary,
+                ..
+            } if instruction.contains("implement") && summary.contains("worker execution failed")
         ));
     }
 
