@@ -90,6 +90,13 @@
       </div>
       <div class="hint" id="agent-hint">Leave these as they are to use the configured defaults.</div>
 
+      <label for="git_mode">Git</label>
+      <select id="git_mode" name="git_mode">
+        <option value="none">No commits</option>
+        <option value="commit_per_milestone">Commit after each successful milestone</option>
+      </select>
+      <div class="hint">Commits are made in the isolated task workspace only. Nothing is pushed, and a milestone is committed only after its verification passes.</div>
+
       <button type="submit">Start collaboration</button>
       <div id="create-error"></div>
     </form>

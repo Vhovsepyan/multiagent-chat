@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::git::MilestoneCommit;
 use crate::verification::VerificationCommand;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,9 @@ pub struct Milestone {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub worker_result_summary: Option<String>,
+    /// Set when this milestone was committed (task 0009). Absent means no
+    /// commit was requested, or none was needed.
+    pub commit: Option<MilestoneCommit>,
 }
 
 /// Build a non-empty, ordered plan from the approved specification. The
@@ -97,6 +101,7 @@ pub fn plan_from_spec(
             started_at: None,
             completed_at: None,
             worker_result_summary: None,
+            commit: None,
         })
         .collect())
 }

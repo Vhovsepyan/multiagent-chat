@@ -23,6 +23,22 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-27 (2026-09-09, task 0009): milestone commits are opt-in per run.
+  `GitMode` (`none` by default, `commit_per_milestone`) is part of the task
+  request, frozen on the task like the agent selection, and `src/git.rs` owns
+  every Git write. The module only ever ADDS a commit on the checked-out branch
+  of a workspace this application prepared: no reset, clean, history rewrite,
+  branch move, remote, or push. One gate runs before the first milestone —
+  repository is its own top level, HEAD is a branch (a detached HEAD is
+  surfaced rather than repaired or branched, chosen with the user), no merge or
+  rebase in progress, no pre-existing uncommitted changes — and a New Project
+  workspace without a repository is initialized there explicitly. A commit is
+  attempted only after verification passes, is skipped (with a notice) when the
+  milestone changed nothing, and a commit failure fails the milestone instead of
+  finalizing it. Commits use a per-command `multiagent-chat@localhost` identity
+  with signing disabled, because headless execution cannot answer a passphrase
+  prompt and global config must stay untouched. `MilestoneCommitCreated` carries
+  only milestone identity plus SHA/short SHA/message — never a path or remote.
 - DP-26 (2026-09-09, tasks 0007/0008 follow-up): one scope statement per worker
   run. The common Claude Code prompt no longer says "Work through the Steps
   section in order"; it presents the approved specification as background

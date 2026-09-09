@@ -1670,6 +1670,7 @@ fn milestone_plan() -> Vec<crate::milestone::Milestone> {
             started_at: None,
             completed_at: None,
             worker_result_summary: None,
+            commit: None,
         })
         .collect()
 }
@@ -1890,6 +1891,266 @@ async fn evidence_export_records_one_audit_event_after_the_archive() {
         assert!(!bytes.is_empty());
         assert_eq!(exported(&state), 1);
     }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Task 0009: per-run Git mode and milestone commits
+// ---------------------------------------------------------------------------
+
+fn commit_event() -> TaskEvent {
+    TaskEvent::MilestoneCommitCreated {
+        id: "m1".into(),
+        order: 1,
+        title: "Project bootstrap".into(),
+        commit: crate::git::MilestoneCommit {
+            sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into(),
+            short_sha: "a1b2c3d".into(),
+            message: "feat(milestone-01): Project bootstrap".into(),
+        },
+    }
+}
+
+/// The mode is part of the request, frozen on the task like the agent
+/// selection, and defaults to the previous behavior.
+#[tokio::test]
+async fn task_creation_stores_the_requested_git_mode() {
+    let (state, root) = test_state("git-mode-api");
+    let app = router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(body_json(response).await["git_mode"], "none");
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "git_mode": "commit_per_milestone"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["git_mode"], "commit_per_milestone");
+    let id: crate::task::TaskId = task["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        state.manager.get(id).unwrap().git_mode,
+        crate::git::GitMode::CommitPerMilestone
+    );
+
+    // An unsupported mode is refused in the standard shape, and creates nothing.
+    let before = state.manager.len();
+    let response = app
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "git_mode": "push_to_github"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("git_mode"), "got: {error}");
+    assert_eq!(state.manager.len(), before);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The form carries the same choice, and an unknown value is refused.
+#[tokio::test]
+async fn the_form_submits_the_git_mode() {
+    let (state, root) = test_state("git-mode-form");
+    let app = router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result\
+             &git_mode=commit_per_milestone",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.manager.list().pop().unwrap().git_mode,
+        crate::git::GitMode::CommitPerMilestone
+    );
+
+    // A blank select means the safe default.
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result&git_mode=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .manager
+            .list()
+            .iter()
+            .any(|task| task.git_mode == crate::git::GitMode::None)
+    );
+
+    let response = app
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result&git_mode=push",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_text(response)
+            .await
+            .contains("not a supported Git mode")
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Required test 4/UI: the commit is stored on the milestone and shown in task
+/// details, live and after a reload.
+#[tokio::test]
+async fn milestone_commits_are_stored_and_displayed() {
+    use http_body_util::BodyExt;
+
+    let (state, root) = test_state("git-commit-ui");
+    let task = state.manager.create("t", "d", "p");
+    let emitter = state.manager.emitter(task.id);
+    emitter.emit(TaskEvent::MilestonePlanCreated {
+        milestones: milestone_plan(),
+    });
+
+    let response = router(state.clone())
+        .oneshot(get(&format!("/ui/tasks/{}/stream", task.id)))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+
+    emitter.emit(commit_event());
+
+    let live = String::from_utf8(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(live.contains("Milestone 1 committed"), "got: {live}");
+    assert!(live.contains("a1b2c3d"), "short sha missing: {live}");
+    // The badge region is refreshed with the commit line too.
+    assert!(
+        live.contains(r#"<div id="milestones" hx-swap-oob="innerHTML">"#),
+        "got: {live}"
+    );
+
+    let stored = state.manager.get(task.id).unwrap();
+    let commit = stored.milestones[0].commit.as_ref().unwrap();
+    assert_eq!(commit.short_sha, "a1b2c3d");
+    assert_eq!(commit.message, "feat(milestone-01): Project bootstrap");
+    assert!(stored.milestones[1].commit.is_none());
+
+    let page = body_text(
+        router(state)
+            .oneshot(get(&format!("/task/{}", task.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(page.contains("Commit: <code>a1b2c3d</code>"), "{page}");
+    assert!(
+        page.contains("No commits"),
+        "the run's Git mode should be shown"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Required test 8: commit creation reaches the evidence archive with safe
+/// metadata only.
+#[tokio::test]
+async fn milestone_commits_appear_in_exported_evidence() {
+    let (state, root) = test_state("git-commit-evidence");
+    let task = state.manager.create("t", "d", "p");
+    let emitter = state.manager.emitter(task.id);
+    emitter.emit(TaskEvent::MilestonePlanCreated {
+        milestones: milestone_plan(),
+    });
+    emitter.emit(commit_event());
+
+    let response = router(state)
+        .oneshot(get(&format!("/api/tasks/{}/evidence", task.id)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+
+    let mut log = String::new();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("DEVELOPMENT_LOG.md").unwrap(),
+        &mut log,
+    )
+    .unwrap();
+    assert!(log.contains("Milestone 1 committed"), "{log}");
+    assert!(log.contains("a1b2c3d"), "{log}");
+    assert!(log.contains("feat(milestone-01)"), "{log}");
+
+    let mut jsonl = String::new();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("agent-session.jsonl").unwrap(),
+        &mut jsonl,
+    )
+    .unwrap();
+    let recorded = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["event"]["type"] == "milestone_commit_created")
+        .expect("the commit event should be in the JSONL");
+    assert_eq!(recorded["event"]["commit"]["short_sha"], "a1b2c3d");
+    // Safe metadata only: no workspace path, no remote, no credential.
+    assert!(!jsonl.contains("task-workspaces"), "workspace path leaked");
+    assert!(!jsonl.to_lowercase().contains("api_key"));
 
     std::fs::remove_dir_all(&root).ok();
 }

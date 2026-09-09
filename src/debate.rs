@@ -532,6 +532,7 @@ VERDICT: NEEDS_WORK"],
                     technology: Some(crate::technology::TechStack::Rust),
                     output: Some(crate::task::OutputTarget::ReviewableResult),
                     agents: None,
+                    git_mode: None,
                 },
                 selection,
             )

@@ -91,6 +91,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             worker_result_summary: None,
+            commit: None,
         }
     }
 

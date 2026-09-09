@@ -82,7 +82,7 @@ fn timeline_html(status: TaskStatus) -> String {
 
 /// Requirement 11: what this task actually runs, read from the task itself
 /// rather than from the current global defaults.
-fn agents_html(agents: &AgentSelection) -> String {
+fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode) -> String {
     let row = |role: &str, who: &str, model: &str| {
         format!(
             r#"<div class="agent"><span class="role">{role}</span><span class="who">{}</span><code>{}</code></div>"#,
@@ -90,8 +90,12 @@ fn agents_html(agents: &AgentSelection) -> String {
             esc(model)
         )
     };
+    let git_row = format!(
+        r#"<div class="agent"><span class="role">Git</span><span class="who">{}</span></div>"#,
+        esc(git_mode.label())
+    );
     format!(
-        r#"<div class="card"><h2 class="section">Agents</h2><div class="agents">{}{}{}</div></div>"#,
+        r#"<div class="card"><h2 class="section">Agents</h2><div class="agents">{}{}{}{}</div></div>"#,
         row(
             "Proposer",
             agents.proposer.provider.label(),
@@ -102,7 +106,9 @@ fn agents_html(agents: &AgentSelection) -> String {
             agents.critic.provider.label(),
             &agents.critic.model
         ),
-        row("Worker", agents.worker.tool.label(), &agents.worker.model)
+        row("Worker", agents.worker.tool.label(), &agents.worker.model),
+        // Task 0009: the run's Git behavior is part of what it actually did.
+        git_row
     )
 }
 
@@ -137,8 +143,19 @@ fn milestone_list_html(milestones: &[crate::milestone::Milestone]) -> String {
                 MilestoneStatus::Running => "active",
                 MilestoneStatus::Pending => "pending",
             };
+            let commit = milestone
+                .commit
+                .as_ref()
+                .map(|commit| {
+                    format!(
+                        r#"<div class="hint">Commit: <code>{}</code> · {}</div>"#,
+                        esc(&commit.short_sha),
+                        esc(&commit.message)
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                r#"<li><span class="milestone-status {class}">{}</span> <strong>{}. {}</strong><div class="hint">{}</div></li>"#,
+                r#"<li><span class="milestone-status {class}">{}</span> <strong>{}. {}</strong><div class="hint">{}</div>{commit}</li>"#,
                 milestone.status.label(),
                 milestone.order,
                 esc(&milestone.title),
@@ -475,6 +492,19 @@ fn event_html(
                 esc(reason)
             ),
         )),
+        TaskEvent::MilestoneCommitCreated {
+            order,
+            title,
+            commit,
+            ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice ok">Milestone {order} committed · {} · <code>{}</code></div>"#,
+                esc(title),
+                esc(&commit.short_sha)
+            ),
+        )),
         TaskEvent::Result { result } => {
             Some(("build", format!("<pre>{}</pre>", esc(&result.diff))))
         }
@@ -563,6 +593,7 @@ fn event_updates(
             | TaskEvent::MilestoneCompleted { .. }
             | TaskEvent::MilestoneFailed { .. }
             | TaskEvent::MilestoneCancelled { .. }
+            | TaskEvent::MilestoneCommitCreated { .. }
     ) {
         return vec![
             (name, html),
@@ -653,6 +684,10 @@ pub struct CreateForm {
     pub worker_tool: Option<String>,
     #[serde(default)]
     pub worker_model: Option<String>,
+    /// Whether verified milestones are committed (task 0009). An unset select
+    /// means the safe default: no commits.
+    #[serde(default)]
+    pub git_mode: Option<String>,
 }
 
 /// A browser submits an unset `<select>` as an empty string. That is "not
@@ -716,6 +751,13 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         Ok(agents) => agents,
         Err(error) => return error_fragment(&error),
     };
+    let git_mode = match chosen(&form.git_mode) {
+        None => None,
+        Some(value) => match crate::git::GitMode::from_id(value) {
+            Some(mode) => Some(mode),
+            None => return error_fragment(&format!("{value:?} is not a supported Git mode")),
+        },
+    };
     let request = TaskRequest {
         kind: form.kind,
         title: form.title,
@@ -724,6 +766,7 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         technology: form.technology,
         output: form.output,
         agents,
+        git_mode,
     };
     if let Err(error) = request.validate() {
         return error_fragment(&error);
@@ -803,7 +846,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .and_then(|project_id| state.projects.get(project_id))
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
-    let agents = agents_html(&task.agents);
+    let agents = agents_html(&task.agents, task.git_mode);
     Html(page_html(
         &task,
         &project_name,

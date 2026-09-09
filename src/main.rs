@@ -12,6 +12,7 @@ mod config;
 mod debate;
 mod evidence;
 mod execution_limits;
+mod git;
 mod implementer;
 mod inspection;
 mod milestone;

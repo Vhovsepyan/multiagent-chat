@@ -299,6 +299,16 @@ async fn run(
         .approved_spec(id)
         .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
     let milestones = plan_from_spec(&approved_spec, &commands).map_err(anyhow::Error::msg)?;
+    // Task 0009: when the run commits, the workspace repository must be in a
+    // state where an isolated commit is obviously safe. Checking once, before
+    // any worker starts, means a problem is reported instead of repaired.
+    if task.git_mode.commits_enabled() {
+        let repo = workspace_ref.path.clone();
+        let limits = state.config.execution.clone();
+        tokio::task::spawn_blocking(move || crate::git::ensure_commit_ready(&repo, &limits))
+            .await??;
+        emitter.notice("milestone commits enabled for this run");
+    }
     emitter.emit(TaskEvent::MilestonePlanCreated {
         milestones: milestones.clone(),
     });
@@ -419,6 +429,51 @@ async fn run(
                 },
             });
             bail!("one or more verification commands failed");
+        }
+        // A milestone is finalized only once its commit (when requested)
+        // exists: a failure here fails the milestone rather than passing it.
+        let commit = {
+            let repo = workspace_ref.path.clone();
+            let limits = state.config.execution.clone();
+            let mode = task.git_mode;
+            let planned = milestone.clone();
+            let results = verification.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::git::commit_milestone_if_enabled(mode, &repo, &planned, &results, &limits)
+            })
+            .await?
+            {
+                Ok(commit) => commit,
+                Err(error) => {
+                    let message = format!("milestone commit failed: {error:#}");
+                    emitter.emit(TaskEvent::MilestoneFailed {
+                        id: milestone.id,
+                        order: milestone.order,
+                        title: milestone.title,
+                        verification,
+                        worker_result_summary: Some(
+                            "Worker completed and verification passed; the commit failed.".into(),
+                        ),
+                        error: message.clone(),
+                    });
+                    bail!("{message}");
+                }
+            }
+        };
+        match commit {
+            Some(commit) => emitter.emit(TaskEvent::MilestoneCommitCreated {
+                id: milestone.id.clone(),
+                order: milestone.order,
+                title: milestone.title.clone(),
+                commit,
+            }),
+            None if task.git_mode.commits_enabled() => {
+                emitter.notice(format!(
+                    "milestone {} changed nothing; no commit was created",
+                    milestone.order
+                ));
+            }
+            None => {}
         }
         emitter.emit(TaskEvent::MilestoneCompleted {
             id: milestone.id,

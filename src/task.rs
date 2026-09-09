@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::agent::{AgentSelection, AgentSelectionRequest};
 use crate::evidence::{EvidencePayload, EvidenceRecord};
 use crate::execution_limits::{HistoryLimits, bounded_text};
+use crate::git::{GitMode, MilestoneCommit};
 use crate::milestone::{Milestone, MilestoneStatus};
 use crate::project::ProjectId;
 use crate::technology::{ProjectProfile, TechStack};
@@ -77,6 +78,10 @@ pub struct TaskRequest {
     /// defaults", which is what every pre-0005 client sends.
     #[serde(default)]
     pub agents: Option<AgentSelectionRequest>,
+    /// Whether verified milestones are committed (task 0009). Absent means the
+    /// previous behavior: no commits.
+    #[serde(default)]
+    pub git_mode: Option<GitMode>,
 }
 
 impl TaskRequest {
@@ -313,6 +318,14 @@ pub enum TaskEvent {
         title: String,
         reason: String,
     },
+    /// A verified milestone was recorded as one commit (task 0009). Carries
+    /// only milestone identity and commit metadata — never a path or remote.
+    MilestoneCommitCreated {
+        id: String,
+        order: u32,
+        title: String,
+        commit: MilestoneCommit,
+    },
 
     Inspection {
         profile: ProjectProfile,
@@ -522,6 +535,13 @@ impl TaskEvent {
                 clean(id);
                 clean(title);
                 clean(reason);
+            }
+            Self::MilestoneCommitCreated {
+                id, title, commit, ..
+            } => {
+                clean(id);
+                clean(title);
+                clean(&mut commit.message);
             }
             Self::Build { chunk } => clean(chunk),
             Self::Notice { message } | Self::Warning { message } => clean(message),
@@ -734,6 +754,8 @@ pub struct Task {
     pub decision: Option<Decision>,
     /// Ordered approved-spec execution plan and live milestone state.
     pub milestones: Vec<Milestone>,
+    /// The Git behavior chosen for this run, frozen at creation (task 0009).
+    pub git_mode: GitMode,
     #[serde(skip)]
     cancelled: bool,
 }
@@ -768,6 +790,7 @@ impl Task {
             error: None,
             decision: None,
             milestones: Vec::new(),
+            git_mode: GitMode::None,
             cancelled: false,
         }
     }
@@ -785,6 +808,7 @@ impl Task {
             technology: request.technology,
             output: request.output,
             agents,
+            git_mode: request.git_mode.unwrap_or_default(),
             profile: None,
             result: None,
             status: TaskStatus::Created,
@@ -887,6 +911,13 @@ impl Task {
                 if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
                     milestone.status = MilestoneStatus::Cancelled;
                     milestone.completed_at = Some(timestamp);
+                }
+            }
+            TaskEvent::MilestoneCommitCreated {
+                ref id, ref commit, ..
+            } => {
+                if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
+                    milestone.commit = Some(commit.clone());
                 }
             }
             _ => {}
@@ -1188,6 +1219,7 @@ impl TaskManager {
                 technology: Some(TechStack::Rust),
                 output: Some(OutputTarget::ReviewableResult),
                 agents: None,
+                git_mode: None,
             },
             AgentSelection::compiled_defaults(),
         )
@@ -2200,6 +2232,7 @@ mod tests {
             technology: Some(TechStack::Python),
             output: Some(OutputTarget::ReviewableResult),
             agents: None,
+            git_mode: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -2222,6 +2255,7 @@ mod tests {
                 technology: None,
                 output: None,
                 agents: None,
+                git_mode: None,
             };
             assert!(request.validate().is_ok());
             request.project_id = None;
@@ -2244,6 +2278,7 @@ mod tests {
             technology: Some(TechStack::Custom),
             output: Some(OutputTarget::ReviewableResult),
             agents: None,
+            git_mode: None,
         };
         assert!(request.validate().unwrap_err().contains("title"));
         let request = TaskRequest {

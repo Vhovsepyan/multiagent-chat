@@ -590,6 +590,19 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Reason: {}", markdown_inline(reason)),
             ],
         ),
+        TaskEvent::MilestoneCommitCreated {
+            id,
+            order,
+            title,
+            commit,
+        } => (
+            format!("Milestone {order} committed: {}", markdown_inline(title)),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(id)),
+                format!("Commit: `{}`", markdown_inline(&commit.short_sha)),
+                format!("Commit message: {}", markdown_inline(&commit.message)),
+            ],
+        ),
         TaskEvent::Result { .. } => ("Task result captured".into(), vec![]),
         TaskEvent::Finished { status, error } => {
             let mut details = vec![format!("Status: {}", status_label(*status))];
@@ -1070,6 +1083,7 @@ mod tests {
                     technology: Some(TechStack::Rust),
                     output: Some(OutputTarget::ReviewableResult),
                     agents: None,
+                    git_mode: None,
                 },
                 agents.clone(),
             )

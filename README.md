@@ -254,6 +254,38 @@ Cancellation preserves completed milestones and prevents future milestones
 from starting. Durable task cancellation controls and acceptance tracking are
 outside this milestone-execution task.
 
+### Milestone commits
+
+A task chooses its Git behavior at creation (`git_mode`, shown as **Git** in
+the form and on the task page):
+
+| Mode | Wire value | Behavior |
+| --- | --- | --- |
+| No commits (default) | `none` | Nothing is committed; the result stays a working-tree diff, exactly as before. |
+| Commit after each successful milestone | `commit_per_milestone` | One commit per milestone that both implemented and verified cleanly. |
+
+Commits are created inside the disposable task workspace only. **Nothing is
+pushed, no remote is configured, and no history is rewritten.** A commit is
+made only after the milestone's verification passes, with a deterministic
+subject such as `feat(milestone-03): Capacity-safe registration`, and the SHA,
+short SHA and message are stored on the milestone, shown in task details, and
+published as a `milestone_commit_created` audit/evidence event.
+
+Before the first milestone runs, an enabled run checks that committing can be
+isolated and stops with an explanation if it cannot: the workspace must be its
+own repository (never one nested in another), on a branch rather than a
+detached HEAD, without a merge or rebase in progress, and with no uncommitted
+changes the run did not create. A New Project workspace that is not yet a
+repository is initialized explicitly, with no remote. Nothing is reset,
+cleaned, or discarded in any of these cases. If a requested commit fails, the
+milestone is recorded as failed with that error, later milestones do not run,
+and the changes are captured in the task result.
+
+Generated commits use a fixed `multiagent-chat <multiagent-chat@localhost>`
+identity passed per command, so global Git configuration is never modified, and
+signing is disabled for that command because headless execution cannot answer a
+passphrase prompt.
+
 ## Agent selection
 
 Three roles are configured independently per task:
@@ -349,7 +381,8 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
   models, and the default selection. Names only; never credentials.
 - `GET /api/projects` — registered Projects.
 - `POST /api/projects` — register a GitHub Project.
-- `POST /api/tasks` — create a typed task, optionally with an `agents` selection.
+- `POST /api/tasks` — create a typed task, optionally with an `agents` selection
+  and a `git_mode` (`none` or `commit_per_milestone`).
 - `GET /api/tasks/{id}` — task snapshot, append-only audit `history`, and the
   bounded `log_tail`; every entry has sequence/timestamp/event fields.
 - `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
