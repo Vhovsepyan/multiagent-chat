@@ -20,6 +20,21 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-21 (2026-09-09, task 0005): agent choice is per task, not per process. A
+  `TaskRequest` may carry an `agents` block; `AgentCatalogue` (built once from
+  `Config`) validates it and returns an `AgentSelection` that is stored on the
+  `Task` and never re-read from the environment afterwards, so a run stays
+  reproducible when `.env` changes. Two enums — `ChatProvider` (proposer,
+  critic) and `CodingTool` (worker) — replace 0004 `ProviderId`, which makes an
+  invalid pairing unrepresentable instead of a runtime error; the worker keeps
+  tool and model as separate values. Unset fields fall back to the configured
+  defaults; a set-but-unknown provider/model/tool is refused with a 400 and the
+  task is not created — never silently substituted. `GET /api/agents` exposes
+  only ids, labels, model names and defaults. An HTML form is flat, so the UI
+  sends six scalar fields and `ui::create` maps them, treating an empty select
+  as "not chosen" while the JSON API still rejects an explicitly empty model.
+  `TaskEvent::AgentsSelected` publishes role/provider/model once per run for the
+  audit trail (task 0006 builds on it).
 - DP-20 (2026-09-09, task 0004): orchestration depends on agent ROLES, not
   vendors. `src/agent/` holds two traits — `ChatAgent` (Proposer/Critic) and
   `CodingAgent` (Worker) — because a conversational agent and a process that

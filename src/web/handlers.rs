@@ -12,6 +12,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::agent::{AgentSelection, ChatProvider, CodingTool, ModelOptions};
 use crate::project::{Project, ProjectSource};
 use crate::task::{Decision, Task, TaskId, TaskRequest, TaskStatus};
 use crate::web::{AppState, pipeline};
@@ -109,6 +110,32 @@ pub async fn list_projects(State(state): State<AppState>) -> ApiResult<Json<Proj
     }))
 }
 
+/// The safe view of agent configuration (task 0005, requirement 10).
+///
+/// Names only: no keys, no credentials, no raw config. Everything here is
+/// already public knowledge for anyone who can open the task form.
+#[derive(Serialize)]
+pub struct AgentOptions {
+    pub chat_providers: Vec<ModelOptions>,
+    pub coding_tools: Vec<ModelOptions>,
+    pub defaults: AgentSelection,
+}
+
+/// `GET /api/agents` — what the task form may offer.
+pub async fn agent_options(State(state): State<AppState>) -> Json<AgentOptions> {
+    Json(AgentOptions {
+        chat_providers: ChatProvider::ALL
+            .iter()
+            .map(|provider| state.catalogue.chat_models(*provider).clone())
+            .collect(),
+        coding_tools: CodingTool::ALL
+            .iter()
+            .map(|tool| state.catalogue.coding_models(*tool).clone())
+            .collect(),
+        defaults: state.catalogue.defaults(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterProject {
     pub name: String,
@@ -157,9 +184,16 @@ pub async fn create_task(
         return Err(ApiError::bad_request("project is not registered"));
     }
 
+    // Task 0005: resolve and freeze the agent selection before the task exists,
+    // so an invalid combination is a 400 rather than a task that fails later.
+    let agents = state
+        .catalogue
+        .resolve(body.request.agents.as_ref())
+        .map_err(ApiError::bad_request)?;
+
     let task = state
         .manager
-        .create_from_request(body.request)
+        .create_from_request(body.request, agents)
         .map_err(ApiError::bad_request)?;
 
     pipeline::spawn(state.clone(), task.id);

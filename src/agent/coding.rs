@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::agent::ProviderId;
+use crate::agent::CodingTool;
 use crate::task::Emitter;
 
 /// One implementation job.
@@ -32,7 +32,7 @@ pub struct CodingTaskRequest<'a> {
 /// task, and fields nothing fills in would only be misleading.
 #[derive(Debug, Clone)]
 pub struct CodingTaskResult {
-    pub provider: ProviderId,
+    pub tool: CodingTool,
     pub model: String,
 }
 
@@ -42,8 +42,8 @@ pub struct CodingTaskResult {
 /// value, so a long build still reaches the browser line by line.
 #[async_trait]
 pub trait CodingAgent: Send + Sync {
-    /// Who is behind this agent.
-    fn provider(&self) -> ProviderId;
+    /// Which tool this agent runs.
+    fn tool(&self) -> CodingTool;
 
     /// The model it implements with.
     fn model(&self) -> &str;

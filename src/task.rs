@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
+use crate::agent::{AgentSelection, AgentSelectionRequest};
 use crate::execution_limits::{HistoryLimits, bounded_text};
 use crate::project::ProjectId;
 use crate::technology::{ProjectProfile, TechStack};
@@ -69,6 +70,10 @@ pub struct TaskRequest {
     pub technology: Option<TechStack>,
     #[serde(default)]
     pub output: Option<OutputTarget>,
+    /// Per-role agent choice (task 0005). Absent means "the configured
+    /// defaults", which is what every pre-0005 client sends.
+    #[serde(default)]
+    pub agents: Option<AgentSelectionRequest>,
 }
 
 impl TaskRequest {
@@ -207,6 +212,12 @@ pub enum TaskEvent {
         markdown: String,
     },
 
+    /// The agents this run will use, published once before the debate starts
+    /// so the event stream carries role/provider/model too (task 0005).
+    AgentsSelected {
+        agents: AgentSelection,
+    },
+
     Inspection {
         profile: ProjectProfile,
         source_revision: Option<String>,
@@ -309,6 +320,9 @@ pub struct Task {
     pub project_id: Option<ProjectId>,
     pub technology: Option<TechStack>,
     pub output: Option<OutputTarget>,
+    /// The agents this run uses, resolved once at creation and never re-read
+    /// from the environment afterwards (task 0005).
+    pub agents: AgentSelection,
     pub profile: Option<ProjectProfile>,
     pub result: Option<TaskResult>,
     pub status: TaskStatus,
@@ -338,6 +352,7 @@ impl Task {
             project_id: None,
             technology: Some(TechStack::Rust),
             output: Some(OutputTarget::ReviewableResult),
+            agents: AgentSelection::compiled_defaults(),
             profile: None,
             result: None,
             status: TaskStatus::Created,
@@ -350,7 +365,9 @@ impl Task {
         }
     }
 
-    pub fn from_request(request: TaskRequest) -> Result<Self, String> {
+    /// `agents` is resolved by the caller against the `AgentCatalogue`, so the
+    /// domain never has to reach for the environment (task 0005).
+    pub fn from_request(request: TaskRequest, agents: AgentSelection) -> Result<Self, String> {
         request.validate()?;
         Ok(Task {
             id: Uuid::new_v4(),
@@ -360,6 +377,7 @@ impl Task {
             project_id: request.project_id,
             technology: request.technology,
             output: request.output,
+            agents,
             profile: None,
             result: None,
             status: TaskStatus::Created,
@@ -564,24 +582,34 @@ impl TaskManager {
         _project: impl Into<String>,
     ) -> Task {
         let description = description.into();
-        let task = Task::from_request(TaskRequest {
-            kind: TaskKind::NewProject,
-            title: title.into(),
-            description: if description.trim().is_empty() {
-                "Legacy task".into()
-            } else {
-                description
+        let task = Task::from_request(
+            TaskRequest {
+                kind: TaskKind::NewProject,
+                title: title.into(),
+                description: if description.trim().is_empty() {
+                    "Legacy task".into()
+                } else {
+                    description
+                },
+                project_id: None,
+                technology: Some(TechStack::Rust),
+                output: Some(OutputTarget::ReviewableResult),
+                agents: None,
             },
-            project_id: None,
-            technology: Some(TechStack::Rust),
-            output: Some(OutputTarget::ReviewableResult),
-        })
+            AgentSelection::compiled_defaults(),
+        )
         .expect("legacy task input is valid");
         self.insert(task)
     }
 
-    pub fn create_from_request(&self, request: TaskRequest) -> Result<Task, String> {
-        let task = Task::from_request(request)?;
+    /// `agents` comes from `AgentCatalogue::resolve`, so the stored task is
+    /// already frozen against later configuration changes (task 0005).
+    pub fn create_from_request(
+        &self,
+        request: TaskRequest,
+        agents: AgentSelection,
+    ) -> Result<Task, String> {
+        let task = Task::from_request(request, agents)?;
         Ok(self.insert(task))
     }
 
@@ -1227,6 +1255,7 @@ mod tests {
             project_id: None,
             technology: Some(TechStack::Python),
             output: Some(OutputTarget::ReviewableResult),
+            agents: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -1248,6 +1277,7 @@ mod tests {
                 project_id: Some(Uuid::new_v4()),
                 technology: None,
                 output: None,
+                agents: None,
             };
             assert!(request.validate().is_ok());
             request.project_id = None;
@@ -1269,6 +1299,7 @@ mod tests {
             project_id: None,
             technology: Some(TechStack::Custom),
             output: Some(OutputTarget::ReviewableResult),
+            agents: None,
         };
         assert!(request.validate().unwrap_err().contains("title"));
         let request = TaskRequest {

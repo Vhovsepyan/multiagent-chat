@@ -62,6 +62,34 @@
       <textarea id="description" name="description" required
                 placeholder="Describe the required behavior, constraints, and acceptance expectations."></textarea>
 
+      <!-- Agent selection (task 0005). The options come from /api/agents, so no
+           model name is hard-coded here. -->
+      <h3 class="section agents-title">Agents</h3>
+      <div id="agent-selection" class="agents-form">
+        <div class="agent-row">
+          <label for="proposer_provider">Proposer</label>
+          <div class="row">
+            <select id="proposer_provider" name="proposer_provider" data-role="proposer"></select>
+            <select id="proposer_model" name="proposer_model"></select>
+          </div>
+        </div>
+        <div class="agent-row">
+          <label for="critic_provider">Critic</label>
+          <div class="row">
+            <select id="critic_provider" name="critic_provider" data-role="critic"></select>
+            <select id="critic_model" name="critic_model"></select>
+          </div>
+        </div>
+        <div class="agent-row">
+          <label for="worker_tool">Worker</label>
+          <div class="row">
+            <select id="worker_tool" name="worker_tool" data-role="worker"></select>
+            <select id="worker_model" name="worker_model"></select>
+          </div>
+        </div>
+      </div>
+      <div class="hint" id="agent-hint">Leave these as they are to use the configured defaults.</div>
+
       <button type="submit">Start collaboration</button>
       <div id="create-error"></div>
     </form>
@@ -78,6 +106,109 @@
       document.getElementById('output').disabled = !isNew;
     }
     syncTaskFields();
+
+    // --- agent selectors (task 0005) ---------------------------------------
+    // The three roles are independent: each has its own provider/tool select
+    // and its own model select, and the model list always follows the provider.
+    const AGENT_ROLES = [
+      { role: 'proposer', selector: 'proposer_provider', models: 'proposer_model' },
+      { role: 'critic', selector: 'critic_provider', models: 'critic_model' },
+      { role: 'worker', selector: 'worker_tool', models: 'worker_model' }
+    ];
+    let agentOptions = null;
+
+    function providersFor(role) {
+      if (!agentOptions) return [];
+      return role === 'worker' ? agentOptions.coding_tools : agentOptions.chat_providers;
+    }
+
+    function providerEntry(role, id) {
+      return providersFor(role).find(function (entry) { return entry.id === id; }) || null;
+    }
+
+    function defaultFor(role) {
+      if (!agentOptions) return null;
+      const chosen = agentOptions.defaults[role];
+      return {
+        id: role === 'worker' ? chosen.tool : chosen.provider,
+        model: chosen.model
+      };
+    }
+
+    function fill(select, values, selected) {
+      select.innerHTML = '';
+      values.forEach(function (value) {
+        const option = document.createElement('option');
+        option.value = value.id;
+        option.textContent = value.label;
+        select.appendChild(option);
+      });
+      if (selected !== null && values.some(function (v) { return v.id === selected; })) {
+        select.value = selected;
+      }
+    }
+
+    // Rebuilding the model list drops any selection the new provider does not
+    // offer, so a stale model can never be submitted (requirement 9).
+    function syncModels(config, keep) {
+      const providerSelect = document.getElementById(config.selector);
+      const modelSelect = document.getElementById(config.models);
+      const entry = providerEntry(config.role, providerSelect.value);
+      if (!entry) {
+        modelSelect.innerHTML = '';
+        return;
+      }
+      const previous = keep ? modelSelect.value : null;
+      const models = entry.models.map(function (model) { return { id: model, label: model }; });
+      const wanted = models.some(function (m) { return m.id === previous; })
+        ? previous
+        : entry.default_model;
+      fill(modelSelect, models, wanted);
+    }
+
+    function renderAgents() {
+      AGENT_ROLES.forEach(function (config) {
+        const providerSelect = document.getElementById(config.selector);
+        const chosen = defaultFor(config.role);
+        fill(providerSelect, providersFor(config.role), chosen ? chosen.id : null);
+        syncModels(config, false);
+        if (chosen) {
+          const modelSelect = document.getElementById(config.models);
+          if (entryHasModel(config.role, providerSelect.value, chosen.model)) {
+            modelSelect.value = chosen.model;
+          }
+        }
+        providerSelect.onchange = function () { syncModels(config, true); };
+      });
+    }
+
+    function entryHasModel(role, providerId, model) {
+      const entry = providerEntry(role, providerId);
+      return !!entry && entry.models.indexOf(model) !== -1;
+    }
+
+    function disableAgents(message) {
+      AGENT_ROLES.forEach(function (config) {
+        document.getElementById(config.selector).disabled = true;
+        document.getElementById(config.models).disabled = true;
+      });
+      document.getElementById('agent-hint').textContent = message;
+    }
+
+    fetch('/api/agents')
+      .then(function (response) {
+        if (!response.ok) throw new Error('agent options unavailable');
+        return response.json();
+      })
+      .then(function (options) {
+        agentOptions = options;
+        renderAgents();
+      })
+      .catch(function () {
+        // Never block task creation on this: an unreachable options endpoint
+        // just means the server-side defaults are used.
+        disableAgents('Agent options are unavailable — the configured defaults will be used.');
+      });
   </script>
 </body>
 </html>

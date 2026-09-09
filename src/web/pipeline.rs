@@ -143,6 +143,14 @@ async fn run(
         None => return Ok(()),
     };
 
+    // Task 0005: the run uses the selection frozen on the task, and it is
+    // resolved BEFORE any workspace or API work so an unavailable provider
+    // fails immediately instead of half-way through a build.
+    let agents = crate::agent::resolve(&task.agents, &state.config)?;
+    emitter.emit(TaskEvent::AgentsSelected {
+        agents: task.agents.clone(),
+    });
+
     let project = match task.project_id {
         Some(project_id) => Some(
             state
@@ -208,13 +216,10 @@ async fn run(
         task.topic(),
         crate::workflow::design_context(task.kind, &profile, &repository_context)
     );
-    let proposer = crate::agent::default_proposer(&state.config)?;
-    let critic = crate::agent::default_critic(&state.config)?;
-
     emitter.status(TaskStatus::Debating);
     let outcome = crate::debate::run(
-        proposer.as_ref(),
-        critic.as_ref(),
+        agents.proposer.as_ref(),
+        agents.critic.as_ref(),
         &topic,
         state.config.max_rounds,
         emitter,
@@ -223,8 +228,8 @@ async fn run(
 
     emitter.status(TaskStatus::GeneratingSpec);
     let document = spec::build(
-        proposer.as_ref(),
-        critic.as_ref(),
+        agents.proposer.as_ref(),
+        agents.critic.as_ref(),
         &outcome.transcript,
         outcome.approved,
         emitter,
@@ -263,8 +268,8 @@ async fn run(
 
     emitter.status(TaskStatus::Implementing);
     let prompt = crate::workflow::implementation_prompt(task.kind, &profile);
-    let worker = crate::agent::default_worker(&state.config)?;
-    worker
+    agents
+        .worker
         .execute(
             CodingTaskRequest {
                 workspace: &workspace_ref.path,

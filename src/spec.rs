@@ -195,7 +195,7 @@ fn strip_code_fence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ProviderId;
+    use crate::agent::ChatProvider;
     use crate::agent::chat::ScriptedAgent;
     use crate::debate::{Speaker, Transcript};
 
@@ -206,12 +206,12 @@ mod tests {
     #[tokio::test]
     async fn the_critics_corrected_draft_is_the_result() {
         let proposer = ScriptedAgent::new(
-            ProviderId::Gemini,
+            ChatProvider::Gemini,
             &["## Problem
 drafted"],
         );
         let critic = ScriptedAgent::new(
-            ProviderId::Anthropic,
+            ChatProvider::Anthropic,
             &["```markdown
 ## Problem
 corrected
@@ -240,8 +240,8 @@ corrected"
     /// in the document, or the implementer builds a design nobody agreed to.
     #[tokio::test]
     async fn an_unapproved_debate_demands_open_risks() {
-        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft"]);
-        let critic = ScriptedAgent::new(ProviderId::Anthropic, &["checked"]);
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["draft"]);
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &["checked"]);
 
         build(
             &proposer,

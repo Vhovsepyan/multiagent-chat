@@ -314,7 +314,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ProviderId;
+    use crate::agent::ChatProvider;
     use crate::agent::chat::ScriptedAgent;
     use crate::api::Role;
 
@@ -324,9 +324,9 @@ mod tests {
     /// network, and no vendor type in sight.
     #[tokio::test]
     async fn runs_to_approval_against_any_chat_agent() {
-        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["a concrete plan"]);
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["a concrete plan"]);
         let critic = ScriptedAgent::new(
-            ProviderId::Anthropic,
+            ChatProvider::Anthropic,
             &["Good enough.
 
 REASON: the plan is buildable
@@ -350,9 +350,9 @@ VERDICT: APPROVED"],
     /// what proves the two agents share one transcript (DP-1).
     #[tokio::test]
     async fn feeds_a_rejected_proposal_back_to_the_proposer() {
-        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft one", "draft two"]);
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["draft one", "draft two"]);
         let critic = ScriptedAgent::new(
-            ProviderId::Anthropic,
+            ChatProvider::Anthropic,
             &[
                 "REASON: the schema is wrong
 VERDICT: NEEDS_WORK",
@@ -381,9 +381,9 @@ VERDICT: APPROVED",
     /// Gate 1 returns either way; running out of rounds is not an error.
     #[tokio::test]
     async fn stops_unapproved_when_the_rounds_run_out() {
-        let proposer = ScriptedAgent::new(ProviderId::Gemini, &["draft"]);
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["draft"]);
         let critic = ScriptedAgent::new(
-            ProviderId::Anthropic,
+            ChatProvider::Anthropic,
             &["REASON: still unsafe
 VERDICT: NEEDS_WORK"],
         );

@@ -12,6 +12,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::agent::{
+    AgentSelection, AgentSelectionRequest, ChatAgentRequest, ChatProvider, CodingAgentRequest,
+    CodingTool,
+};
 use crate::project::{Project, ProjectSource};
 use crate::task::{
     Decision, OutputTarget, Task, TaskEvent, TaskId, TaskKind, TaskRequest, TaskStatus,
@@ -70,6 +74,32 @@ fn timeline_html(status: TaskStatus) -> String {
     html
 }
 
+/// Requirement 11: what this task actually runs, read from the task itself
+/// rather than from the current global defaults.
+fn agents_html(agents: &AgentSelection) -> String {
+    let row = |role: &str, who: &str, model: &str| {
+        format!(
+            r#"<div class="agent"><span class="role">{role}</span><span class="who">{}</span><code>{}</code></div>"#,
+            esc(who),
+            esc(model)
+        )
+    };
+    format!(
+        r#"<div class="card"><h2 class="section">Agents</h2><div class="agents">{}{}{}</div></div>"#,
+        row(
+            "Proposer",
+            agents.proposer.provider.label(),
+            &agents.proposer.model
+        ),
+        row(
+            "Critic",
+            agents.critic.provider.label(),
+            &agents.critic.model
+        ),
+        row("Worker", agents.worker.tool.label(), &agents.worker.model)
+    )
+}
+
 fn gate_html(id: TaskId, spec: &str) -> String {
     format!(
         r#"<div class="card"><h2 class="section">Specification — your call</h2>
@@ -83,7 +113,11 @@ fn gate_html(id: TaskId, spec: &str) -> String {
     )
 }
 
-fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
+fn event_html(
+    id: TaskId,
+    event: &TaskEvent,
+    agents: &AgentSelection,
+) -> Option<(&'static str, String)> {
     match event {
         TaskEvent::Status { status } => Some(("status", timeline_html(*status))),
         TaskEvent::RoundStarted { round, of } => Some((
@@ -93,7 +127,8 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
         TaskEvent::Proposal { text, .. } => Some((
             "debate",
             format!(
-                r#"<div class="turn proposer"><h3>Proposer · Gemini</h3><pre>{}</pre></div>"#,
+                r#"<div class="turn proposer"><h3>Proposer · {}</h3><pre>{}</pre></div>"#,
+                esc(agents.proposer.provider.label()),
                 esc(text)
             ),
         )),
@@ -120,7 +155,8 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
             Some((
                 "debate",
                 format!(
-                    r#"<div class="turn critic"><h3>Critic · Claude</h3><pre>{}</pre>{badge}</div>"#,
+                    r#"<div class="turn critic"><h3>Critic · {}</h3><pre>{}</pre>{badge}</div>"#,
+                    esc(agents.critic.provider.label()),
                     esc(text)
                 ),
             ))
@@ -131,6 +167,27 @@ fn event_html(id: TaskId, event: &TaskEvent) -> Option<(&'static str, String)> {
             format!(
                 r#"<div class="card"><h2 class="section">Specification</h2><div class="spec-body">{}</div></div>"#,
                 esc(markdown)
+            ),
+        )),
+        TaskEvent::AgentsSelected { agents } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice">Agents · Proposer {} · Critic {} · Worker {}</div>"#,
+                esc(&format!(
+                    "{} {}",
+                    agents.proposer.provider.label(),
+                    agents.proposer.model
+                )),
+                esc(&format!(
+                    "{} {}",
+                    agents.critic.provider.label(),
+                    agents.critic.model
+                )),
+                esc(&format!(
+                    "{} {}",
+                    agents.worker.tool.label(),
+                    agents.worker.model
+                ))
             ),
         )),
         TaskEvent::Inspection {
@@ -195,8 +252,9 @@ fn event_updates(
     id: TaskId,
     event: &TaskEvent,
     current_spec: Option<&str>,
+    agents: &AgentSelection,
 ) -> Vec<(&'static str, String)> {
-    let Some((name, html)) = event_html(id, event) else {
+    let Some((name, html)) = event_html(id, event, agents) else {
         return Vec::new();
     };
     if let TaskEvent::Finished { status, .. } = event {
@@ -264,6 +322,8 @@ pub async fn register_project(
     }
 }
 
+/// HTML forms are flat, so the agent selection arrives as six separate fields
+/// rather than the nested `agents` object the JSON API takes (task 0005).
 #[derive(Debug, Deserialize)]
 pub struct CreateForm {
     pub kind: TaskKind,
@@ -275,9 +335,81 @@ pub struct CreateForm {
     pub technology: Option<TechStack>,
     #[serde(default)]
     pub output: Option<OutputTarget>,
+    #[serde(default)]
+    pub proposer_provider: Option<String>,
+    #[serde(default)]
+    pub proposer_model: Option<String>,
+    #[serde(default)]
+    pub critic_provider: Option<String>,
+    #[serde(default)]
+    pub critic_model: Option<String>,
+    #[serde(default)]
+    pub worker_tool: Option<String>,
+    #[serde(default)]
+    pub worker_model: Option<String>,
+}
+
+/// A browser submits an unset `<select>` as an empty string. That is "not
+/// chosen", not "chosen as empty", so it becomes `None` here and the catalogue
+/// fills in the default. The JSON API keeps the stricter reading, where an
+/// explicit empty model is an error.
+fn chosen(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+impl CreateForm {
+    fn agents(&self) -> Result<Option<AgentSelectionRequest>, String> {
+        let proposer_provider = parse_provider("proposer", chosen(&self.proposer_provider))?;
+        let critic_provider = parse_provider("critic", chosen(&self.critic_provider))?;
+        let worker_tool = match chosen(&self.worker_tool) {
+            None => None,
+            Some(value) => Some(
+                CodingTool::from_id(value)
+                    .ok_or_else(|| format!("{value:?} is not a supported worker tool"))?,
+            ),
+        };
+        let request = AgentSelectionRequest {
+            proposer: chat_request(proposer_provider, chosen(&self.proposer_model)),
+            critic: chat_request(critic_provider, chosen(&self.critic_model)),
+            worker: match (worker_tool, chosen(&self.worker_model)) {
+                (None, None) => None,
+                (tool, model) => Some(CodingAgentRequest {
+                    tool,
+                    model: model.map(str::to_string),
+                }),
+            },
+        };
+        Ok((!request.is_empty()).then_some(request))
+    }
+}
+
+fn parse_provider(role: &str, value: Option<&str>) -> Result<Option<ChatProvider>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) => ChatProvider::from_id(value)
+            .map(Some)
+            .ok_or_else(|| format!("{value:?} is not a supported {role} provider")),
+    }
+}
+
+fn chat_request(provider: Option<ChatProvider>, model: Option<&str>) -> Option<ChatAgentRequest> {
+    match (provider, model) {
+        (None, None) => None,
+        (provider, model) => Some(ChatAgentRequest {
+            provider,
+            model: model.map(str::to_string),
+        }),
+    }
 }
 
 pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>) -> Response {
+    let agents = match form.agents() {
+        Ok(agents) => agents,
+        Err(error) => return error_fragment(&error),
+    };
     let request = TaskRequest {
         kind: form.kind,
         title: form.title,
@@ -285,6 +417,7 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         project_id: form.project_id,
         technology: form.technology,
         output: form.output,
+        agents,
     };
     if let Err(error) = request.validate() {
         return error_fragment(&error);
@@ -294,7 +427,11 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
     {
         return error_fragment("Select a registered project.");
     }
-    let task = match state.manager.create_from_request(request) {
+    let agents = match state.catalogue.resolve(request.agents.as_ref()) {
+        Ok(agents) => agents,
+        Err(error) => return error_fragment(&error),
+    };
+    let task = match state.manager.create_from_request(request, agents) {
         Ok(task) => task,
         Err(error) => return error_fragment(&error),
     };
@@ -334,7 +471,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     };
     let mut done = String::new();
     for event in &task.history {
-        for (slot, html) in event_updates(id, event, task.spec.as_deref()) {
+        for (slot, html) in event_updates(id, event, task.spec.as_deref(), &task.agents) {
             match slot {
                 "debate" => debate.push_str(&html),
                 "spec" => spec = html,
@@ -352,9 +489,11 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .and_then(|project_id| state.projects.get(project_id))
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
+    let agents = agents_html(&task.agents);
     Html(page_html(
         &task,
         &project_name,
+        &agents,
         &debate,
         &spec,
         &build,
@@ -374,13 +513,14 @@ fn spec_readonly_html(spec: Option<&str>) -> String {
 fn page_html(
     task: &Task,
     project: &str,
+    agents: &str,
     debate: &str,
     spec: &str,
     build: &str,
     done: &str,
 ) -> String {
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div><div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
         id = task.id,
         title = esc(&task.title),
         kind = task.kind.label(),
@@ -398,10 +538,15 @@ pub async fn stream(
         let updates = match received {
             Ok((event_id, event)) if event_id == id => {
                 let task = manager.get(id);
+                let agents = task
+                    .as_ref()
+                    .map(|task| task.agents.clone())
+                    .unwrap_or_else(AgentSelection::compiled_defaults);
                 event_updates(
                     id,
                     &event,
                     task.as_ref().and_then(|task| task.spec.as_deref()),
+                    &agents,
                 )
             }
             Ok(_) => return None,

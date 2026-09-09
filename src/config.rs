@@ -24,10 +24,17 @@ pub struct Config {
     /// Production web tasks use repository-backed temporary workspaces.
     pub workspace_root: Option<PathBuf>,
     pub max_rounds: u32,
+    /// Default model for the Gemini provider.
     pub gemini_model: String,
+    /// Default model for the Anthropic provider.
     pub critic_model: String,
     /// Model Claude Code runs the implementation with.
     pub implementer_model: String,
+    /// Extra models offered per provider/tool in the task form (task 0005).
+    /// The default above is always offered as well, so these lists only add.
+    pub gemini_models: Vec<String>,
+    pub anthropic_models: Vec<String>,
+    pub claude_code_models: Vec<String>,
     /// Permission mode passed to Claude Code. See `implementer.rs` for why the
     /// default is the permissive one.
     pub permission_mode: String,
@@ -37,9 +44,9 @@ pub struct Config {
 
 /// Defaults used when the variable is missing from `.env`.
 const DEFAULT_MAX_ROUNDS: u32 = 5;
-const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
-const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
+pub const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const DEFAULT_PORT: u16 = 3000;
 
@@ -104,10 +111,32 @@ impl Config {
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
             implementer_model: optional("IMPLEMENTER_MODEL", DEFAULT_IMPLEMENTER_MODEL),
+            gemini_models: model_list("GEMINI_MODELS"),
+            anthropic_models: model_list("ANTHROPIC_MODELS"),
+            claude_code_models: model_list("CLAUDE_CODE_MODELS"),
             permission_mode: optional("CLAUDE_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
             port,
         })
     }
+}
+
+/// A comma-separated list of model names, e.g. `GEMINI_MODELS=a,b,c`.
+///
+/// Blank entries are dropped rather than becoming an unselectable empty model.
+/// The provider default is added by the catalogue, so an unset variable simply
+/// means "one model, the configured default" (task 0005).
+fn model_list(name: &str) -> Vec<String> {
+    let Ok(raw) = env::var(name) else {
+        return Vec::new();
+    };
+    let mut models: Vec<String> = Vec::new();
+    for model in raw.split(',') {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|known| known == model) {
+            models.push(model.to_string());
+        }
+    }
+    models
 }
 
 /// A variable the app cannot run without.

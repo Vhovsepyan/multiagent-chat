@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::agent::ProviderId;
+use crate::agent::ChatProvider;
 use crate::api::Message;
 
 /// One request to a chat agent.
@@ -31,7 +31,7 @@ impl<'a> ChatRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub text: String,
-    pub provider: ProviderId,
+    pub provider: ChatProvider,
     pub model: String,
 }
 
@@ -44,7 +44,7 @@ pub struct ChatResponse {
 #[async_trait]
 pub trait ChatAgent: Send + Sync {
     /// Who is behind this agent.
-    fn provider(&self) -> ProviderId;
+    fn provider(&self) -> ChatProvider;
 
     /// The model this agent will answer with.
     fn model(&self) -> &str;
@@ -72,7 +72,7 @@ pub trait ChatAgent: Send + Sync {
 /// tested end to end with no API key and no network.
 #[cfg(test)]
 pub struct ScriptedAgent {
-    provider: ProviderId,
+    provider: ChatProvider,
     model: String,
     replies: std::sync::Mutex<std::collections::VecDeque<String>>,
     seen: std::sync::Mutex<Vec<(Option<String>, Vec<Message>)>>,
@@ -80,7 +80,7 @@ pub struct ScriptedAgent {
 
 #[cfg(test)]
 impl ScriptedAgent {
-    pub fn new(provider: ProviderId, replies: &[&str]) -> Self {
+    pub fn new(provider: ChatProvider, replies: &[&str]) -> Self {
         ScriptedAgent {
             provider,
             model: format!("{provider}-test"),
@@ -103,7 +103,7 @@ impl ScriptedAgent {
 #[cfg(test)]
 #[async_trait]
 impl ChatAgent for ScriptedAgent {
-    fn provider(&self) -> ProviderId {
+    fn provider(&self) -> ChatProvider {
         self.provider
     }
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_scripted_agent_answers_in_order_and_reports_itself() {
-        let agent = ScriptedAgent::new(ProviderId::Gemini, &["first", "second"]);
+        let agent = ScriptedAgent::new(ChatProvider::Gemini, &["first", "second"]);
         let messages = vec![Message::user("hello")];
 
         let response = agent
@@ -145,7 +145,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.text, "first");
-        assert_eq!(response.provider, ProviderId::Gemini);
+        assert_eq!(response.provider, ChatProvider::Gemini);
         assert_eq!(response.model, agent.model());
 
         assert_eq!(
@@ -159,7 +159,7 @@ mod tests {
     /// `complete_text` must go through `complete`, not around it.
     #[tokio::test]
     async fn the_text_helper_records_the_same_call() {
-        let agent = ScriptedAgent::new(ProviderId::Anthropic, &["ok"]);
+        let agent = ScriptedAgent::new(ChatProvider::Anthropic, &["ok"]);
         let messages = vec![Message::user("q")];
 
         agent
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exhausted_script_fails_rather_than_inventing_an_answer() {
-        let agent = ScriptedAgent::new(ProviderId::Gemini, &[]);
+        let agent = ScriptedAgent::new(ChatProvider::Gemini, &[]);
 
         let error = agent
             .complete_text(None, &[Message::user("q")])

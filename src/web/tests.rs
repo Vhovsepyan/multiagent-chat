@@ -31,8 +31,11 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         workspace_root: Some(root.clone()),
         max_rounds: 1,
         gemini_model: "test-model".into(),
-        critic_model: "test-model".into(),
-        implementer_model: "test-model".into(),
+        critic_model: "test-critic-model".into(),
+        implementer_model: "test-worker-model".into(),
+        gemini_models: vec!["test-model-fast".into()],
+        anthropic_models: Vec::new(),
+        claude_code_models: Vec::new(),
         permission_mode: "acceptEdits".into(),
         port: 0,
     };
@@ -949,5 +952,346 @@ async fn failed_finished_event_replaces_the_live_implementing_status() {
     assert!(output.contains(r#"id="done" hx-swap-oob="innerHTML""#));
     assert!(output.contains("Failed: verification failed"));
     assert!(!output.contains(r#"class="step active">Build"#));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Task 0005: per-task agent and model selection
+// ---------------------------------------------------------------------------
+
+/// A state whose credentials are unmistakable, so a leak into a response body
+/// cannot hide behind a word that appears in normal output.
+fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("mac-web-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        execution: Default::default(),
+        gemini_api_key: "gemini-credential-must-not-leak".into(),
+        anthropic_api_key: "anthropic-credential-must-not-leak".into(),
+        workspace_root: Some(root.clone()),
+        max_rounds: 1,
+        gemini_model: "test-model".into(),
+        critic_model: "test-critic-model".into(),
+        implementer_model: "test-worker-model".into(),
+        gemini_models: vec!["test-model-fast".into()],
+        anthropic_models: Vec::new(),
+        claude_code_models: Vec::new(),
+        permission_mode: "acceptEdits".into(),
+        port: 0,
+    };
+    let provider = LocalWorkspaceProvider::new(root.join("task-workspaces")).unwrap();
+    (
+        AppState::with_workspace(config, std::sync::Arc::new(provider)),
+        root,
+    )
+}
+
+/// Required test 10: the options endpoint is the browser's only view of agent
+/// configuration, so it must carry names and nothing else.
+#[tokio::test]
+async fn agent_options_expose_models_but_never_credentials() {
+    let (state, root) = secret_state("agent-options");
+
+    let response = router(state).oneshot(get("/api/agents")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(!body.contains("credential"), "credentials leaked: {body}");
+    assert!(!body.to_lowercase().contains("api_key"));
+    assert!(!body.contains("permission_mode"));
+    assert!(!body.contains("workspace_root"));
+
+    let options: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(options["chat_providers"][0]["id"], "gemini");
+    assert_eq!(options["chat_providers"][1]["id"], "anthropic");
+    assert_eq!(options["coding_tools"][0]["id"], "claude_code");
+    // The configured default is always offered, plus any extra models.
+    assert_eq!(
+        options["chat_providers"][0]["models"],
+        json!(["test-model", "test-model-fast"])
+    );
+    assert_eq!(options["chat_providers"][0]["default_model"], "test-model");
+    assert_eq!(options["defaults"]["proposer"]["provider"], "gemini");
+    assert_eq!(options["defaults"]["critic"]["provider"], "anthropic");
+    assert_eq!(options["defaults"]["worker"]["tool"], "claude_code");
+    assert_eq!(options["defaults"]["worker"]["model"], "test-worker-model");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Required tests 2-4: an explicit choice for each role is stored on the task.
+#[tokio::test]
+async fn creating_a_task_stores_the_selected_agents_per_role() {
+    let (state, root) = test_state("agent-select");
+
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "agents": {
+                    "proposer": {"provider": "gemini", "model": "test-model-fast"},
+                    "critic": {"provider": "gemini", "model": "test-model"},
+                    "worker": {"tool": "claude_code", "model": "test-worker-model"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["agents"]["proposer"]["provider"], "gemini");
+    assert_eq!(task["agents"]["proposer"]["model"], "test-model-fast");
+    // Both chat roles may run on one provider with different models.
+    assert_eq!(task["agents"]["critic"]["provider"], "gemini");
+    assert_eq!(task["agents"]["critic"]["model"], "test-model");
+    assert_eq!(task["agents"]["worker"]["tool"], "claude_code");
+
+    let id: crate::task::TaskId = task["id"].as_str().unwrap().parse().unwrap();
+    let stored = state.manager.get(id).unwrap();
+    assert_eq!(stored.agents.proposer.model, "test-model-fast");
+    assert_eq!(stored.agents.critic.model, "test-model");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Requirement 5: a request that says nothing about agents behaves exactly as
+/// it did before this feature existed.
+#[tokio::test]
+async fn a_request_without_agents_uses_the_configured_defaults() {
+    let (state, root) = test_state("agent-default");
+
+    let response = router(state)
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["agents"]["proposer"]["provider"], "gemini");
+    assert_eq!(task["agents"]["proposer"]["model"], "test-model");
+    assert_eq!(task["agents"]["critic"]["provider"], "anthropic");
+    assert_eq!(task["agents"]["critic"]["model"], "test-critic-model");
+    assert_eq!(task["agents"]["worker"]["model"], "test-worker-model");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Required tests 5-8: every invalid combination is refused, and none of them
+/// is quietly replaced by something that would have worked.
+#[tokio::test]
+async fn invalid_agent_selections_are_rejected_rather_than_substituted() {
+    let base = json!({
+        "kind": "new_project",
+        "title": "Renamer",
+        "description": "search and replace",
+        "technology": "rust",
+        "output": "reviewable_result"
+    });
+    let cases = [
+        // 5: a provider this build does not serve.
+        (
+            "unknown-provider",
+            json!({"proposer": {"provider": "openai"}}),
+        ),
+        // 7: a worker tool this build does not serve (Codex is task 0015).
+        ("unknown-tool", json!({"worker": {"tool": "codex"}})),
+        // 6: a model configured for a different provider.
+        (
+            "wrong-provider-model",
+            json!({"proposer": {"provider": "gemini", "model": "test-critic-model"}}),
+        ),
+        // 6: a model no provider offers.
+        (
+            "unknown-model",
+            json!({"critic": {"provider": "anthropic", "model": "claude-imaginary"}}),
+        ),
+        // 8: an explicitly empty model.
+        ("empty-model", json!({"worker": {"model": ""}})),
+    ];
+
+    for (tag, agents) in cases {
+        let (state, root) = test_state(&format!("agent-invalid-{tag}"));
+        let mut body = base.clone();
+        body["agents"] = agents;
+
+        let response = router(state.clone())
+            .oneshot(post("/api/tasks", body))
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_client_error(),
+            "{tag} should be refused, got {}",
+            response.status()
+        );
+        assert_eq!(state.manager.len(), 0, "{tag} must not create a task");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// Required test 9: the selection is frozen on the task. Later configuration
+/// changes — a different default model, a different offer — cannot rewrite what
+/// a created run is using.
+#[tokio::test]
+async fn a_stored_selection_ignores_later_configuration_changes() {
+    let (state, root) = test_state("agent-frozen");
+
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Renamer",
+                "description": "search and replace",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "agents": {"proposer": {"provider": "gemini", "model": "test-model-fast"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    let id: crate::task::TaskId = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // The operator edits .env and restarts nothing: a new catalogue now offers
+    // different models and a different default.
+    let mut changed = crate::agent::test_config();
+    changed.gemini_model = "gemini-brand-new".into();
+    changed.critic_model = "claude-brand-new".into();
+    let later = crate::agent::AgentCatalogue::from_config(&changed);
+    assert_eq!(later.defaults().proposer.model, "gemini-brand-new");
+
+    let stored = state.manager.get(id).unwrap();
+    assert_eq!(stored.agents.proposer.model, "test-model-fast");
+    assert_eq!(stored.agents.critic.model, "test-critic-model");
+    assert_eq!(stored.agents.worker.model, "test-worker-model");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The form is the production path, and it carries the same six choices as the
+/// JSON API (frontend cases 4 and 5).
+#[tokio::test]
+async fn the_form_submits_and_displays_the_selected_agents() {
+    let (state, root) = test_state("ui-agent-select");
+
+    let response = router(state.clone())
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result\
+             &proposer_provider=anthropic&proposer_model=test-critic-model\
+             &critic_provider=anthropic&critic_model=test-critic-model\
+             &worker_tool=claude_code&worker_model=test-worker-model",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let task = state.manager.list().pop().unwrap();
+    assert_eq!(
+        task.agents.proposer.provider,
+        crate::agent::ChatProvider::Anthropic
+    );
+    assert_eq!(task.agents.proposer.model, "test-critic-model");
+
+    // Requirement 11: the task page reports what this run actually uses.
+    let page = body_text(
+        router(state)
+            .oneshot(get(&format!("/task/{}", task.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(page.contains("Agents"), "no agents card: {page}");
+    assert!(page.contains("Anthropic"));
+    assert!(page.contains("test-critic-model"));
+    assert!(page.contains("Claude Code"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An empty `<select>` is "not chosen", but a bad one is still refused.
+#[tokio::test]
+async fn the_form_defaults_blank_selectors_and_refuses_bad_ones() {
+    let (state, root) = test_state("ui-agent-blank");
+    let app = router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result\
+             &proposer_provider=&proposer_model=&critic_provider=&critic_model=&worker_tool=&worker_model=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let task = state.manager.list().pop().unwrap();
+    assert_eq!(task.agents.proposer.model, "test-model");
+
+    let response = app
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result\
+             &proposer_provider=openai",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("not a supported"));
+    assert_eq!(state.manager.len(), 1, "the bad request created a task");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Frontend cases 1-3 as far as a server-side test can reach them: the form
+/// ships the selectors, and it takes its options from the backend rather than
+/// from hard-coded model names.
+#[tokio::test]
+async fn the_task_form_ships_agent_selectors_without_hard_coded_models() {
+    let (state, root) = test_state("ui-agent-form");
+    let html = body_text(router(state).oneshot(get("/")).await.unwrap()).await;
+
+    for field in [
+        "proposer_provider",
+        "proposer_model",
+        "critic_provider",
+        "critic_model",
+        "worker_tool",
+        "worker_model",
+    ] {
+        assert!(html.contains(field), "form is missing {field}");
+    }
+    assert!(
+        html.contains("/api/agents"),
+        "options must come from the API"
+    );
+    assert!(
+        !html.contains("claude-sonnet"),
+        "model names must not be hard-coded"
+    );
+    assert!(
+        !html.contains("gemini-3"),
+        "model names must not be hard-coded"
+    );
+
     std::fs::remove_dir_all(&root).ok();
 }

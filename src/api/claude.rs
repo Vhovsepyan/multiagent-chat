@@ -102,7 +102,9 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
-    pub fn new(config: &Config) -> Result<Self> {
+    /// `model` comes from the task's stored selection (task 0005), not from
+    /// the environment — a run must not change model mid-flight.
+    pub fn new(config: &Config, model: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .build()
@@ -111,7 +113,7 @@ impl ClaudeClient {
         Ok(ClaudeClient {
             http,
             api_key: config.anthropic_api_key.clone(),
-            model: config.critic_model.clone(),
+            model: model.to_string(),
         })
     }
 
@@ -242,8 +244,8 @@ fn text_of(response: &Response) -> Result<String> {
 /// only ever sees this trait; everything Anthropic-specific stays above.
 #[async_trait::async_trait]
 impl crate::agent::ChatAgent for ClaudeClient {
-    fn provider(&self) -> crate::agent::ProviderId {
-        crate::agent::ProviderId::Anthropic
+    fn provider(&self) -> crate::agent::ChatProvider {
+        crate::agent::ChatProvider::Anthropic
     }
 
     fn model(&self) -> &str {
@@ -347,7 +349,7 @@ mod tests {
     #[ignore = "hits the real Anthropic API; run with: cargo test -- --ignored"]
     async fn live_pong() {
         let config = Config::load().expect("config should load from .env");
-        let client = ClaudeClient::new(&config).expect("client should build");
+        let client = ClaudeClient::new(&config, &config.critic_model).expect("client should build");
 
         let reply = client
             .send(

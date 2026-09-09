@@ -33,7 +33,7 @@ mod workspace;
 
 use anyhow::Result;
 
-use crate::agent::CodingTaskRequest;
+use crate::agent::{AgentCatalogue, CodingTaskRequest};
 use crate::config::Config;
 
 #[tokio::main]
@@ -51,13 +51,22 @@ async fn main() -> Result<()> {
         return web::serve(config).await;
     }
 
+    // Task 0005: the CLI has no selection UI, so it runs the configured
+    // defaults — resolved once here and then used for the whole run.
+    let selection = AgentCatalogue::from_config(&config).defaults();
+    let agents = agent::resolve(&selection, &config)?;
+
     ui::header(concat!("multiagent-chat v", env!("CARGO_PKG_VERSION")));
     if args.implement_only {
-        ui::system(&format!("implementer {}", config.implementer_model));
+        ui::system(&format!("implementer {}", selection.worker.model));
     } else {
         ui::system(&format!(
-            "proposer {} | critic {} | max {} rounds",
-            config.gemini_model, config.critic_model, config.max_rounds
+            "proposer {} {} | critic {} {} | max {} rounds",
+            selection.proposer.provider,
+            selection.proposer.model,
+            selection.critic.provider,
+            selection.critic.model,
+            config.max_rounds
         ));
     }
     if let Some(root) = &config.workspace_root {
@@ -86,14 +95,10 @@ async fn main() -> Result<()> {
         };
         let repo = target::resolve(&config, &topic)?;
 
-        // Roles, not vendors (task 0004): the factory decides who serves each.
-        let proposer = agent::default_proposer(&config)?;
-        let critic = agent::default_critic(&config)?;
-
         // Gate 1: the debate runs until APPROVED or max rounds.
         let outcome = debate::run(
-            proposer.as_ref(),
-            critic.as_ref(),
+            agents.proposer.as_ref(),
+            agents.critic.as_ref(),
             &topic,
             config.max_rounds,
             &emitter,
@@ -107,8 +112,8 @@ async fn main() -> Result<()> {
         // The spec is built from the transcript either way; `approved` only
         // changes how loudly we warn about it.
         let document = spec::build(
-            proposer.as_ref(),
-            critic.as_ref(),
+            agents.proposer.as_ref(),
+            agents.critic.as_ref(),
             &outcome.transcript,
             outcome.approved,
             &emitter,
@@ -131,8 +136,8 @@ async fn main() -> Result<()> {
     ui::success("approved.");
 
     // Phase 5: hand it to the Worker agent inside the target repo.
-    let worker = agent::default_worker(&config)?;
-    worker
+    agents
+        .worker
         .execute(
             CodingTaskRequest {
                 workspace: &target_repo,

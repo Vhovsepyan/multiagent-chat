@@ -22,7 +22,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
-use crate::agent::{CodingAgent, CodingTaskRequest, CodingTaskResult, ProviderId};
+use crate::agent::{CodingAgent, CodingTaskRequest, CodingTaskResult, CodingTool};
 use crate::config::Config;
 use crate::task::Emitter;
 use crate::ui;
@@ -48,26 +48,30 @@ pub fn prompt(spec_path: &Path, task_prompt: &str) -> String {
 ///
 /// It owns a `Config` clone rather than borrowing one, so the agent can be
 /// boxed and handed to a pipeline stage without tying it to a caller frame.
+/// `model` comes from the task's stored selection (task 0005), which is why it
+/// is a field here rather than a lookup in `config` at launch time.
 pub struct ClaudeCodeAgent {
     config: Config,
+    model: String,
 }
 
 impl ClaudeCodeAgent {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, model: &str) -> Self {
         ClaudeCodeAgent {
             config: config.clone(),
+            model: model.to_string(),
         }
     }
 }
 
 #[async_trait]
 impl CodingAgent for ClaudeCodeAgent {
-    fn provider(&self) -> ProviderId {
-        ProviderId::ClaudeCode
+    fn tool(&self) -> CodingTool {
+        CodingTool::ClaudeCode
     }
 
     fn model(&self) -> &str {
-        &self.config.implementer_model
+        &self.model
     }
 
     async fn execute(
@@ -77,6 +81,7 @@ impl CodingAgent for ClaudeCodeAgent {
     ) -> Result<CodingTaskResult> {
         run_with_prompt(
             &self.config,
+            &self.model,
             request.workspace,
             request.spec_path,
             emitter,
@@ -84,8 +89,8 @@ impl CodingAgent for ClaudeCodeAgent {
         )
         .await?;
         Ok(CodingTaskResult {
-            provider: self.provider(),
-            model: self.model().to_string(),
+            tool: self.tool(),
+            model: self.model.clone(),
         })
     }
 }
@@ -101,6 +106,7 @@ impl CodingAgent for ClaudeCodeAgent {
 /// Private since task 0004: orchestration goes through `CodingAgent::execute`.
 async fn run_with_prompt(
     config: &Config,
+    model: &str,
     repo: &Path,
     spec_path: &Path,
     emitter: &Emitter,
@@ -109,7 +115,7 @@ async fn run_with_prompt(
     ui::header("Implementer");
     ui::system(&format!(
         "claude -p --model {} --permission-mode {}",
-        config.implementer_model, config.permission_mode
+        model, config.permission_mode
     ));
     ui::system(&format!("working directory: {}", repo.display()));
 
@@ -125,7 +131,7 @@ async fn run_with_prompt(
         .arg("-p")
         .arg(prompt(spec_path, task_prompt))
         .arg("--model")
-        .arg(&config.implementer_model)
+        .arg(model)
         .arg("--permission-mode")
         .arg(&config.permission_mode);
     let output = crate::process_runner::run(
@@ -180,10 +186,12 @@ mod tests {
     #[test]
     fn the_claude_code_agent_reports_itself() {
         let config = crate::agent::test_config();
-        let agent = ClaudeCodeAgent::new(&config);
+        let agent = ClaudeCodeAgent::new(&config, "worker-model-b");
 
-        assert_eq!(agent.provider(), ProviderId::ClaudeCode);
-        assert_eq!(agent.model(), config.implementer_model);
+        assert_eq!(agent.tool(), CodingTool::ClaudeCode);
+        // The selected model wins over the environment default (task 0005).
+        assert_eq!(agent.model(), "worker-model-b");
+        assert_ne!(agent.model(), config.implementer_model);
     }
 
     #[test]

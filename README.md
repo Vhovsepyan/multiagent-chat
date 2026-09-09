@@ -213,7 +213,7 @@ Core modules:
 
 ```text
 src/
-  agent/           role abstractions (chat/coding) and provider factories
+  agent/           role abstractions, per-task selection, catalogue, resolver
   project.rs       repository-backed Project domain and store boundary
   workspace.rs     isolated task workspace provider and result diff
   inspection.rs    bounded metadata and instruction discovery
@@ -241,6 +241,10 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
+- Agent model options come from environment configuration; the application does
+  not query providers for the models an account can actually use, so a
+  misconfigured model name fails when the task runs rather than when it is
+  offered. The CLI always runs the configured defaults.
 
 ## Development
 

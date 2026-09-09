@@ -197,6 +197,42 @@ h2.section {
   margin: 28px 0 12px;
 }
 
+/* --- agent selection and the resolved agents card (task 0005) ------------ */
+
+h3.section.agents-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 22px 0 4px;
+}
+.agent-row label { margin-bottom: 6px; }
+.agents-form .row { gap: 10px; }
+
+.agents { display: grid; gap: 10px; }
+.agent {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.agent .role {
+  min-width: 92px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.agent .who { color: var(--text); }
+.agent code {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font: 12.5px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: #cbd3e4;
+}
+
 .done-banner {
   border-radius: var(--radius);
   padding: 14px 16px;

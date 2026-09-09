@@ -140,7 +140,9 @@ pub struct GeminiClient {
 }
 
 impl GeminiClient {
-    pub fn new(config: &Config) -> Result<Self> {
+    /// `model` comes from the task's stored selection (task 0005), not from
+    /// the environment — a run must not change model mid-flight.
+    pub fn new(config: &Config, model: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .build()
@@ -149,7 +151,7 @@ impl GeminiClient {
         Ok(GeminiClient {
             http,
             api_key: config.gemini_api_key.clone(),
-            model: config.gemini_model.clone(),
+            model: model.to_string(),
         })
     }
 
@@ -300,8 +302,8 @@ fn text_of(response: &Response) -> Result<String> {
 /// only ever sees this trait; everything Google-specific stays above.
 #[async_trait::async_trait]
 impl crate::agent::ChatAgent for GeminiClient {
-    fn provider(&self) -> crate::agent::ProviderId {
-        crate::agent::ProviderId::Gemini
+    fn provider(&self) -> crate::agent::ChatProvider {
+        crate::agent::ChatProvider::Gemini
     }
 
     fn model(&self) -> &str {
@@ -411,7 +413,7 @@ mod tests {
     #[ignore = "hits the real Gemini API; run with: cargo test -- --ignored"]
     async fn live_pong() {
         let config = Config::load().expect("config should load from .env");
-        let client = GeminiClient::new(&config).expect("client should build");
+        let client = GeminiClient::new(&config, &config.gemini_model).expect("client should build");
 
         let reply = client
             .send(

@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
+use crate::agent::AgentCatalogue;
 use crate::config::Config;
 use crate::project::ProjectStore;
 use crate::task::TaskManager;
@@ -36,6 +37,10 @@ pub struct AppState {
     pub projects: ProjectStore,
     pub workspaces: Arc<dyn WorkspaceProvider>,
     pub config: Arc<Config>,
+    /// Which providers/models this installation offers (task 0005). Built once
+    /// from `config`, so a task resolved against it never depends on a later
+    /// environment change.
+    pub catalogue: Arc<AgentCatalogue>,
 }
 
 impl AppState {
@@ -47,6 +52,7 @@ impl AppState {
                 LocalWorkspaceProvider::temporary_with_limits(config.execution.clone())
                     .expect("temporary workspace root should be available"),
             ),
+            catalogue: Arc::new(AgentCatalogue::from_config(&config)),
             config: Arc::new(config),
         }
     }
@@ -57,6 +63,7 @@ impl AppState {
             manager: TaskManager::with_history_limits(config.execution.history),
             projects: ProjectStore::default(),
             workspaces,
+            catalogue: Arc::new(AgentCatalogue::from_config(&config)),
             config: Arc::new(config),
         }
     }
@@ -78,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(handlers::health))
         .route("/api/projects", get(handlers::list_projects))
         .route("/api/projects", post(handlers::register_project))
+        .route("/api/agents", get(handlers::agent_options))
         .route("/api/tasks", post(handlers::create_task))
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
