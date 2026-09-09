@@ -4,6 +4,11 @@
 //! Task 0005. The catalogue is built once from `Config` at startup. It holds
 //! only names — never a key, never raw config — because it is also what the
 //! browser is allowed to see.
+//!
+//! Availability is per provider: a chat provider is offered only when its own
+//! credential is configured, so an installation with one key is a supported
+//! setup rather than a startup failure. The Claude Code worker authenticates
+//! itself, so it is always offered.
 
 use serde::Serialize;
 
@@ -48,70 +53,130 @@ impl ModelOptions {
 }
 
 /// Everything the UI may know about agent choices.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Only AVAILABLE providers are present, in `ChatProvider::ALL` order, so
+/// listing the catalogue and validating against it can never disagree.
+#[derive(Debug, Clone)]
 pub struct AgentCatalogue {
-    gemini: ModelOptions,
-    anthropic: ModelOptions,
-    claude_code: ModelOptions,
+    chat: Vec<(ChatProvider, ModelOptions)>,
+    coding: Vec<(CodingTool, ModelOptions)>,
 }
 
 impl AgentCatalogue {
     pub fn from_config(config: &Config) -> Self {
-        AgentCatalogue {
-            gemini: ModelOptions::new(
-                ChatProvider::Gemini.id(),
-                ChatProvider::Gemini.label(),
-                &config.gemini_models,
-                &config.gemini_model,
-            ),
-            anthropic: ModelOptions::new(
-                ChatProvider::Anthropic.id(),
-                ChatProvider::Anthropic.label(),
-                &config.anthropic_models,
-                &config.critic_model,
-            ),
-            claude_code: ModelOptions::new(
-                CodingTool::ClaudeCode.id(),
-                CodingTool::ClaudeCode.label(),
-                &config.claude_code_models,
-                &config.implementer_model,
-            ),
+        let mut chat = Vec::new();
+        for provider in ChatProvider::ALL {
+            let (configured, default) = match provider {
+                ChatProvider::Gemini => (&config.gemini_models, &config.gemini_model),
+                ChatProvider::Anthropic => (&config.anthropic_models, &config.critic_model),
+            };
+            if config.chat_credential(provider).is_some() {
+                chat.push((
+                    provider,
+                    ModelOptions::new(provider.id(), provider.label(), configured, default),
+                ));
+            }
         }
+
+        // The worker tool has its own authentication (Claude Code signs in on
+        // its own), so it does not depend on the Anthropic HTTP credential.
+        let coding = CodingTool::ALL
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool,
+                    ModelOptions::new(
+                        tool.id(),
+                        tool.label(),
+                        &config.claude_code_models,
+                        &config.implementer_model,
+                    ),
+                )
+            })
+            .collect();
+
+        AgentCatalogue { chat, coding }
     }
 
-    pub fn chat_models(&self, provider: ChatProvider) -> &ModelOptions {
-        match provider {
-            ChatProvider::Gemini => &self.gemini,
-            ChatProvider::Anthropic => &self.anthropic,
-        }
+    /// `None` when the provider is not configured in this installation.
+    pub fn chat_models(&self, provider: ChatProvider) -> Option<&ModelOptions> {
+        self.chat
+            .iter()
+            .find(|(known, _)| *known == provider)
+            .map(|(_, options)| options)
     }
 
-    pub fn coding_models(&self, tool: CodingTool) -> &ModelOptions {
-        match tool {
-            CodingTool::ClaudeCode => &self.claude_code,
-        }
+    pub fn coding_models(&self, tool: CodingTool) -> Option<&ModelOptions> {
+        self.coding
+            .iter()
+            .find(|(known, _)| *known == tool)
+            .map(|(_, options)| options)
+    }
+
+    /// The providers this installation can actually use, for the UI.
+    pub fn available_chat_providers(&self) -> Vec<ModelOptions> {
+        self.chat
+            .iter()
+            .map(|(_, options)| options.clone())
+            .collect()
+    }
+
+    pub fn available_coding_tools(&self) -> Vec<ModelOptions> {
+        self.coding
+            .iter()
+            .map(|(_, options)| options.clone())
+            .collect()
     }
 
     /// What a task gets when the user chooses nothing: the previous behavior.
-    pub fn defaults(&self) -> AgentSelection {
-        AgentSelection {
-            proposer: ChatAgentConfig::new(ChatProvider::Gemini, self.gemini.default_model.clone()),
-            critic: ChatAgentConfig::new(
-                ChatProvider::Anthropic,
-                self.anthropic.default_model.clone(),
-            ),
-            worker: CodingAgentConfig::new(
-                CodingTool::ClaudeCode,
-                self.claude_code.default_model.clone(),
-            ),
-        }
+    ///
+    /// Fails — rather than substituting another provider — when a default role
+    /// has no credential, so a misconfigured installation is told what to fix.
+    pub fn defaults(&self) -> Result<AgentSelection, String> {
+        let (proposer, critic) = self.default_chat_pair()?;
+        Ok(AgentSelection {
+            proposer,
+            critic,
+            worker: self.default_worker()?,
+        })
+    }
+
+    /// The two chat roles only, for callers that do not need a worker yet.
+    pub fn default_chat_pair(&self) -> Result<(ChatAgentConfig, ChatAgentConfig), String> {
+        Ok((
+            self.default_chat("proposer", ChatProvider::Gemini)?,
+            self.default_chat("critic", ChatProvider::Anthropic)?,
+        ))
+    }
+
+    /// The worker only. Separate because `--implement-only` runs no debate and
+    /// must not require a chat provider at all.
+    pub fn default_worker(&self) -> Result<CodingAgentConfig, String> {
+        let options = self
+            .coding_models(CodingTool::ClaudeCode)
+            .ok_or_else(|| unavailable_tool("worker", CodingTool::ClaudeCode))?;
+        Ok(CodingAgentConfig::new(
+            CodingTool::ClaudeCode,
+            options.default_model.clone(),
+        ))
+    }
+
+    fn default_chat(&self, role: &str, provider: ChatProvider) -> Result<ChatAgentConfig, String> {
+        let options = self
+            .chat_models(provider)
+            .ok_or_else(|| unavailable_provider(role, provider))?;
+        Ok(ChatAgentConfig::new(
+            provider,
+            options.default_model.clone(),
+        ))
     }
 
     /// Turn a request into the selection the task will keep for its lifetime.
     ///
-    /// An unset field falls back to the default; a set-but-unknown one is an
-    /// error. A rejected selection is never quietly replaced by a working one —
-    /// building against a model the user did not ask for is worse than failing.
+    /// An unset field falls back to the default; a set-but-unknown or
+    /// unavailable one is an error. A rejected selection is never quietly
+    /// replaced by a working one — building against a provider or model the
+    /// user did not ask for is worse than failing.
     pub fn resolve(
         &self,
         request: Option<&AgentSelectionRequest>,
@@ -140,7 +205,9 @@ impl AgentCatalogue {
         fallback: ChatProvider,
     ) -> Result<ChatAgentConfig, String> {
         let provider = request.and_then(|r| r.provider).unwrap_or(fallback);
-        let options = self.chat_models(provider);
+        let options = self
+            .chat_models(provider)
+            .ok_or_else(|| unavailable_provider(role, provider))?;
         let model = match request.and_then(|r| r.model.as_deref()) {
             None => options.default_model.clone(),
             Some(model) if model.trim().is_empty() => {
@@ -159,7 +226,9 @@ impl AgentCatalogue {
         let tool = request
             .and_then(|r| r.tool)
             .unwrap_or(CodingTool::ClaudeCode);
-        let options = self.coding_models(tool);
+        let options = self
+            .coding_models(tool)
+            .ok_or_else(|| unavailable_tool("worker", tool))?;
         let model = match request.and_then(|r| r.model.as_deref()) {
             None => options.default_model.clone(),
             Some(model) if model.trim().is_empty() => {
@@ -170,6 +239,22 @@ impl AgentCatalogue {
         };
         Ok(CodingAgentConfig::new(tool, model))
     }
+}
+
+/// Names the variable to set, never any value of it.
+fn unavailable_provider(role: &str, provider: ChatProvider) -> String {
+    format!(
+        "{role} provider {} is not available in this installation; set {} to enable it",
+        provider.label(),
+        provider.credential_variable()
+    )
+}
+
+fn unavailable_tool(role: &str, tool: CodingTool) -> String {
+    format!(
+        "{role} tool {} is not available in this installation",
+        tool.label()
+    )
 }
 
 /// A message that names what is on offer, so the user can fix the request
@@ -186,10 +271,14 @@ mod tests {
     use super::*;
 
     fn catalogue() -> AgentCatalogue {
+        AgentCatalogue::from_config(&configured())
+    }
+
+    fn configured() -> Config {
         let mut config = crate::agent::test_config();
         config.gemini_models = vec!["gemini-fast".into()];
         config.anthropic_models = vec!["claude-extra".into()];
-        AgentCatalogue::from_config(&config)
+        config
     }
 
     /// Required test 1: no selection means exactly what the app did before.
@@ -210,7 +299,7 @@ mod tests {
     #[test]
     fn the_default_model_is_always_offered() {
         let catalogue = catalogue();
-        let gemini = catalogue.chat_models(ChatProvider::Gemini);
+        let gemini = catalogue.chat_models(ChatProvider::Gemini).unwrap();
 
         assert_eq!(gemini.default_model, "proposer-model");
         assert_eq!(gemini.models, vec!["proposer-model", "gemini-fast"]);
@@ -306,5 +395,102 @@ mod tests {
         let error = catalogue().resolve(Some(&request)).unwrap_err();
 
         assert!(error.contains("Claude Code"), "unexpected: {error}");
+    }
+
+    // --- availability ------------------------------------------------------
+
+    fn only(provider: Option<ChatProvider>) -> AgentCatalogue {
+        let mut config = configured();
+        config.gemini_api_key = (provider == Some(ChatProvider::Gemini)).then(|| "key".into());
+        config.anthropic_api_key =
+            (provider == Some(ChatProvider::Anthropic)).then(|| "key".into());
+        AgentCatalogue::from_config(&config)
+    }
+
+    /// A provider with no credential is not offered at all, and one with a
+    /// credential is unaffected by the other one being missing.
+    #[test]
+    fn only_providers_with_credentials_are_offered() {
+        let gemini_only = only(Some(ChatProvider::Gemini));
+        assert!(gemini_only.chat_models(ChatProvider::Gemini).is_some());
+        assert!(gemini_only.chat_models(ChatProvider::Anthropic).is_none());
+        assert_eq!(gemini_only.available_chat_providers().len(), 1);
+
+        let anthropic_only = only(Some(ChatProvider::Anthropic));
+        assert!(anthropic_only.chat_models(ChatProvider::Gemini).is_none());
+        assert!(
+            anthropic_only
+                .chat_models(ChatProvider::Anthropic)
+                .is_some()
+        );
+
+        let neither = only(None);
+        assert!(neither.available_chat_providers().is_empty());
+    }
+
+    /// The worker does not depend on the Anthropic HTTP key: Claude Code signs
+    /// in on its own, so it stays available with no chat provider configured.
+    #[test]
+    fn the_worker_stays_available_without_any_chat_credential() {
+        let neither = only(None);
+
+        assert_eq!(neither.available_coding_tools().len(), 1);
+        assert_eq!(neither.default_worker().unwrap().model, "worker-model");
+    }
+
+    /// A default role whose provider is unavailable fails with a message that
+    /// names the variable to set — and never substitutes the other provider.
+    #[test]
+    fn an_unavailable_default_provider_fails_with_a_configuration_error() {
+        let error = only(Some(ChatProvider::Gemini)).defaults().unwrap_err();
+        assert!(error.contains("critic"), "unexpected: {error}");
+        assert!(error.contains("Anthropic"), "unexpected: {error}");
+        assert!(error.contains("ANTHROPIC_API_KEY"), "unexpected: {error}");
+
+        let error = only(Some(ChatProvider::Anthropic)).defaults().unwrap_err();
+        assert!(error.contains("proposer"), "unexpected: {error}");
+        assert!(error.contains("GEMINI_API_KEY"), "unexpected: {error}");
+    }
+
+    /// With one provider configured, a task that names it for both chat roles
+    /// still resolves — availability is per provider, not all-or-nothing.
+    #[test]
+    fn one_configured_provider_can_serve_both_chat_roles() {
+        let request = AgentSelectionRequest {
+            proposer: Some(ChatAgentRequest {
+                provider: Some(ChatProvider::Anthropic),
+                model: None,
+            }),
+            critic: Some(ChatAgentRequest {
+                provider: Some(ChatProvider::Anthropic),
+                model: Some("claude-extra".into()),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = only(Some(ChatProvider::Anthropic))
+            .resolve(Some(&request))
+            .unwrap();
+
+        assert_eq!(resolved.proposer.model, "critic-model");
+        assert_eq!(resolved.critic.model, "claude-extra");
+        assert_eq!(resolved.worker.model, "worker-model");
+    }
+
+    #[test]
+    fn selecting_an_unavailable_provider_is_refused() {
+        let request = AgentSelectionRequest {
+            proposer: Some(ChatAgentRequest {
+                provider: Some(ChatProvider::Gemini),
+                model: None,
+            }),
+            ..Default::default()
+        };
+
+        let error = only(Some(ChatProvider::Anthropic))
+            .resolve(Some(&request))
+            .unwrap_err();
+
+        assert!(error.contains("GEMINI_API_KEY"), "unexpected: {error}");
     }
 }

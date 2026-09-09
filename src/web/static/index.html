@@ -126,8 +126,11 @@
       return providersFor(role).find(function (entry) { return entry.id === id; }) || null;
     }
 
+    // `defaults` is absent when a default role has no configured provider.
+    // The selectors then start on the first AVAILABLE provider, which the user
+    // sees and submits explicitly — the server never substitutes silently.
     function defaultFor(role) {
-      if (!agentOptions) return null;
+      if (!agentOptions || !agentOptions.defaults) return null;
       const chosen = agentOptions.defaults[role];
       return {
         id: role === 'worker' ? chosen.tool : chosen.provider,
@@ -169,17 +172,23 @@
     function renderAgents() {
       AGENT_ROLES.forEach(function (config) {
         const providerSelect = document.getElementById(config.selector);
+        const modelSelect = document.getElementById(config.models);
+        const available = providersFor(config.role);
+        // A role with no configured provider cannot be chosen here; the server
+        // reports what to configure when such a task is submitted.
+        providerSelect.disabled = available.length === 0;
+        modelSelect.disabled = available.length === 0;
         const chosen = defaultFor(config.role);
-        fill(providerSelect, providersFor(config.role), chosen ? chosen.id : null);
+        fill(providerSelect, available, chosen ? chosen.id : null);
         syncModels(config, false);
-        if (chosen) {
-          const modelSelect = document.getElementById(config.models);
-          if (entryHasModel(config.role, providerSelect.value, chosen.model)) {
-            modelSelect.value = chosen.model;
-          }
+        if (chosen && entryHasModel(config.role, providerSelect.value, chosen.model)) {
+          modelSelect.value = chosen.model;
         }
         providerSelect.onchange = function () { syncModels(config, true); };
       });
+      if (agentOptions.unavailable) {
+        document.getElementById('agent-hint').textContent = agentOptions.unavailable;
+      }
     }
 
     function entryHasModel(role, providerId, model) {

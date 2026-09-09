@@ -26,8 +26,8 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
 
     let config = Config {
         execution: Default::default(),
-        gemini_api_key: "test".into(),
-        anthropic_api_key: "test".into(),
+        gemini_api_key: Some("test".into()),
+        anthropic_api_key: Some("test".into()),
         workspace_root: Some(root.clone()),
         max_rounds: 1,
         gemini_model: "test-model".into(),
@@ -966,8 +966,8 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
     std::fs::create_dir_all(&root).unwrap();
     let config = Config {
         execution: Default::default(),
-        gemini_api_key: "gemini-credential-must-not-leak".into(),
-        anthropic_api_key: "anthropic-credential-must-not-leak".into(),
+        gemini_api_key: Some("gemini-credential-must-not-leak".into()),
+        anthropic_api_key: Some("anthropic-credential-must-not-leak".into()),
         workspace_root: Some(root.clone()),
         max_rounds: 1,
         gemini_model: "test-model".into(),
@@ -1103,28 +1103,45 @@ async fn invalid_agent_selections_are_rejected_rather_than_substituted() {
         "output": "reviewable_result"
     });
     let cases = [
-        // 5: a provider this build does not serve.
+        // 5: a provider this build does not serve. The message names what was
+        // sent and what is accepted, so the client can fix the request.
         (
             "unknown-provider",
             json!({"proposer": {"provider": "openai"}}),
+            vec!["proposer", "openai", "gemini", "anthropic"],
         ),
         // 7: a worker tool this build does not serve (Codex is task 0015).
-        ("unknown-tool", json!({"worker": {"tool": "codex"}})),
+        (
+            "unknown-tool",
+            json!({"worker": {"tool": "codex"}}),
+            vec!["worker", "codex", "claude_code"],
+        ),
         // 6: a model configured for a different provider.
         (
             "wrong-provider-model",
             json!({"proposer": {"provider": "gemini", "model": "test-critic-model"}}),
+            vec![
+                "proposer model",
+                "test-critic-model",
+                "Gemini",
+                "test-model",
+            ],
         ),
         // 6: a model no provider offers.
         (
             "unknown-model",
             json!({"critic": {"provider": "anthropic", "model": "claude-imaginary"}}),
+            vec!["critic model", "claude-imaginary", "Anthropic"],
         ),
         // 8: an explicitly empty model.
-        ("empty-model", json!({"worker": {"model": ""}})),
+        (
+            "empty-model",
+            json!({"worker": {"model": ""}}),
+            vec!["worker model cannot be empty"],
+        ),
     ];
 
-    for (tag, agents) in cases {
+    for (tag, agents, expected) in cases {
         let (state, root) = test_state(&format!("agent-invalid-{tag}"));
         let mut body = base.clone();
         body["agents"] = agents;
@@ -1134,10 +1151,22 @@ async fn invalid_agent_selections_are_rejected_rather_than_substituted() {
             .await
             .unwrap();
 
+        // One shape for every invalid selection: 400 with {"error": "..."}.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
+        let body = body_json(response).await;
+        let error = body["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tag} should answer with an error field, got {body}"))
+            .to_string();
+        for fragment in expected {
+            assert!(
+                error.contains(fragment),
+                "{tag} error should mention {fragment:?}: {error}"
+            );
+        }
         assert!(
-            response.status().is_client_error(),
-            "{tag} should be refused, got {}",
-            response.status()
+            !error.contains("at line"),
+            "{tag} should not leak a byte offset: {error}"
         );
         assert_eq!(state.manager.len(), 0, "{tag} must not create a task");
         std::fs::remove_dir_all(&root).ok();
@@ -1177,7 +1206,7 @@ async fn a_stored_selection_ignores_later_configuration_changes() {
     changed.gemini_model = "gemini-brand-new".into();
     changed.critic_model = "claude-brand-new".into();
     let later = crate::agent::AgentCatalogue::from_config(&changed);
-    assert_eq!(later.defaults().proposer.model, "gemini-brand-new");
+    assert_eq!(later.defaults().unwrap().proposer.model, "gemini-brand-new");
 
     let stored = state.manager.get(id).unwrap();
     assert_eq!(stored.agents.proposer.model, "test-model-fast");
@@ -1292,6 +1321,253 @@ async fn the_task_form_ships_agent_selectors_without_hard_coded_models() {
         !html.contains("gemini-3"),
         "model names must not be hard-coded"
     );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Task 0005 follow-up: independent provider availability, uniform JSON errors
+// ---------------------------------------------------------------------------
+
+/// A state that configures only the named providers, so an installation with
+/// one key — or none — can be exercised end to end.
+fn state_with_credentials(
+    tag: &str,
+    gemini: bool,
+    anthropic: bool,
+) -> (AppState, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("mac-web-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        execution: Default::default(),
+        gemini_api_key: gemini.then(|| "gemini-credential-must-not-leak".into()),
+        anthropic_api_key: anthropic.then(|| "anthropic-credential-must-not-leak".into()),
+        workspace_root: Some(root.clone()),
+        max_rounds: 1,
+        gemini_model: "test-model".into(),
+        critic_model: "test-critic-model".into(),
+        implementer_model: "test-worker-model".into(),
+        gemini_models: Vec::new(),
+        anthropic_models: Vec::new(),
+        claude_code_models: Vec::new(),
+        permission_mode: "acceptEdits".into(),
+        port: 0,
+    };
+    let provider = LocalWorkspaceProvider::new(root.join("task-workspaces")).unwrap();
+    (
+        AppState::with_workspace(config, std::sync::Arc::new(provider)),
+        root,
+    )
+}
+
+fn new_project_body(agents: Option<Value>) -> Value {
+    let mut body = json!({
+        "kind": "new_project",
+        "title": "Renamer",
+        "description": "search and replace",
+        "technology": "rust",
+        "output": "reviewable_result"
+    });
+    if let Some(agents) = agents {
+        body["agents"] = agents;
+    }
+    body
+}
+
+/// A provider with no credential is not offered, and the one that is configured
+/// is unaffected. The worker keeps its own authentication, so it stays offered.
+#[tokio::test]
+async fn agent_options_list_only_available_providers() {
+    let (state, root) = state_with_credentials("agents-gemini-only", true, false);
+
+    let response = router(state).oneshot(get("/api/agents")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(!body.contains("credential"), "credentials leaked: {body}");
+
+    let options: Value = serde_json::from_str(&body).unwrap();
+    let providers = options["chat_providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 1, "got {providers:?}");
+    assert_eq!(providers[0]["id"], "gemini");
+    assert_eq!(options["coding_tools"][0]["id"], "claude_code");
+    // The critic default is unavailable, so the UI is told what to configure
+    // rather than being handed a substitute provider.
+    assert!(options["defaults"].is_null());
+    let unavailable = options["unavailable"].as_str().unwrap();
+    assert!(unavailable.contains("critic"), "got: {unavailable}");
+    assert!(
+        unavailable.contains("ANTHROPIC_API_KEY"),
+        "got: {unavailable}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Both keys configured is the pre-existing setup, and it must look exactly as
+/// it did: both providers offered, defaults present and unchanged.
+#[tokio::test]
+async fn both_credentials_keep_the_previous_defaults() {
+    let (state, root) = state_with_credentials("agents-both", true, true);
+
+    let options = body_json(router(state).oneshot(get("/api/agents")).await.unwrap()).await;
+
+    assert_eq!(options["chat_providers"].as_array().unwrap().len(), 2);
+    assert_eq!(options["defaults"]["proposer"]["provider"], "gemini");
+    assert_eq!(options["defaults"]["proposer"]["model"], "test-model");
+    assert_eq!(options["defaults"]["critic"]["provider"], "anthropic");
+    assert_eq!(options["defaults"]["worker"]["tool"], "claude_code");
+    assert!(options.get("unavailable").is_none());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// With one provider configured the application still runs: a task that names
+/// that provider for both chat roles is accepted, and one that falls back to an
+/// unavailable default is refused with configuration guidance.
+#[tokio::test]
+async fn one_configured_provider_is_enough_to_create_a_task() {
+    let (state, root) = state_with_credentials("agents-anthropic-only", false, true);
+    let app = router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/api/tasks",
+            new_project_body(Some(json!({
+                "proposer": {"provider": "anthropic"},
+                "critic": {"provider": "anthropic"}
+            }))),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["agents"]["proposer"]["provider"], "anthropic");
+    assert_eq!(task["agents"]["proposer"]["model"], "test-critic-model");
+    assert_eq!(task["agents"]["worker"]["model"], "test-worker-model");
+
+    // The default proposer is Gemini, which this installation cannot serve.
+    let response = app
+        .oneshot(post("/api/tasks", new_project_body(None)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("proposer"), "got: {error}");
+    assert!(error.contains("GEMINI_API_KEY"), "got: {error}");
+    assert!(
+        !error.contains("must-not-leak"),
+        "credential leaked: {error}"
+    );
+    assert_eq!(
+        state.manager.len(),
+        1,
+        "the refused task was created anyway"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// With no chat credential at all the server still starts and serves the UI;
+/// only the chat roles are unavailable, and the worker tool remains offered.
+#[tokio::test]
+async fn no_chat_credentials_still_serves_the_application() {
+    let (state, root) = state_with_credentials("agents-none", false, false);
+    let app = router(state.clone());
+
+    assert_eq!(
+        app.clone()
+            .oneshot(get("/api/health"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let options = body_json(app.clone().oneshot(get("/api/agents")).await.unwrap()).await;
+    assert!(options["chat_providers"].as_array().unwrap().is_empty());
+    assert_eq!(options["coding_tools"].as_array().unwrap().len(), 1);
+    assert!(options["defaults"].is_null());
+
+    let response = app
+        .oneshot(post("/api/tasks", new_project_body(None)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("GEMINI_API_KEY")
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Every malformed JSON body answers in the API's own shape — 400 with an
+/// `error` string — rather than a framework-generated 422.
+#[tokio::test]
+async fn malformed_json_bodies_use_the_standard_error_response() {
+    let (state, root) = test_state("json-errors");
+    let app = router(state);
+
+    let cases: [(&str, Request<Body>, Vec<&str>); 4] = [
+        (
+            "unknown-provider",
+            post(
+                "/api/tasks",
+                new_project_body(Some(json!({"proposer": {"provider": "openai"}}))),
+            ),
+            vec!["invalid request body", "provider", "openai"],
+        ),
+        (
+            "wrong-type",
+            post("/api/tasks", json!({"kind": "new_project", "title": 7})),
+            vec!["invalid request body", "title"],
+        ),
+        (
+            "broken-syntax",
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+            vec!["invalid request body"],
+        ),
+        (
+            "missing-content-type",
+            Request::builder()
+                .method("POST")
+                .uri("/api/projects")
+                .body(Body::from("{}"))
+                .unwrap(),
+            vec!["invalid request body", "application/json"],
+        ),
+    ];
+
+    for (tag, request, expected) in cases {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
+        let body = body_json(response).await;
+        let error = body["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tag} should answer with an error field, got {body}"))
+            .to_string();
+        for fragment in expected {
+            assert!(
+                error.contains(fragment),
+                "{tag} error should mention {fragment:?}: {error}"
+            );
+        }
+        assert!(
+            !error.contains("at line"),
+            "{tag} leaked an offset: {error}"
+        );
+    }
 
     std::fs::remove_dir_all(&root).ok();
 }

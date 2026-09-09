@@ -3,16 +3,18 @@
 use std::convert::Infallible;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::agent::{AgentSelection, ChatProvider, CodingTool, ModelOptions};
+use crate::agent::{AgentSelection, ModelOptions};
 use crate::project::{Project, ProjectSource};
 use crate::task::{Decision, Task, TaskId, TaskRequest, TaskStatus};
 use crate::web::{AppState, pipeline};
@@ -82,6 +84,58 @@ struct ErrorBody {
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 // ---------------------------------------------------------------------------
+// JSON body extraction
+// ---------------------------------------------------------------------------
+
+/// `Json<T>`, but a malformed or unsupported body is reported the way every
+/// other client error in this API is: 400 with `{"error": "..."}`.
+///
+/// Plain `Json<T>` answers a bad enum variant with a 422 and a framework
+/// sentence, so an unsupported provider looked like a different class of
+/// failure from an unsupported model. Both are the client asking for something
+/// this installation does not serve.
+pub struct ValidJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ValidJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> std::result::Result<Self, ApiError> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(ValidJson(value)),
+            Err(rejection) => Err(ApiError::bad_request(readable_json_error(&rejection))),
+        }
+    }
+}
+
+/// Keep serde's useful part — the field path and what was expected — and drop
+/// the framework preamble and the byte offset.
+fn readable_json_error(rejection: &JsonRejection) -> String {
+    const PREFIXES: [&str; 2] = [
+        "Failed to deserialize the JSON body into the target type: ",
+        "Failed to parse the request body as JSON: ",
+    ];
+    let text = rejection.body_text();
+    let mut detail = text.as_str();
+    for prefix in PREFIXES {
+        if let Some(rest) = detail.strip_prefix(prefix) {
+            detail = rest;
+        }
+    }
+    // serde appends "at line 1 column 173", which locates a byte, not a field.
+    let detail = detail
+        .split(" at line ")
+        .next()
+        .unwrap_or(detail)
+        .trim()
+        .trim_end_matches('.');
+    format!("invalid request body: {detail}")
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -116,23 +170,27 @@ pub async fn list_projects(State(state): State<AppState>) -> ApiResult<Json<Proj
 /// already public knowledge for anyone who can open the task form.
 #[derive(Serialize)]
 pub struct AgentOptions {
+    /// Only providers this installation has credentials for.
     pub chat_providers: Vec<ModelOptions>,
     pub coding_tools: Vec<ModelOptions>,
-    pub defaults: AgentSelection,
+    /// `None` when a default role has no available provider; `unavailable`
+    /// then says which variable to set. Neither field carries a credential.
+    pub defaults: Option<AgentSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
 }
 
 /// `GET /api/agents` — what the task form may offer.
 pub async fn agent_options(State(state): State<AppState>) -> Json<AgentOptions> {
+    let (defaults, unavailable) = match state.catalogue.defaults() {
+        Ok(defaults) => (Some(defaults), None),
+        Err(error) => (None, Some(error)),
+    };
     Json(AgentOptions {
-        chat_providers: ChatProvider::ALL
-            .iter()
-            .map(|provider| state.catalogue.chat_models(*provider).clone())
-            .collect(),
-        coding_tools: CodingTool::ALL
-            .iter()
-            .map(|tool| state.catalogue.coding_models(*tool).clone())
-            .collect(),
-        defaults: state.catalogue.defaults(),
+        chat_providers: state.catalogue.available_chat_providers(),
+        coding_tools: state.catalogue.available_coding_tools(),
+        defaults,
+        unavailable,
     })
 }
 
@@ -150,7 +208,7 @@ fn default_branch() -> String {
 
 pub async fn register_project(
     State(state): State<AppState>,
-    Json(body): Json<RegisterProject>,
+    ValidJson(body): ValidJson<RegisterProject>,
 ) -> ApiResult<(StatusCode, Json<Project>)> {
     let source = ProjectSource::github(&body.repository)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -163,22 +221,16 @@ pub async fn register_project(
     Ok((StatusCode::CREATED, Json(project)))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateTask {
-    #[serde(flatten)]
-    pub request: TaskRequest,
-}
-
 /// `POST /api/tasks` — create a task and start the pipeline in the background.
 ///
 /// Returns 201 immediately; the work continues on a spawned tokio task and is
 /// followed via `GET /api/tasks/{id}` (and, from Phase 9, the SSE stream).
 pub async fn create_task(
     State(state): State<AppState>,
-    Json(body): Json<CreateTask>,
+    ValidJson(request): ValidJson<TaskRequest>,
 ) -> ApiResult<(StatusCode, Json<Task>)> {
-    body.request.validate().map_err(ApiError::bad_request)?;
-    if let Some(project_id) = body.request.project_id
+    request.validate().map_err(ApiError::bad_request)?;
+    if let Some(project_id) = request.project_id
         && state.projects.get(project_id).is_none()
     {
         return Err(ApiError::bad_request("project is not registered"));
@@ -188,12 +240,12 @@ pub async fn create_task(
     // so an invalid combination is a 400 rather than a task that fails later.
     let agents = state
         .catalogue
-        .resolve(body.request.agents.as_ref())
+        .resolve(request.agents.as_ref())
         .map_err(ApiError::bad_request)?;
 
     let task = state
         .manager
-        .create_from_request(body.request, agents)
+        .create_from_request(request, agents)
         .map_err(ApiError::bad_request)?;
 
     pipeline::spawn(state.clone(), task.id);
@@ -258,7 +310,7 @@ pub async fn task_events(
 pub async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
-    Json(decision): Json<Decision>,
+    ValidJson(decision): ValidJson<Decision>,
 ) -> ApiResult<Json<Task>> {
     let task = state
         .manager

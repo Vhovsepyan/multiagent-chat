@@ -20,6 +20,22 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- DP-22 (2026-09-09, task 0005 follow-up): provider availability is per
+  provider. `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` are optional and startup
+  requires neither; `AgentCatalogue` offers only providers whose own credential
+  is configured, and `GET /api/agents` lists exactly those. Defaults stay
+  Gemini/Anthropic/Claude Code, so a fully configured installation is unchanged;
+  when a default role has no credential, `defaults()` fails with a message
+  naming the variable to set (`defaults: null` plus `unavailable` in the API)
+  rather than substituting the other provider. The Claude Code worker is always
+  available: `implementer_command` now takes `Option<&str>` and, with no key,
+  passes none — the child still has the inherited environment cleared, so it
+  falls back to its own login. `--implement-only` therefore needs no chat
+  provider at all. All JSON bodies go through a `ValidJson` extractor that
+  renders serde rejections as the API-standard 400 `{"error": ...}` with the
+  field path and accepted values, without the framework preamble or byte
+  offset; `CreateTask` was dropped because its `#[serde(flatten)]` was what
+  erased the field path from those messages.
 - DP-21 (2026-09-09, task 0005): agent choice is per task, not per process. A
   `TaskRequest` may carry an `agents` block; `AgentCatalogue` (built once from
   `Config`) validates it and returns an `AgentSelection` that is stored on the

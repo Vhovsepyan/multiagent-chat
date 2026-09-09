@@ -110,9 +110,13 @@ impl ClaudeClient {
             .build()
             .context("could not build the HTTP client")?;
 
+        let api_key = config.anthropic_api_key.clone().context(
+            "ANTHROPIC_API_KEY is not set — the Anthropic provider is not configured in this installation",
+        )?;
+
         Ok(ClaudeClient {
             http,
-            api_key: config.anthropic_api_key.clone(),
+            api_key,
             model: model.to_string(),
         })
     }

@@ -39,6 +39,15 @@ impl ChatProvider {
         }
     }
 
+    /// The environment variable that makes this provider available. Only the
+    /// NAME is ever shown to a user; the value never leaves `Config`.
+    pub fn credential_variable(self) -> &'static str {
+        match self {
+            ChatProvider::Gemini => "GEMINI_API_KEY",
+            ChatProvider::Anthropic => "ANTHROPIC_API_KEY",
+        }
+    }
+
     /// Parse a wire/form value. `None` means the id is not one we serve — the
     /// caller reports that rather than guessing a provider.
     pub fn from_id(value: &str) -> Option<Self> {

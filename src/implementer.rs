@@ -124,8 +124,10 @@ async fn run_with_prompt(
     }
     println!();
 
-    let mut command =
-        crate::process_environment::implementer_command(CLAUDE_BIN, &config.anthropic_api_key);
+    let mut command = crate::process_environment::implementer_command(
+        CLAUDE_BIN,
+        config.anthropic_api_key.as_deref(),
+    );
     command
         .current_dir(repo)
         .arg("-p")

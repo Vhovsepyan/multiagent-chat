@@ -148,9 +148,13 @@ impl GeminiClient {
             .build()
             .context("could not build the HTTP client")?;
 
+        let api_key = config.gemini_api_key.clone().context(
+            "GEMINI_API_KEY is not set — the Gemini provider is not configured in this installation",
+        )?;
+
         Ok(GeminiClient {
             http,
-            api_key: config.gemini_api_key.clone(),
+            api_key,
             model: model.to_string(),
         })
     }

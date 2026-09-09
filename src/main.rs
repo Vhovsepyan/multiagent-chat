@@ -53,21 +53,26 @@ async fn main() -> Result<()> {
 
     // Task 0005: the CLI has no selection UI, so it runs the configured
     // defaults — resolved once here and then used for the whole run.
-    let selection = AgentCatalogue::from_config(&config).defaults();
-    let agents = agent::resolve(&selection, &config)?;
+    //
+    // The worker is needed on every path; the chat roles only when there is a
+    // debate, so `--implement-only` still runs on an installation that
+    // configures no chat provider at all.
+    let catalogue = AgentCatalogue::from_config(&config);
+    let worker_selection = catalogue.default_worker().map_err(anyhow::Error::msg)?;
+    let worker = agent::coding_agent(&worker_selection, &config)?;
+    let chat_selection = if args.implement_only {
+        None
+    } else {
+        Some(catalogue.default_chat_pair().map_err(anyhow::Error::msg)?)
+    };
 
     ui::header(concat!("multiagent-chat v", env!("CARGO_PKG_VERSION")));
-    if args.implement_only {
-        ui::system(&format!("implementer {}", selection.worker.model));
-    } else {
-        ui::system(&format!(
+    match &chat_selection {
+        None => ui::system(&format!("implementer {}", worker_selection.model)),
+        Some((proposer, critic)) => ui::system(&format!(
             "proposer {} {} | critic {} {} | max {} rounds",
-            selection.proposer.provider,
-            selection.proposer.model,
-            selection.critic.provider,
-            selection.critic.model,
-            config.max_rounds
-        ));
+            proposer.provider, proposer.model, critic.provider, critic.model, config.max_rounds
+        )),
     }
     if let Some(root) = &config.workspace_root {
         ui::system(&format!("legacy CLI workspace: {}", root.display()));
@@ -95,10 +100,15 @@ async fn main() -> Result<()> {
         };
         let repo = target::resolve(&config, &topic)?;
 
+        let (proposer_selection, critic_selection) =
+            chat_selection.expect("a debate run resolved its chat agents");
+        let proposer = agent::chat_agent(&proposer_selection, &config)?;
+        let critic = agent::chat_agent(&critic_selection, &config)?;
+
         // Gate 1: the debate runs until APPROVED or max rounds.
         let outcome = debate::run(
-            agents.proposer.as_ref(),
-            agents.critic.as_ref(),
+            proposer.as_ref(),
+            critic.as_ref(),
             &topic,
             config.max_rounds,
             &emitter,
@@ -112,8 +122,8 @@ async fn main() -> Result<()> {
         // The spec is built from the transcript either way; `approved` only
         // changes how loudly we warn about it.
         let document = spec::build(
-            agents.proposer.as_ref(),
-            agents.critic.as_ref(),
+            proposer.as_ref(),
+            critic.as_ref(),
             &outcome.transcript,
             outcome.approved,
             &emitter,
@@ -136,8 +146,7 @@ async fn main() -> Result<()> {
     ui::success("approved.");
 
     // Phase 5: hand it to the Worker agent inside the target repo.
-    agents
-        .worker
+    worker
         .execute(
             CodingTaskRequest {
                 workspace: &target_repo,

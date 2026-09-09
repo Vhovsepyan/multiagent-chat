@@ -81,8 +81,8 @@ pub fn coding_agent(
 pub(crate) fn test_config() -> Config {
     Config {
         execution: Default::default(),
-        gemini_api_key: "test".into(),
-        anthropic_api_key: "test".into(),
+        gemini_api_key: Some("test".into()),
+        anthropic_api_key: Some("test".into()),
         workspace_root: None,
         max_rounds: 1,
         gemini_model: "proposer-model".into(),
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn default_roles_keep_the_previous_wiring() {
         let config = test_config();
-        let selection = AgentCatalogue::from_config(&config).defaults();
+        let selection = AgentCatalogue::from_config(&config).defaults().unwrap();
 
         let agents = resolve(&selection, &config).unwrap();
 

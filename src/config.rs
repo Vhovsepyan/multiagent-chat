@@ -16,8 +16,11 @@ use anyhow::{Context, Result, bail};
 #[derive(Clone)]
 pub struct Config {
     pub execution: crate::execution_limits::ExecutionLimits,
-    pub gemini_api_key: String,
-    pub anthropic_api_key: String,
+    /// Credentials are per provider and independent: an installation may
+    /// configure one chat provider, both, or neither (the Claude Code worker
+    /// authenticates itself). A provider without its key is simply not offered.
+    pub gemini_api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
     /// Folder that holds all of the user's projects. The repo for one run is
     /// chosen inside this folder at runtime — see `target.rs`.
     /// Optional compatibility setting for the original terminal workflow.
@@ -51,6 +54,15 @@ const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const DEFAULT_PORT: u16 = 3000;
 
 impl Config {
+    /// The credential for one chat provider, or `None` when this installation
+    /// does not configure it. Provider availability is decided from this.
+    pub fn chat_credential(&self, provider: crate::agent::ChatProvider) -> Option<&str> {
+        match provider {
+            crate::agent::ChatProvider::Gemini => self.gemini_api_key.as_deref(),
+            crate::agent::ChatProvider::Anthropic => self.anthropic_api_key.as_deref(),
+        }
+    }
+
     /// Load `.env` (if present) and build a `Config`.
     ///
     /// Returns `Err` with a readable message if a required variable is missing
@@ -104,8 +116,8 @@ impl Config {
 
         Ok(Config {
             execution: crate::execution_limits::ExecutionLimits::load()?,
-            gemini_api_key: required("GEMINI_API_KEY")?,
-            anthropic_api_key: required("ANTHROPIC_API_KEY")?,
+            gemini_api_key: credential("GEMINI_API_KEY"),
+            anthropic_api_key: credential("ANTHROPIC_API_KEY"),
             workspace_root,
             max_rounds,
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -139,14 +151,15 @@ fn model_list(name: &str) -> Vec<String> {
     models
 }
 
-/// A variable the app cannot run without.
-fn required(name: &str) -> Result<String> {
-    let value = env::var(name)
-        .with_context(|| format!("{name} is not set — copy .env.example to .env and fill it in"))?;
-    if value.trim().is_empty() {
-        bail!("{name} is set but empty");
-    }
-    Ok(value)
+/// A provider credential. Missing or blank means "this provider is not
+/// configured", which is a supported state — the catalogue then does not offer
+/// it, and a task that asks for it is refused with a clear message. Startup
+/// does not require any particular key.
+fn credential(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// A variable with a sensible fallback.
@@ -154,6 +167,14 @@ fn optional(name: &str, default: &str) -> String {
     match env::var(name) {
         Ok(v) if !v.trim().is_empty() => v,
         _ => default.to_string(),
+    }
+}
+
+/// Says whether a credential is configured without revealing any of it.
+fn redacted(value: &Option<String>) -> &'static str {
+    match value {
+        Some(_) => "<redacted>",
+        None => "<unset>",
     }
 }
 
@@ -165,8 +186,8 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("execution", &self.execution)
-            .field("gemini_api_key", &"<redacted>")
-            .field("anthropic_api_key", &"<redacted>")
+            .field("gemini_api_key", &redacted(&self.gemini_api_key))
+            .field("anthropic_api_key", &redacted(&self.anthropic_api_key))
             .field("workspace_root", &self.workspace_root)
             .field("max_rounds", &self.max_rounds)
             .field("gemini_model", &self.gemini_model)

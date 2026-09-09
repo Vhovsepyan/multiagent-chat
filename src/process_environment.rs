@@ -65,14 +65,22 @@ pub fn async_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     command(program).into()
 }
 
-/// Claude uses the configured Anthropic key; no other inherited provider
-/// configuration (including endpoint overrides or alternate tokens) is allowed.
+/// Claude Code gets the configured Anthropic key and nothing else: no other
+/// inherited provider configuration (endpoint overrides, alternate tokens) is
+/// allowed through.
+///
+/// `None` means this installation has no Anthropic HTTP credential. The child
+/// is then launched with no `ANTHROPIC_API_KEY` at all — the inherited one is
+/// already cleared — so Claude Code falls back to its own stored login. Worker
+/// authentication is deliberately independent of the chat provider key.
 pub fn implementer_command(
     program: impl AsRef<OsStr>,
-    anthropic_api_key: &str,
+    anthropic_api_key: Option<&str>,
 ) -> tokio::process::Command {
     let mut command = async_command(program);
-    command.env("ANTHROPIC_API_KEY", anthropic_api_key);
+    if let Some(key) = anthropic_api_key {
+        command.env("ANTHROPIC_API_KEY", key);
+    }
     command
 }
 
@@ -125,9 +133,28 @@ mod tests {
         }
     }
 
+    /// Without a configured HTTP credential the child gets no key at all, so
+    /// Claude Code uses its own login rather than an inherited secret.
+    #[test]
+    fn implementer_without_a_configured_key_passes_no_credential() {
+        let command = implementer_command("unused-test-command", None);
+        let env: Vec<_> = command.as_std().get_envs().collect();
+
+        assert!(!env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+        for (key, _) in env {
+            assert!(RUNTIME_VARIABLES.iter().any(|name| {
+                if cfg!(windows) {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                } else {
+                    key == *name
+                }
+            }));
+        }
+    }
+
     #[test]
     fn implementer_has_only_the_explicit_provider_credential() {
-        let command = implementer_command("unused-test-command", "test-only-anthropic");
+        let command = implementer_command("unused-test-command", Some("test-only-anthropic"));
         let env: Vec<_> = command.as_std().get_envs().collect();
         assert!(env.iter().any(|(key, value)| *key == "ANTHROPIC_API_KEY"
             && *value == Some(OsStr::new("test-only-anthropic"))));
@@ -180,7 +207,7 @@ mod tests {
                 let mut child = if role == "runtime" {
                     command(exe)
                 } else {
-                    implementer_command(exe, "test-only-selected-key").into_std()
+                    implementer_command(exe, Some("test-only-selected-key")).into_std()
                 };
                 let status = child
                     .args(["--exact", "process_environment::tests::environment_probe"])

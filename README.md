@@ -241,6 +241,9 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
+- Chat providers are available only when their own key is configured. The
+  default roles are proposer/Gemini and critic/Anthropic, so a single-key
+  installation must choose the configured provider explicitly per task.
 - Agent model options come from environment configuration; the application does
   not query providers for the models an account can actually use, so a
   misconfigured model name fails when the task runs rather than when it is
