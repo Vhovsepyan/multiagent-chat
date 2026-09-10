@@ -187,10 +187,23 @@ impl PersistentDestination {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        // The rename above published the project, so persistence has SUCCEEDED
+        // from here on. Describing the repository is reporting, not publishing:
+        // when that fails the metadata is unavailable and the run says so,
+        // rather than claiming the destination was left unchanged.
+        let (git, git_warning) = match crate::git::repository_status(self.path(), limits) {
+            Ok(git) => (git, None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "the project was persisted but its repository could not be described: {error:#}"
+                )),
+            ),
+        };
         Ok(PersistedProject {
             destination: self.display(),
-            git: crate::git::repository_status(&self.path, limits)
-                .context("the project was persisted but its repository could not be described")?,
+            git,
+            git_warning,
         })
     }
 
@@ -216,8 +229,16 @@ impl PersistentDestination {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedProject {
     pub destination: String,
+    /// The repository the persisted project holds. `None` means either that the
+    /// project is not a repository or that `git_warning` says why it could not
+    /// be inspected — never that persistence failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<RepositoryStatus>,
+    /// Set when the project WAS published but its repository metadata could not
+    /// be read. This is a non-fatal warning about reporting, not about the
+    /// project, which is already at its destination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_warning: Option<String>,
 }
 
 /// Copy a directory tree, refusing anything that is not a plain file or folder.
@@ -329,6 +350,10 @@ mod tests {
 
         assert_eq!(persisted.destination, destination.display());
         assert!(persisted.git.is_none(), "no repository was generated");
+        assert!(
+            persisted.git_warning.is_none(),
+            "a project without a repository is not a reporting failure"
+        );
         assert_eq!(
             fs::read_to_string(destination.path().join("src/main.rs")).unwrap(),
             "fn main() {}\n"
@@ -536,5 +561,56 @@ mod tests {
         assert_eq!(fs::read_to_string(&secret).unwrap(), "private\n");
         // The copy failed after staging began; the staging folder is gone.
         assert_eq!(fs::read_dir(fixture.output()).unwrap().count(), 1);
+    }
+
+    /// Regression: a repository that cannot be INSPECTED after the project has
+    /// already been renamed into place is missing metadata, not a failed
+    /// persistence. The project is published either way.
+    #[test]
+    fn unreadable_git_metadata_after_finalization_still_persists_the_project() {
+        let fixture = Fixture::new("git-metadata");
+        let project = fixture.generated_project();
+        git(&project, &["init", "--quiet"]);
+        git(&project, &["config", "user.email", "tests@example.com"]);
+        git(&project, &["config", "user.name", "Tests"]);
+        git(&project, &["add", "--all", "."]);
+        git(
+            &project,
+            &["commit", "--quiet", "-m", "feat(milestone-01): bootstrap"],
+        );
+        let destination = fixture.destination("described-badly");
+        // Every Git command this run makes now times out, so the copy and the
+        // rename still succeed and only the description of the result fails.
+        let unusable_git = ExecutionLimits {
+            git_timeout: std::time::Duration::from_nanos(1),
+            ..ExecutionLimits::default()
+        };
+
+        let persisted = destination.persist(&project, &unusable_git).unwrap();
+
+        assert_eq!(persisted.destination, destination.display());
+        assert!(
+            persisted.git.is_none(),
+            "metadata is unavailable, not empty"
+        );
+        let warning = persisted
+            .git_warning
+            .expect("an unreadable repository is reported as a warning");
+        assert!(warning.contains("could not be described"), "{warning}");
+        // The project, and its history, really are at the destination.
+        assert_eq!(
+            fs::read_to_string(destination.path().join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(destination.path().join(".git").is_dir());
+        assert_eq!(
+            git(destination.path(), &["log", "--format=%s"]),
+            "feat(milestone-01): bootstrap"
+        );
+        // With a working Git the same destination describes itself normally.
+        let status = crate::git::repository_status(destination.path(), &limits())
+            .unwrap()
+            .expect("a repository is present");
+        assert_eq!(status.commits, 1);
     }
 }

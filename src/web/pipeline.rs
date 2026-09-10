@@ -569,9 +569,14 @@ async fn persist_project(
         };
     match persisted {
         Ok(project) => {
+            // The project is at its destination; only its metadata is missing.
+            if let Some(warning) = &project.git_warning {
+                emitter.warn(warning.clone());
+            }
             emitter.emit(TaskEvent::ProjectPersisted {
                 destination: project.destination,
                 git: project.git,
+                git_warning: project.git_warning,
             });
             Ok(())
         }
@@ -1448,6 +1453,79 @@ mod persistent_output_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not configured"), "unexpected: {error}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Regression: repository metadata that cannot be read AFTER the project was
+    /// published is a warning about reporting. The run must stay completed, the
+    /// audit must say the project was persisted, and nothing may claim the
+    /// destination was left unchanged.
+    #[tokio::test]
+    async fn unreadable_git_metadata_does_not_fail_a_published_project() {
+        let (mut state, root) = crate::web::tests::test_state("persist-git-metadata");
+        // Every Git command times out, so the project is copied and renamed
+        // normally and only describing its repository fails.
+        std::sync::Arc::make_mut(&mut state.config)
+            .execution
+            .git_timeout = std::time::Duration::from_nanos(1);
+        let task = new_project(
+            &state,
+            OutputTarget::PersistentLocalProject,
+            Some("published-project"),
+        );
+        let emitter = state.manager.emitter(task.id);
+        let destination = persistent_destination(&state, &task).unwrap().unwrap();
+        let workspace = workspace_with_project(&state, &task);
+
+        persist_project(&state, &emitter, &destination, &workspace)
+            .await
+            .expect("a published project is not a failed persistence");
+        finish_run(&state, task.id, &emitter, Some(&workspace), Ok(()));
+
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("main.rs")).unwrap(),
+            "fn main() {}\n",
+            "the project really is at its destination"
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Completed);
+        let persistence = stored.persistence.clone().expect("persistence metadata");
+        assert_eq!(persistence.status, PersistenceStatus::Persisted);
+        assert!(persistence.git.is_none());
+        assert!(
+            persistence
+                .git_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("could not be described")),
+            "{persistence:?}"
+        );
+        assert!(persistence.error.is_none(), "{persistence:?}");
+        let kinds = event_kinds(&stored);
+        assert!(kinds.contains(&"project_persisted".to_string()));
+        assert!(!kinds.contains(&"project_persistence_failed".to_string()));
+        assert!(kinds.contains(&"task_completed".to_string()));
+        // The warning is visible, without pretending the run failed.
+        assert!(
+            stored.log_tail.iter().any(|recorded| matches!(
+                &recorded.event,
+                TaskEvent::Warning { message } if message.contains("could not be described")
+            )),
+            "the non-fatal warning must reach the run log"
+        );
+        let report = final_report(&state, task.id);
+        assert!(report.contains("Persisted to"), "{report}");
+        assert!(
+            report.contains("Repository metadata unavailable"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("No Git repository was present"),
+            "an unreadable repository is not an absent one: {report}"
+        );
+        assert!(
+            !report.contains("The destination was left unchanged"),
+            "the destination WAS published: {report}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

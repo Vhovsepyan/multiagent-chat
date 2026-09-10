@@ -607,9 +607,18 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             "Project persistence started".into(),
             vec![format!("Destination: `{}`", markdown_inline(destination))],
         ),
-        TaskEvent::ProjectPersisted { destination, git } => {
+        TaskEvent::ProjectPersisted {
+            destination,
+            git,
+            git_warning,
+        } => {
             let mut details = vec![format!("Destination: `{}`", markdown_inline(destination))];
-            if let Some(git) = git {
+            if let Some(warning) = git_warning {
+                details.push(format!(
+                    "Git repository: not described ({})",
+                    markdown_inline(warning)
+                ));
+            } else if let Some(git) = git {
                 details.push(format!("Git commits: {}", git.commits));
                 if let Some(branch) = &git.branch {
                     details.push(format!("Git branch: `{}`", markdown_inline(branch)));
@@ -967,8 +976,10 @@ fn persistent_result(task: &Task) -> String {
     };
     match persistence.status {
         crate::task::PersistenceStatus::Persisted => {
-            let git = match &persistence.git {
-                Some(git) => format!(
+            // A persisted project whose repository could not be read must not
+            // be reported as having had no repository at all.
+            let git = match (&persistence.git, &persistence.git_warning) {
+                (Some(git), _) => format!(
                     " Git repository preserved: {} commit(s){}; remote configured: {}.",
                     git.commits,
                     git.head_sha
@@ -977,7 +988,11 @@ fn persistent_result(task: &Task) -> String {
                         .unwrap_or_default(),
                     git.has_remote
                 ),
-                None => " No Git repository was present.".into(),
+                (None, Some(warning)) => format!(
+                    " Repository metadata unavailable: {}.",
+                    markdown_inline(warning)
+                ),
+                (None, None) => " No Git repository was present.".into(),
             };
             format!(
                 "Persisted to `{}`.{git}",

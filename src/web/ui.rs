@@ -202,14 +202,14 @@ fn output_state_html(
                     format!(
                         "Kept at <code>{}</code>{}",
                         esc(&persistence.destination),
-                        persistence
-                            .git
-                            .as_ref()
-                            .map(|git| format!(
-                                " · Git history preserved: {} commit(s)",
-                                git.commits
-                            ))
-                            .unwrap_or_default()
+                        match (&persistence.git, &persistence.git_warning) {
+                            (Some(git), _) =>
+                                format!(" · Git history preserved: {} commit(s)", git.commits),
+                            // The project was published; only reporting failed.
+                            (None, Some(warning)) =>
+                                format!(" · repository details unavailable: {}", esc(warning)),
+                            (None, None) => String::new(),
+                        }
                     ),
                 ),
                 PersistenceStatus::Failed => (
@@ -580,14 +580,20 @@ fn event_html(
                 esc(destination)
             ),
         )),
-        TaskEvent::ProjectPersisted { destination, git } => Some((
+        TaskEvent::ProjectPersisted {
+            destination,
+            git,
+            git_warning,
+        } => Some((
             "build",
             format!(
                 r#"<div class="notice ok">Project kept at <code>{}</code>{}</div>"#,
                 esc(destination),
-                git.as_ref()
-                    .map(|git| format!(" · {} commit(s) preserved", git.commits))
-                    .unwrap_or_default()
+                match (git, git_warning) {
+                    (Some(git), _) => format!(" · {} commit(s) preserved", git.commits),
+                    (None, Some(_)) => " · repository details unavailable".to_string(),
+                    (None, None) => String::new(),
+                }
             ),
         )),
         TaskEvent::ProjectPersistenceFailed { destination, error } => Some((

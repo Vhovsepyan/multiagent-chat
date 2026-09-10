@@ -211,6 +211,9 @@ pub struct ProjectPersistence {
     pub destination: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<crate::git::RepositoryStatus>,
+    /// Why repository metadata is missing from a SUCCESSFUL persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -427,6 +430,9 @@ pub enum TaskEvent {
     ProjectPersisted {
         destination: String,
         git: Option<crate::git::RepositoryStatus>,
+        /// Present when the project reached its destination but its repository
+        /// could not be inspected. Persistence still succeeded.
+        git_warning: Option<String>,
     },
     ProjectPersistenceFailed {
         destination: String,
@@ -649,8 +655,17 @@ impl TaskEvent {
                 clean(title);
                 clean(&mut commit.message);
             }
-            Self::ProjectPersistenceStarted { destination }
-            | Self::ProjectPersisted { destination, .. } => clean(destination),
+            Self::ProjectPersistenceStarted { destination } => clean(destination),
+            Self::ProjectPersisted {
+                destination,
+                git_warning,
+                ..
+            } => {
+                clean(destination);
+                if let Some(git_warning) = git_warning {
+                    clean(git_warning);
+                }
+            }
             Self::ProjectPersistenceFailed { destination, error } => {
                 clean(destination);
                 clean(error);
@@ -1043,18 +1058,21 @@ impl Task {
                     status: PersistenceStatus::Started,
                     destination: destination.clone(),
                     git: None,
+                    git_warning: None,
                     error: None,
                 });
             }
             TaskEvent::ProjectPersisted {
                 ref destination,
                 ref git,
+                ref git_warning,
             } => {
                 self.persistence = Some(ProjectPersistence {
                     mode: OutputTarget::PersistentLocalProject,
                     status: PersistenceStatus::Persisted,
                     destination: destination.clone(),
                     git: git.clone(),
+                    git_warning: git_warning.clone(),
                     error: None,
                 });
             }
@@ -1067,6 +1085,7 @@ impl Task {
                     status: PersistenceStatus::Failed,
                     destination: destination.clone(),
                     git: None,
+                    git_warning: None,
                     error: Some(error.clone()),
                 });
             }
@@ -1163,6 +1182,9 @@ impl Task {
         }
         if let Some(persistence) = &mut self.persistence {
             clean(&mut persistence.destination);
+            if let Some(warning) = &mut persistence.git_warning {
+                clean(warning);
+            }
             if let Some(error) = &mut persistence.error {
                 clean(error);
             }
