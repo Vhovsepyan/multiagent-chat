@@ -57,10 +57,48 @@ impl TaskKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a New Project run leaves behind (task 0010).
+///
+/// The default keeps the behavior every task had before persistent output
+/// existed: the generated project is reviewed from the task result and the
+/// temporary workspace is thrown away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputTarget {
+    #[default]
     ReviewableResult,
+    /// Keep the finished project in a folder inside the server's configured
+    /// persistent output root. `TaskRequest::destination` names that folder.
+    PersistentLocalProject,
+}
+
+impl OutputTarget {
+    pub const ALL: [OutputTarget; 2] = [
+        OutputTarget::ReviewableResult,
+        OutputTarget::PersistentLocalProject,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ReviewableResult => "reviewable_result",
+            Self::PersistentLocalProject => "persistent_local_project",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReviewableResult => "Temporary review result",
+            Self::PersistentLocalProject => "Persistent local project",
+        }
+    }
+
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|target| target.id() == value)
+    }
+
+    pub fn is_persistent(self) -> bool {
+        matches!(self, Self::PersistentLocalProject)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +112,10 @@ pub struct TaskRequest {
     pub technology: Option<TechStack>,
     #[serde(default)]
     pub output: Option<OutputTarget>,
+    /// The folder name a persistent New Project is written to, inside the
+    /// server's configured output root (task 0010). Never a path.
+    #[serde(default)]
+    pub destination: Option<String>,
     /// Per-role agent choice (task 0005). Absent means "the configured
     /// defaults", which is what every pre-0005 client sends.
     #[serde(default)]
@@ -100,8 +142,23 @@ impl TaskRequest {
                 if self.technology.is_none() {
                     return Err("new_project requires a technology".into());
                 }
-                if self.output.is_none() {
-                    return Err("new_project requires output configuration".into());
+                match self.output {
+                    None => return Err("new_project requires output configuration".into()),
+                    // Task 0010: the destination is part of choosing persistent
+                    // output, so its syntax is checked with the rest of the
+                    // request rather than half-way through the run.
+                    Some(OutputTarget::PersistentLocalProject) => {
+                        let destination = self.destination.as_deref().unwrap_or_default();
+                        crate::persistence::validate_name(destination)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Some(OutputTarget::ReviewableResult) => {
+                        if self.destination.is_some() {
+                            return Err(
+                                "a temporary review result has no destination folder".into()
+                            );
+                        }
+                    }
                 }
             }
             TaskKind::Feature | TaskKind::BugFix => {
@@ -111,7 +168,8 @@ impl TaskRequest {
                         self.kind.label()
                     ));
                 }
-                if self.technology.is_some() || self.output.is_some() {
+                if self.technology.is_some() || self.output.is_some() || self.destination.is_some()
+                {
                     return Err(format!(
                         "{} uses the registered project's detected technology and output",
                         self.kind.label()
@@ -121,6 +179,40 @@ impl TaskRequest {
         }
         Ok(())
     }
+}
+
+/// How far persistent output got (task 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceStatus {
+    Started,
+    Persisted,
+    Failed,
+}
+
+impl PersistenceStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Started => "persisting",
+            Self::Persisted => "persisted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The safe persistent-output metadata retained on the task (task 0010).
+///
+/// `destination` is the user's own chosen folder; no temporary workspace path
+/// ever reaches this structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPersistence {
+    pub mode: OutputTarget,
+    pub status: PersistenceStatus,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<crate::git::RepositoryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +417,20 @@ pub enum TaskEvent {
         order: u32,
         title: String,
         commit: MilestoneCommit,
+    },
+
+    /// Persistent New Project output (task 0010). `destination` is always the
+    /// user's chosen folder, never an internal temporary path.
+    ProjectPersistenceStarted {
+        destination: String,
+    },
+    ProjectPersisted {
+        destination: String,
+        git: Option<crate::git::RepositoryStatus>,
+    },
+    ProjectPersistenceFailed {
+        destination: String,
+        error: String,
     },
 
     Inspection {
@@ -543,6 +649,12 @@ impl TaskEvent {
                 clean(title);
                 clean(&mut commit.message);
             }
+            Self::ProjectPersistenceStarted { destination }
+            | Self::ProjectPersisted { destination, .. } => clean(destination),
+            Self::ProjectPersistenceFailed { destination, error } => {
+                clean(destination);
+                clean(error);
+            }
             Self::Build { chunk } => clean(chunk),
             Self::Notice { message } | Self::Warning { message } => clean(message),
             Self::Finished { error, .. } => {
@@ -727,6 +839,10 @@ pub struct Task {
     pub project_id: Option<ProjectId>,
     pub technology: Option<TechStack>,
     pub output: Option<OutputTarget>,
+    /// The persistent destination folder name this run asked for (task 0010).
+    pub destination: Option<String>,
+    /// How persistent output went, once it has been attempted (task 0010).
+    pub persistence: Option<ProjectPersistence>,
     /// The agents this run uses, resolved once at creation and never re-read
     /// from the environment afterwards (task 0005).
     pub agents: AgentSelection,
@@ -775,6 +891,8 @@ impl Task {
             project_id: None,
             technology: Some(TechStack::Rust),
             output: Some(OutputTarget::ReviewableResult),
+            destination: None,
+            persistence: None,
             agents: AgentSelection::compiled_defaults(),
             profile: None,
             result: None,
@@ -807,6 +925,10 @@ impl Task {
             project_id: request.project_id,
             technology: request.technology,
             output: request.output,
+            destination: request
+                .destination
+                .map(|destination| destination.trim().to_string()),
+            persistence: None,
             agents,
             git_mode: request.git_mode.unwrap_or_default(),
             profile: None,
@@ -913,6 +1035,41 @@ impl Task {
                     milestone.completed_at = Some(timestamp);
                 }
             }
+            // Task 0010: persistent-output state is rebuilt from its events, so
+            // a snapshot and the audit log can never disagree about it.
+            TaskEvent::ProjectPersistenceStarted { ref destination } => {
+                self.persistence = Some(ProjectPersistence {
+                    mode: OutputTarget::PersistentLocalProject,
+                    status: PersistenceStatus::Started,
+                    destination: destination.clone(),
+                    git: None,
+                    error: None,
+                });
+            }
+            TaskEvent::ProjectPersisted {
+                ref destination,
+                ref git,
+            } => {
+                self.persistence = Some(ProjectPersistence {
+                    mode: OutputTarget::PersistentLocalProject,
+                    status: PersistenceStatus::Persisted,
+                    destination: destination.clone(),
+                    git: git.clone(),
+                    error: None,
+                });
+            }
+            TaskEvent::ProjectPersistenceFailed {
+                ref destination,
+                ref error,
+            } => {
+                self.persistence = Some(ProjectPersistence {
+                    mode: OutputTarget::PersistentLocalProject,
+                    status: PersistenceStatus::Failed,
+                    destination: destination.clone(),
+                    git: None,
+                    error: Some(error.clone()),
+                });
+            }
             TaskEvent::MilestoneCommitCreated {
                 ref id, ref commit, ..
             } => {
@@ -1000,6 +1157,15 @@ impl Task {
         }
         if let Some(error) = &mut self.error {
             clean(error);
+        }
+        if let Some(destination) = &mut self.destination {
+            clean(destination);
+        }
+        if let Some(persistence) = &mut self.persistence {
+            clean(&mut persistence.destination);
+            if let Some(error) = &mut persistence.error {
+                clean(error);
+            }
         }
         if let Some(decision) = &mut self.decision
             && let Some(spec) = &mut decision.spec
@@ -1218,6 +1384,7 @@ impl TaskManager {
                 project_id: None,
                 technology: Some(TechStack::Rust),
                 output: Some(OutputTarget::ReviewableResult),
+                destination: None,
                 agents: None,
                 git_mode: None,
             },
@@ -2231,6 +2398,7 @@ mod tests {
             project_id: None,
             technology: Some(TechStack::Python),
             output: Some(OutputTarget::ReviewableResult),
+            destination: None,
             agents: None,
             git_mode: None,
         };
@@ -2254,6 +2422,7 @@ mod tests {
                 project_id: Some(Uuid::new_v4()),
                 technology: None,
                 output: None,
+                destination: None,
                 agents: None,
                 git_mode: None,
             };
@@ -2277,6 +2446,7 @@ mod tests {
             project_id: None,
             technology: Some(TechStack::Custom),
             output: Some(OutputTarget::ReviewableResult),
+            destination: None,
             agents: None,
             git_mode: None,
         };

@@ -19,8 +19,8 @@ use crate::agent::{
 use crate::milestone::MilestoneStatus;
 use crate::project::{Project, ProjectSource};
 use crate::task::{
-    Decision, OutputTarget, RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRequest,
-    TaskStatus,
+    Decision, OutputTarget, PersistenceStatus, ProjectPersistence, RecordedEvent, Task, TaskEvent,
+    TaskId, TaskKind, TaskRequest, TaskStatus,
 };
 use crate::technology::TechStack;
 use crate::web::{AppState, pipeline};
@@ -164,6 +164,74 @@ fn milestone_list_html(milestones: &[crate::milestone::Milestone]) -> String {
         })
         .collect::<String>();
     format!(r#"<ol class="milestones">{rows}</ol>"#)
+}
+
+/// The output card. Shown only for tasks that have an output target of their
+/// own — Feature and Bug Fix inherit the registered project's, so the option
+/// does not apply to them (task 0010).
+fn output_html(task: &Task) -> String {
+    format!(
+        r#"<div class="card"><h2 class="section">Output</h2><div id="output-summary" hx-swap="innerHTML">{}</div></div>"#,
+        output_state_html(task.output, task.persistence.as_ref())
+    )
+}
+
+/// Rendered from current task state, so a reload and a live update agree.
+fn output_state_html(
+    output: Option<OutputTarget>,
+    persistence: Option<&ProjectPersistence>,
+) -> String {
+    let Some(output) = output else {
+        return String::new();
+    };
+    let mut html = format!(
+        r#"<div class="agent"><span class="role">Mode</span><span class="who">{}</span></div>"#,
+        esc(output.label())
+    );
+    match persistence {
+        None if output.is_persistent() => html.push_str(
+            r#"<div class="hint">The finished project is kept after the run; nothing has been written yet.</div>"#,
+        ),
+        None => html.push_str(
+            r#"<div class="hint">The temporary workspace is removed after the run; review the result below.</div>"#,
+        ),
+        Some(persistence) => {
+            let (class, detail) = match persistence.status {
+                PersistenceStatus::Persisted => (
+                    "ok",
+                    format!(
+                        "Kept at <code>{}</code>{}",
+                        esc(&persistence.destination),
+                        persistence
+                            .git
+                            .as_ref()
+                            .map(|git| format!(
+                                " · Git history preserved: {} commit(s)",
+                                git.commits
+                            ))
+                            .unwrap_or_default()
+                    ),
+                ),
+                PersistenceStatus::Failed => (
+                    "err",
+                    format!(
+                        "Not kept at <code>{}</code> · {}",
+                        esc(&persistence.destination),
+                        esc(persistence.error.as_deref().unwrap_or("no detail recorded"))
+                    ),
+                ),
+                PersistenceStatus::Started => (
+                    "active",
+                    format!("Writing to <code>{}</code>…", esc(&persistence.destination)),
+                ),
+            };
+            html.push_str(&format!(
+                r#"<div class="agent"><span class="milestone-status {class}">{}</span><span class="who">{detail}</span></div>"#,
+                persistence.status.label()
+            ));
+        }
+    }
+    html
 }
 
 fn gate_html(id: TaskId, spec: &str) -> String {
@@ -505,6 +573,31 @@ fn event_html(
                 esc(&commit.short_sha)
             ),
         )),
+        TaskEvent::ProjectPersistenceStarted { destination } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Keeping the project at <code>{}</code></div>"#,
+                esc(destination)
+            ),
+        )),
+        TaskEvent::ProjectPersisted { destination, git } => Some((
+            "build",
+            format!(
+                r#"<div class="notice ok">Project kept at <code>{}</code>{}</div>"#,
+                esc(destination),
+                git.as_ref()
+                    .map(|git| format!(" · {} commit(s) preserved", git.commits))
+                    .unwrap_or_default()
+            ),
+        )),
+        TaskEvent::ProjectPersistenceFailed { destination, error } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Could not keep the project at <code>{}</code> · {}</div>"#,
+                esc(destination),
+                esc(error)
+            ),
+        )),
         TaskEvent::Result { result } => {
             Some(("build", format!("<pre>{}</pre>", esc(&result.diff))))
         }
@@ -562,29 +655,62 @@ fn timestamp_html(recorded: &RecordedEvent) -> String {
     )
 }
 
+/// The task state a live update is rendered against.
+///
+/// Live updates are rendered from CURRENT task state rather than from one event
+/// in isolation, so a reconnecting browser and a live one show the same thing.
+struct RenderState<'a> {
+    spec: Option<&'a str>,
+    agents: &'a AgentSelection,
+    milestones: &'a [crate::milestone::Milestone],
+    output: Option<OutputTarget>,
+    persistence: Option<&'a ProjectPersistence>,
+}
+
+impl<'a> RenderState<'a> {
+    fn of(task: &'a Task) -> Self {
+        Self {
+            spec: task.spec.as_deref(),
+            agents: &task.agents,
+            milestones: &task.milestones,
+            output: task.output,
+            persistence: task.persistence.as_ref(),
+        }
+    }
+}
+
 /// A single domain event may affect several independent live UI regions.
 ///
 /// `milestones` is the task's CURRENT plan state, so a milestone event refreshes
 /// the visible pending/running/passed/failed/cancelled badges instead of only
-/// appending a line of text (task 0008 follow-up). The extra updates travel as
+/// appending a line of text (task 0008 follow-up); persistence events refresh
+/// the output card the same way (task 0010). The extra updates travel as
 /// out-of-band swaps on the same SSE message, so ordering is unchanged.
 fn event_updates(
     id: TaskId,
     recorded: &RecordedEvent,
-    current_spec: Option<&str>,
-    agents: &AgentSelection,
-    milestones: &[crate::milestone::Milestone],
+    state: &RenderState<'_>,
 ) -> Vec<(&'static str, String)> {
-    let Some((name, html)) = event_html(id, recorded, agents) else {
+    let Some((name, html)) = event_html(id, recorded, state.agents) else {
         return Vec::new();
     };
+    let output = || output_state_html(state.output, state.persistence);
     if let TaskEvent::Finished { status, .. } = &recorded.event {
         return vec![
             ("status", timeline_html(*status)),
             (name, html),
-            ("spec", spec_readonly_html(current_spec)),
-            ("milestones", milestone_list_html(milestones)),
+            ("spec", spec_readonly_html(state.spec)),
+            ("milestones", milestone_list_html(state.milestones)),
+            ("output-summary", output()),
         ];
+    }
+    if matches!(
+        recorded.event,
+        TaskEvent::ProjectPersistenceStarted { .. }
+            | TaskEvent::ProjectPersisted { .. }
+            | TaskEvent::ProjectPersistenceFailed { .. }
+    ) {
+        return vec![(name, html), ("output-summary", output())];
     }
     if matches!(
         recorded.event,
@@ -597,7 +723,7 @@ fn event_updates(
     ) {
         return vec![
             (name, html),
-            ("milestones", milestone_list_html(milestones)),
+            ("milestones", milestone_list_html(state.milestones)),
         ];
     }
     vec![(name, html)]
@@ -672,6 +798,10 @@ pub struct CreateForm {
     pub technology: Option<TechStack>,
     #[serde(default)]
     pub output: Option<OutputTarget>,
+    /// The persistent destination folder name (task 0010). A browser submits an
+    /// untouched text input as an empty string, which means "not chosen".
+    #[serde(default)]
+    pub destination: Option<String>,
     #[serde(default)]
     pub proposer_provider: Option<String>,
     #[serde(default)]
@@ -765,6 +895,7 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         project_id: form.project_id,
         technology: form.technology,
         output: form.output,
+        destination: chosen(&form.destination).map(str::to_string),
         agents,
         git_mode,
     };
@@ -819,16 +950,11 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         String::new()
     };
     let mut done = String::new();
+    let render = RenderState::of(&task);
     for event in task.display_history() {
-        // The page renders the milestone card from state below, so the
-        // "milestones" slot is ignored while replaying history.
-        for (slot, html) in event_updates(
-            id,
-            event,
-            task.spec.as_deref(),
-            &task.agents,
-            &task.milestones,
-        ) {
+        // The page renders the milestone and output cards from state below, so
+        // their slots are ignored while replaying history.
+        for (slot, html) in event_updates(id, event, &render) {
             match slot {
                 "debate" => debate.push_str(&html),
                 "spec" => spec = html,
@@ -847,10 +973,16 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
     let agents = agents_html(&task.agents, task.git_mode);
+    let output = if task.output.is_some() {
+        output_html(&task)
+    } else {
+        String::new()
+    };
     Html(page_html(
         &task,
         &project_name,
         &agents,
+        &output,
         &debate,
         &spec,
         &build,
@@ -867,10 +999,12 @@ fn spec_readonly_html(spec: Option<&str>) -> String {
     spec.map(|spec| format!(r#"<div class="card"><h2 class="section">Specification</h2><div class="spec-body">{}</div></div>"#, esc(spec))).unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn page_html(
     task: &Task,
     project: &str,
     agents: &str,
+    output: &str,
     debate: &str,
     spec: &str,
     build: &str,
@@ -879,7 +1013,7 @@ fn page_html(
     let actions = actions_html(task.id);
     let milestones = milestones_html(task);
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{actions}{milestones}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{output}{actions}{milestones}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
         id = task.id,
         title = esc(&task.title),
         kind = task.kind.label(),
@@ -897,21 +1031,20 @@ pub async fn stream(
         let updates = match received {
             Ok((event_id, event)) if event_id == id => {
                 let task = manager.get(id);
-                let agents = task
-                    .as_ref()
-                    .map(|task| task.agents.clone())
-                    .unwrap_or_else(AgentSelection::compiled_defaults);
-                let milestones = task
-                    .as_ref()
-                    .map(|task| task.milestones.clone())
-                    .unwrap_or_default();
-                event_updates(
-                    id,
-                    &event,
-                    task.as_ref().and_then(|task| task.spec.as_deref()),
-                    &agents,
-                    &milestones,
-                )
+                // A task that vanished mid-stream still renders, with the
+                // compiled defaults standing in for state we can no longer read.
+                let fallback = AgentSelection::compiled_defaults();
+                let render = match &task {
+                    Some(task) => RenderState::of(task),
+                    None => RenderState {
+                        spec: None,
+                        agents: &fallback,
+                        milestones: &[],
+                        output: None,
+                        persistence: None,
+                    },
+                };
+                event_updates(id, &event, &render)
             }
             Ok(_) => return None,
             Err(BroadcastStreamRecvError::Lagged(_)) => vec![(

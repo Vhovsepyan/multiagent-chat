@@ -40,6 +40,8 @@ See [Agent selection](#agent-selection) for details.
 
 `WORKSPACE_ROOT` is no longer required by the web application. It remains an optional compatibility setting for the original CLI workflow.
 
+`PERSISTENT_OUTPUT_ROOT` names the one existing folder a persistent New Project may be written into. It is optional: when unset, `WORKSPACE_ROOT` is used, and when neither is set, persistent output is refused with a message naming the variable to set.
+
 ## Usage
 
 ```bash
@@ -58,7 +60,18 @@ In the web UI:
 6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
 7. Select **Export Evidence** at any point to download the run's redacted evidence package.
 
-Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output configuration. The initial output is a reviewable task result; repository publishing is intentionally deferred.
+Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output mode.
+
+### New Project output
+
+A New Project chooses between two outputs; the default is unchanged from before this option existed.
+
+- **Temporary review result** — the project is built in the isolated task workspace and reviewed from the task result. The workspace is then removed.
+- **Persistent local project** — after implementation and verification succeed, the finished project is copied into `PERSISTENT_OUTPUT_ROOT/<destination>` and survives workspace cleanup.
+
+The destination is a plain folder name (letters, digits, dot, dash, underscore), never a path: the server joins it to the configured output root, so separators, `..` and absolute paths are rejected. An existing non-empty destination is never overwritten, and links are refused rather than followed. The project is staged and then moved into place, so a failed persistence leaves the destination exactly as it was, fails the task, and is recorded as `project_persistence_failed`. When milestone commits are enabled, the repository is copied verbatim, so commit history and SHAs are preserved; no remote is ever configured or pushed.
+
+This option does not apply to Feature and Bug Fix tasks, which inherit the registered project's output.
 
 Approval is accepted only once, while the task is waiting for review. Early,
 duplicate, and terminal-task approval requests are rejected. An approved
@@ -389,8 +402,10 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
   models, and the default selection. Names only; never credentials.
 - `GET /api/projects` — registered Projects.
 - `POST /api/projects` — register a GitHub Project.
-- `POST /api/tasks` — create a typed task, optionally with an `agents` selection
-  and a `git_mode` (`none` or `commit_per_milestone`).
+- `POST /api/tasks` — create a typed task, optionally with an `agents` selection,
+  a `git_mode` (`none` or `commit_per_milestone`), and, for New Project, an
+  `output` (`reviewable_result` or `persistent_local_project`) with a
+  `destination` folder name for the persistent mode.
 - `GET /api/tasks/{id}` — task snapshot, append-only audit `history`, and the
   bounded `log_tail`; every entry has sequence/timestamp/event fields.
 - `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
@@ -418,6 +433,21 @@ Example New Project task:
   "output": "reviewable_result"
 }
 ```
+
+Example New Project task kept on disk:
+
+```json
+{
+  "kind": "new_project",
+  "title": "Create an event processor",
+  "description": "Process events idempotently and expose health checks.",
+  "technology": "rust",
+  "output": "persistent_local_project",
+  "destination": "event-processor"
+}
+```
+
+A finished task then reports its `persistence` (`mode`, `status`, `destination`, and repository status where applicable).
 
 Example Feature task:
 
@@ -466,6 +496,7 @@ src/
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
+  persistence.rs   persistent New Project output: safe destination and finalization
   process_environment.rs explicit child-process environment policy
   execution_limits.rs centralized timeout, output, history, recovery settings
   process_runner.rs bounded process execution and output streaming
@@ -482,7 +513,8 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Evidence retention is in memory and is lost on restart. Raw worker
   stdout/stderr is intentionally not retained in the evidence transcript; the
   existing bounded UI log and process capture remain separate.
-- The initial New Project output is a reviewable result, not a downloadable archive or pushed repository.
+- A persistent New Project is written to a local folder only. Downloadable archives, created GitHub repositories, and pushes are not implemented.
+- Persistent output requires a configured `PERSISTENT_OUTPUT_ROOT` (or `WORKSPACE_ROOT`); it cannot write anywhere else, and the generated project must contain no symlinks or junctions.
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.

@@ -29,6 +29,7 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         gemini_api_key: Some("test".into()),
         anthropic_api_key: Some("test".into()),
         workspace_root: Some(root.clone()),
+        persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
@@ -44,6 +45,14 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         AppState::with_workspace(config, std::sync::Arc::new(provider)),
         root,
     )
+}
+
+/// Task 0010: the one folder a persistent New Project may be written into.
+/// Created per test root so nothing a test persists can escape it.
+pub(super) fn persistent_output_root(root: &std::path::Path) -> std::path::PathBuf {
+    let output = root.join("persistent-output");
+    std::fs::create_dir_all(&output).unwrap();
+    output
 }
 
 async fn body_json(response: axum::response::Response) -> Value {
@@ -1049,6 +1058,7 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
         gemini_api_key: Some("gemini-credential-must-not-leak".into()),
         anthropic_api_key: Some("anthropic-credential-must-not-leak".into()),
         workspace_root: Some(root.clone()),
+        persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
@@ -1423,6 +1433,7 @@ fn state_with_credentials(
         gemini_api_key: gemini.then(|| "gemini-credential-must-not-leak".into()),
         anthropic_api_key: anthropic.then(|| "anthropic-credential-must-not-leak".into()),
         workspace_root: Some(root.clone()),
+        persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
@@ -2152,5 +2163,155 @@ async fn milestone_commits_appear_in_exported_evidence() {
     assert!(!jsonl.contains("task-workspaces"), "workspace path leaked");
     assert!(!jsonl.to_lowercase().contains("api_key"));
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Task 0010: the New Project output mode reaches the API, and a destination
+/// that is not a plain folder name inside the output root never gets that far.
+#[tokio::test]
+async fn persistent_new_project_output_is_accepted_and_unsafe_destinations_are_rejected() {
+    let (state, root) = test_state("persistent-output-api");
+    let app = router(state.clone());
+
+    let created = app
+        .clone()
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Invoice tool",
+                "description": "Generate invoices from a CSV file",
+                "technology": "rust",
+                "output": "persistent_local_project",
+                "destination": "invoice-tool"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let body = body_json(created).await;
+    assert_eq!(body["output"], "persistent_local_project");
+    assert_eq!(body["destination"], "invoice-tool");
+    assert!(
+        body["persistence"].is_null(),
+        "nothing is persisted at creation"
+    );
+
+    let base = json!({
+        "kind": "new_project",
+        "title": "Invoice tool",
+        "description": "Generate invoices from a CSV file",
+        "technology": "rust"
+    });
+    let with = |fields: Value| {
+        let mut request = base.clone();
+        for (key, value) in fields.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        request
+    };
+    for (invalid, expected) in [
+        (
+            with(json!({"output": "persistent_local_project"})),
+            "destination folder name",
+        ),
+        (
+            with(json!({"output": "persistent_local_project", "destination": "../escape"})),
+            "destination folder name",
+        ),
+        (
+            with(json!({"output": "persistent_local_project", "destination": "nested/child"})),
+            "destination folder name",
+        ),
+        (
+            with(json!({"output": "persistent_local_project", "destination": "C:/Windows"})),
+            "destination folder name",
+        ),
+        (
+            with(json!({"output": "reviewable_result", "destination": "invoice-tool"})),
+            "no destination folder",
+        ),
+        (
+            json!({
+                "kind": "feature",
+                "project_id": "11111111-1111-4111-8111-111111111111",
+                "title": "Add idempotency",
+                "description": "Reject duplicate keys",
+                "destination": "somewhere"
+            }),
+            "detected technology and output",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(post("/api/tasks", invalid.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "should be rejected: {invalid}"
+        );
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+
+    // Only the accepted task exists, and nothing was written to the output root.
+    assert_eq!(state.manager.len(), 1);
+    assert_eq!(
+        std::fs::read_dir(state.config.persistent_output_root.as_ref().unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The browser form carries the same choice, and an untouched destination input
+/// is "not chosen" rather than an empty destination.
+#[tokio::test]
+async fn the_form_offers_the_output_mode_and_submits_a_destination() {
+    let (state, root) = test_state("ui-output-form");
+    let app = router(state.clone());
+    let html = body_text(app.clone().oneshot(get("/")).await.unwrap()).await;
+    for field in [
+        "persistent_local_project",
+        "reviewable_result",
+        "destination",
+    ] {
+        assert!(html.contains(field), "form is missing {field}");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust\
+             &output=persistent_local_project&destination=renamer-tool",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("HX-Redirect"));
+
+    let rejected = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/tasks",
+            "kind=new_project&title=Renamer&description=Build+it&technology=rust\
+             &output=persistent_local_project&destination=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_text(rejected)
+            .await
+            .contains("destination folder name"),
+        "the form must say what is wrong"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

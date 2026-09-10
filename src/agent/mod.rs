@@ -84,6 +84,7 @@ pub(crate) fn test_config() -> Config {
         gemini_api_key: Some("test".into()),
         anthropic_api_key: Some("test".into()),
         workspace_root: None,
+        persistent_output_root: None,
         max_rounds: 1,
         gemini_model: "proposer-model".into(),
         critic_model: "critic-model".into(),

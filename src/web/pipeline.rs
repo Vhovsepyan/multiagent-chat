@@ -6,9 +6,12 @@ use crate::agent::{CodingAgent, CodingAgentConfig, CodingTaskRequest};
 use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
 use crate::inspection::{InspectionRequest, inspect};
 use crate::milestone::plan_from_spec;
+use crate::persistence::PersistentDestination;
 use crate::project::Project;
 use crate::spec;
-use crate::task::{Emitter, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus};
+use crate::task::{
+    Emitter, Task, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus,
+};
 use crate::technology::ProjectProfile;
 use crate::web::AppState;
 use crate::workspace::{TaskWorkspace, WorkspaceRequest, task_result_diff};
@@ -176,6 +179,16 @@ async fn run(
     emitter.emit(TaskEvent::AgentsSelected {
         agents: task.agents.clone(),
     });
+
+    // Task 0010: an unusable persistent destination is reported here, before any
+    // agent or workspace work, rather than after a whole run has been paid for.
+    let destination = persistent_destination(state, &task)?;
+    if let Some(destination) = &destination {
+        emitter.notice(format!(
+            "this run will keep the finished project at {}",
+            destination.display()
+        ));
+    }
 
     let project = match task.project_id {
         Some(project_id) => Some(
@@ -501,8 +514,76 @@ async fn run(
         verification: all_verification,
         diff,
     };
+    // The result is recorded BEFORE persistence, so a persistence failure still
+    // leaves the full evidence of what the run produced.
     emitter.emit(TaskEvent::Result { result });
+
+    // Task 0010: implementation and verification are done; the project may now
+    // leave the disposable workspace for the destination the user chose.
+    if let Some(destination) = &destination {
+        if state.manager.is_cancelled(id) {
+            emitter.notice("task cancelled before the project was persisted");
+            return Ok(());
+        }
+        persist_project(state, emitter, destination, workspace_ref).await?;
+    }
     Ok(())
+}
+
+/// The destination a persistent New Project will use, or `None` for the
+/// temporary review result every other task produces.
+fn persistent_destination(state: &AppState, task: &Task) -> Result<Option<PersistentDestination>> {
+    if !task.output.is_some_and(|output| output.is_persistent()) {
+        return Ok(None);
+    }
+    let name = task
+        .destination
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("a persistent project has no destination folder name"))?;
+    let destination =
+        PersistentDestination::resolve(state.config.persistent_output_root.as_deref(), name)?;
+    destination.ensure_available()?;
+    Ok(Some(destination))
+}
+
+/// Copy the finished project to its destination and audit the outcome.
+///
+/// A failure here is a task failure: the destination must never be presented as
+/// a completed persistent result when the project did not actually reach it.
+async fn persist_project(
+    state: &AppState,
+    emitter: &Emitter,
+    destination: &PersistentDestination,
+    workspace: &TaskWorkspace,
+) -> Result<()> {
+    emitter.emit(TaskEvent::ProjectPersistenceStarted {
+        destination: destination.display(),
+    });
+    let source = workspace.path.clone();
+    let target = destination.clone();
+    let limits = state.config.execution.clone();
+    let persisted =
+        match tokio::task::spawn_blocking(move || target.persist(&source, &limits)).await {
+            Ok(persisted) => persisted,
+            Err(error) => Err(anyhow::anyhow!("project persistence task failed: {error}")),
+        };
+    match persisted {
+        Ok(project) => {
+            emitter.emit(TaskEvent::ProjectPersisted {
+                destination: project.destination,
+                git: project.git,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            emitter.emit(TaskEvent::ProjectPersistenceFailed {
+                destination: destination.display(),
+                error: message.clone(),
+            });
+            bail!("could not keep the generated project: {message}")
+        }
+    }
 }
 
 async fn execute_verification(
@@ -1137,5 +1218,236 @@ mod failure_limit_tests {
             Some("execution failed")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Task 0010: persistent New Project output, from choosing a destination to the
+/// evidence the finished run leaves behind.
+#[cfg(test)]
+mod persistent_output_tests {
+    use super::*;
+    use crate::agent::AgentSelection;
+    use crate::task::{OutputTarget, PersistenceStatus, TaskKind, TaskRequest};
+    use crate::technology::TechStack;
+
+    fn new_project(state: &AppState, output: OutputTarget, destination: Option<&str>) -> Task {
+        state
+            .manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::NewProject,
+                    title: "Invoice tool".into(),
+                    description: "Generate invoices from a CSV file".into(),
+                    project_id: None,
+                    technology: Some(TechStack::Rust),
+                    output: Some(output),
+                    destination: destination.map(str::to_string),
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap()
+    }
+
+    fn workspace_with_project(state: &AppState, task: &Task) -> TaskWorkspace {
+        let workspace = state
+            .workspaces
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        std::fs::write(workspace.path.join("main.rs"), "fn main() {}\n").unwrap();
+        workspace
+    }
+
+    /// The `type` of every recorded event, which is what the audit log exposes.
+    fn event_kinds(task: &Task) -> Vec<String> {
+        task.history
+            .iter()
+            .map(|recorded| {
+                serde_json::to_value(&recorded.event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn final_report(state: &AppState, id: TaskId) -> String {
+        let snapshot = state.manager.evidence_snapshot(id).unwrap();
+        crate::evidence::export(&snapshot)
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|(name, _)| name == crate::evidence::FINAL_REPORT_FILENAME)
+            .expect("the final report is part of every export")
+            .1
+    }
+
+    /// Required test 1 and 3, and the audit half of required test 8: the project
+    /// reaches its destination and stays there once the workspace is cleaned.
+    #[tokio::test]
+    async fn a_persistent_new_project_outlives_the_temporary_workspace() {
+        let (state, root) = crate::web::tests::test_state("persist-success");
+        let task = new_project(
+            &state,
+            OutputTarget::PersistentLocalProject,
+            Some("kept-project"),
+        );
+        let emitter = state.manager.emitter(task.id);
+        let destination = persistent_destination(&state, &task)
+            .unwrap()
+            .expect("a persistent task resolves a destination");
+        let workspace = workspace_with_project(&state, &task);
+
+        persist_project(&state, &emitter, &destination, &workspace)
+            .await
+            .unwrap();
+        finish_run(&state, task.id, &emitter, Some(&workspace), Ok(()));
+
+        assert!(
+            !workspace.root.exists(),
+            "the temporary workspace is still disposable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Completed);
+        let persistence = stored.persistence.clone().expect("persistence metadata");
+        assert_eq!(persistence.status, PersistenceStatus::Persisted);
+        assert_eq!(persistence.mode, OutputTarget::PersistentLocalProject);
+        assert_eq!(persistence.destination, destination.display());
+        // The workspace is a repository, so the persisted project describes one.
+        let git = persistence.git.expect("a repository was persisted");
+        assert!(!git.has_remote, "no remote may be configured");
+        let kinds = event_kinds(&stored);
+        assert!(kinds.contains(&"project_persistence_started".to_string()));
+        assert!(kinds.contains(&"project_persisted".to_string()));
+        let report = final_report(&state, task.id);
+        assert!(
+            report.contains("Output mode: Persistent local project"),
+            "{report}"
+        );
+        assert!(report.contains("Persisted to"), "{report}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Required test 2: a temporary review result behaves exactly as before —
+    /// nothing is written outside the workspace, and nothing is audited.
+    #[tokio::test]
+    async fn a_temporary_new_project_publishes_nothing_outside_the_workspace() {
+        let (state, root) = crate::web::tests::test_state("persist-temporary");
+        let task = new_project(&state, OutputTarget::ReviewableResult, None);
+        let emitter = state.manager.emitter(task.id);
+        assert!(
+            persistent_destination(&state, &task).unwrap().is_none(),
+            "a review result resolves no destination"
+        );
+        let workspace = workspace_with_project(&state, &task);
+
+        finish_run(&state, task.id, &emitter, Some(&workspace), Ok(()));
+
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Completed);
+        assert!(stored.persistence.is_none());
+        assert!(
+            !event_kinds(&stored)
+                .iter()
+                .any(|kind| kind.starts_with("project_persist")),
+            "no persistence event belongs to a temporary run"
+        );
+        assert!(!workspace.root.exists());
+        assert_eq!(
+            std::fs::read_dir(state.config.persistent_output_root.as_ref().unwrap())
+                .unwrap()
+                .count(),
+            0,
+            "the configured output root must stay untouched"
+        );
+        let report = final_report(&state, task.id);
+        assert!(
+            report.contains("Output mode: Temporary review result"),
+            "{report}"
+        );
+        assert!(report.contains("Not requested"), "{report}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Required tests 7 and 8: a destination that became unusable during the run
+    /// fails the task, is audited, and keeps whatever is already there.
+    #[tokio::test]
+    async fn a_persistence_failure_fails_the_task_and_keeps_the_destination() {
+        let (state, root) = crate::web::tests::test_state("persist-failure");
+        let task = new_project(
+            &state,
+            OutputTarget::PersistentLocalProject,
+            Some("occupied-later"),
+        );
+        let emitter = state.manager.emitter(task.id);
+        let destination = persistent_destination(&state, &task).unwrap().unwrap();
+        let workspace = workspace_with_project(&state, &task);
+        // Somebody puts a project there while this run is still building.
+        std::fs::create_dir_all(destination.path()).unwrap();
+        std::fs::write(destination.path().join("existing.txt"), "user work\n").unwrap();
+
+        let error = persist_project(&state, &emitter, &destination, &workspace)
+            .await
+            .unwrap_err();
+        finish_run(&state, task.id, &emitter, Some(&workspace), Err(error));
+
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("existing.txt")).unwrap(),
+            "user work\n",
+            "existing destination content must survive"
+        );
+        assert!(!destination.path().join("main.rs").exists());
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        let persistence = stored.persistence.clone().expect("persistence metadata");
+        assert_eq!(persistence.status, PersistenceStatus::Failed);
+        assert!(
+            persistence.error.as_deref().unwrap().contains("not empty"),
+            "{persistence:?}"
+        );
+        let kinds = event_kinds(&stored);
+        assert!(kinds.contains(&"project_persistence_failed".to_string()));
+        assert!(!kinds.contains(&"project_persisted".to_string()));
+        assert!(!kinds.contains(&"task_completed".to_string()));
+        let report = final_report(&state, task.id);
+        assert!(report.contains("Persistent result: Failed"), "{report}");
+        assert!(!report.contains("Persisted to"), "{report}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// An unusable destination stops the run before any agent is called, and an
+    /// installation that configures no output root cannot persist at all.
+    #[tokio::test]
+    async fn an_unusable_destination_is_refused_before_the_run_starts() {
+        let (mut state, root) = crate::web::tests::test_state("persist-precheck");
+        let task = new_project(
+            &state,
+            OutputTarget::PersistentLocalProject,
+            Some("already-there"),
+        );
+        let output_root = state.config.persistent_output_root.clone().unwrap();
+        std::fs::create_dir_all(output_root.join("already-there")).unwrap();
+        std::fs::write(output_root.join("already-there/theirs.txt"), "theirs\n").unwrap();
+
+        let error = persistent_destination(&state, &task)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not empty"), "unexpected: {error}");
+
+        std::sync::Arc::make_mut(&mut state.config).persistent_output_root = None;
+        let error = persistent_destination(&state, &task)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not configured"), "unexpected: {error}");
+        std::fs::remove_dir_all(root).ok();
     }
 }

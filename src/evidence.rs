@@ -603,6 +603,33 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Commit message: {}", markdown_inline(&commit.message)),
             ],
         ),
+        TaskEvent::ProjectPersistenceStarted { destination } => (
+            "Project persistence started".into(),
+            vec![format!("Destination: `{}`", markdown_inline(destination))],
+        ),
+        TaskEvent::ProjectPersisted { destination, git } => {
+            let mut details = vec![format!("Destination: `{}`", markdown_inline(destination))];
+            if let Some(git) = git {
+                details.push(format!("Git commits: {}", git.commits));
+                if let Some(branch) = &git.branch {
+                    details.push(format!("Git branch: `{}`", markdown_inline(branch)));
+                }
+                if let Some(head) = &git.head_sha {
+                    details.push(format!("Git HEAD: `{}`", markdown_inline(head)));
+                }
+                details.push(format!("Git remote configured: {}", git.has_remote));
+            } else {
+                details.push("Git repository: none".into());
+            }
+            ("Project persisted".into(), details)
+        }
+        TaskEvent::ProjectPersistenceFailed { destination, error } => (
+            "Project persistence failed".into(),
+            vec![
+                format!("Destination: `{}`", markdown_inline(destination)),
+                format!("Error: {}", markdown_inline(error)),
+            ],
+        ),
         TaskEvent::Result { .. } => ("Task result captured".into(), vec![]),
         TaskEvent::Finished { status, error } => {
             let mut details = vec![format!("Status: {}", status_label(*status))];
@@ -868,7 +895,7 @@ fn final_report(task: &Task) -> String {
             .any(|recorded| event_contains_truncation(&recorded.event));
 
     let mut markdown = format!(
-        "# Final Report\n\nTask title: {}\n\nTask type: {}\n\nTask description/objective:\n\n{}\n\nStart time: {}\n\nEnd time: {}\n\nFinal status: {}\n\nAgents used: Proposer {} / `{}`; Critic {} / `{}`; Worker {} / `{}`\n\nSpecification status: {}\n\nWorker result: {}\n\nVerification result: {}\n\nOutput/workspace: The temporary workspace is not exported. Any reviewable diff and verification result are retained in task result evidence.\n\n",
+        "# Final Report\n\nTask title: {}\n\nTask type: {}\n\nTask description/objective:\n\n{}\n\nStart time: {}\n\nEnd time: {}\n\nFinal status: {}\n\nAgents used: Proposer {} / `{}`; Critic {} / `{}`; Worker {} / `{}`\n\nSpecification status: {}\n\nWorker result: {}\n\nVerification result: {}\n\nOutput/workspace: The temporary workspace is not exported. Any reviewable diff and verification result are retained in task result evidence.\n\nOutput mode: {}\n\nPersistent result: {}\n\n",
         markdown_inline(&task.title),
         task.kind.label(),
         markdown_quote(&task.description),
@@ -886,6 +913,10 @@ fn final_report(task: &Task) -> String {
             .as_deref()
             .unwrap_or("Not run or no worker result recorded"),
         verification,
+        task.output
+            .map(|output| output.label())
+            .unwrap_or("Not applicable"),
+        persistent_result(task),
     );
     if !task.milestones.is_empty() {
         markdown.push_str("## Milestones\n\n");
@@ -923,6 +954,48 @@ fn final_report(task: &Task) -> String {
     markdown
 }
 
+/// What the export says about persistent output (task 0010). A run that did not
+/// ask for it, or did not reach it, must never read as a persisted project.
+fn persistent_result(task: &Task) -> String {
+    let Some(persistence) = &task.persistence else {
+        return match task.output {
+            Some(crate::task::OutputTarget::PersistentLocalProject) => {
+                "Requested but not attempted; nothing was persisted.".into()
+            }
+            _ => "Not requested; the temporary workspace was not published.".into(),
+        };
+    };
+    match persistence.status {
+        crate::task::PersistenceStatus::Persisted => {
+            let git = match &persistence.git {
+                Some(git) => format!(
+                    " Git repository preserved: {} commit(s){}; remote configured: {}.",
+                    git.commits,
+                    git.head_sha
+                        .as_deref()
+                        .map(|sha| format!(", HEAD `{}`", markdown_inline(sha)))
+                        .unwrap_or_default(),
+                    git.has_remote
+                ),
+                None => " No Git repository was present.".into(),
+            };
+            format!(
+                "Persisted to `{}`.{git}",
+                markdown_inline(&persistence.destination)
+            )
+        }
+        crate::task::PersistenceStatus::Failed => format!(
+            "Failed for `{}`: {}. The destination was left unchanged.",
+            markdown_inline(&persistence.destination),
+            markdown_inline(persistence.error.as_deref().unwrap_or("no detail recorded"))
+        ),
+        crate::task::PersistenceStatus::Started => format!(
+            "Started for `{}` but no completion was recorded.",
+            markdown_inline(&persistence.destination)
+        ),
+    }
+}
+
 fn known_errors(task: &Task) -> Vec<String> {
     let mut errors = Vec::new();
     if let Some(error) = &task.error {
@@ -934,6 +1007,7 @@ fn known_errors(task: &Task) -> Vec<String> {
             | TaskEvent::CriticFailed { error, .. }
             | TaskEvent::WorkerFailed { error, .. }
             | TaskEvent::VerificationFailed { error, .. }
+            | TaskEvent::ProjectPersistenceFailed { error, .. }
             | TaskEvent::TaskFailed { error } => Some(error),
             TaskEvent::Finished {
                 error: Some(error), ..
@@ -1082,6 +1156,7 @@ mod tests {
                     project_id: None,
                     technology: Some(TechStack::Rust),
                     output: Some(OutputTarget::ReviewableResult),
+                    destination: None,
                     agents: None,
                     git_mode: None,
                 },

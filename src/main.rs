@@ -16,6 +16,7 @@ mod git;
 mod implementer;
 mod inspection;
 mod milestone;
+mod persistence;
 mod process_environment;
 #[cfg(windows)]
 mod process_job;

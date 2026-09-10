@@ -73,6 +73,52 @@ pub struct MilestoneCommit {
     pub message: String,
 }
 
+/// A path-free description of a finished project's repository (task 0010).
+///
+/// This is metadata about history that already exists; reading it never writes
+/// to the repository and never configures or contacts a remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryStatus {
+    /// The checked-out branch, or `None` when HEAD is not on one.
+    pub branch: Option<String>,
+    /// The commit the project is on, or `None` when nothing was committed.
+    pub head_sha: Option<String>,
+    /// How many commits that branch holds.
+    pub commits: u32,
+    /// Always false today: this application never configures a remote.
+    pub has_remote: bool,
+}
+
+/// Read the repository state of a project directory, or `None` when it is not
+/// a Git repository at all.
+pub fn repository_status(
+    repo: &Path,
+    limits: &ExecutionLimits,
+) -> Result<Option<RepositoryStatus>> {
+    if !repo.join(".git").exists() {
+        return Ok(None);
+    }
+    let value = |args: &[&str]| -> Result<Option<String>> {
+        Ok(git(repo, args, limits)?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    };
+    let branch = value(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let head_sha = value(&["rev-parse", "HEAD"])?;
+    let commits = match &head_sha {
+        Some(_) => value(&["rev-list", "--count", "HEAD"])?
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0),
+        None => 0,
+    };
+    Ok(Some(RepositoryStatus {
+        branch,
+        head_sha,
+        commits,
+        has_remote: value(&["remote"])?.is_some(),
+    }))
+}
+
 /// The deterministic commit subject for a milestone.
 pub fn commit_message(milestone: &Milestone) -> String {
     let subject = format!(

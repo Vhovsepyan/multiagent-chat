@@ -26,6 +26,10 @@ pub struct Config {
     /// Optional compatibility setting for the original terminal workflow.
     /// Production web tasks use repository-backed temporary workspaces.
     pub workspace_root: Option<PathBuf>,
+    /// The ONE folder a persistent New Project may be written into (task 0010).
+    /// Falls back to `workspace_root`, which already means "the folder holding
+    /// this user's projects". `None` means persistent output is refused.
+    pub persistent_output_root: Option<PathBuf>,
     pub max_rounds: u32,
     /// Default model for the Gemini provider.
     pub gemini_model: String,
@@ -95,6 +99,23 @@ impl Config {
             );
         }
 
+        // Task 0010: only this folder may receive a persistent New Project, and
+        // a configured one must already exist — the application never creates
+        // an output root it was told about but cannot find.
+        let persistent_output_root = env::var("PERSISTENT_OUTPUT_ROOT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        if let Some(path) = &persistent_output_root
+            && !path.is_dir()
+        {
+            bail!(
+                "PERSISTENT_OUTPUT_ROOT does not point at an existing directory: {}",
+                path.display()
+            );
+        }
+        let persistent_output_root = persistent_output_root.or_else(|| workspace_root.clone());
+
         let max_rounds = match env::var("MAX_ROUNDS") {
             Ok(raw) => raw
                 .trim()
@@ -119,6 +140,7 @@ impl Config {
             gemini_api_key: credential("GEMINI_API_KEY"),
             anthropic_api_key: credential("ANTHROPIC_API_KEY"),
             workspace_root,
+            persistent_output_root,
             max_rounds,
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
@@ -189,6 +211,7 @@ impl fmt::Debug for Config {
             .field("gemini_api_key", &redacted(&self.gemini_api_key))
             .field("anthropic_api_key", &redacted(&self.anthropic_api_key))
             .field("workspace_root", &self.workspace_root)
+            .field("persistent_output_root", &self.persistent_output_root)
             .field("max_rounds", &self.max_rounds)
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)

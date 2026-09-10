@@ -52,8 +52,17 @@
           <option value="type_script_node">TypeScript / Node.js</option>
           <option value="custom">Other</option>
         </select>
-        <input type="hidden" id="output" name="output" value="reviewable_result">
-        <div class="hint">This phase produces a reviewable result from an isolated server workspace.</div>
+        <label for="output">Output</label>
+        <select id="output" name="output" onchange="syncOutputFields()">
+          <option value="reviewable_result">Temporary review result</option>
+          <option value="persistent_local_project">Persistent local project</option>
+        </select>
+        <div class="hint" id="output-hint">The project is built in an isolated server workspace and reviewed from the task result; the workspace is then removed.</div>
+        <div id="destination-field" hidden>
+          <label for="destination">Project folder name</label>
+          <input type="text" id="destination" name="destination" placeholder="invoice-tool">
+          <div class="hint">Created inside the server's configured persistent output folder. Letters, digits, dot, dash and underscore only — not a path.</div>
+        </div>
       </div>
 
       <label for="title">Title</label>
@@ -111,6 +120,21 @@
       document.getElementById('project_id').disabled = isNew;
       document.getElementById('technology').disabled = !isNew;
       document.getElementById('output').disabled = !isNew;
+      syncOutputFields();
+    }
+
+    // The destination applies only to a persistent New Project, so it is hidden
+    // AND disabled otherwise — a disabled input is never submitted, which keeps
+    // the request free of a field the server would have to reject.
+    function syncOutputFields() {
+      const isNew = document.getElementById('kind').value === 'new_project';
+      const persistent = document.getElementById('output').value === 'persistent_local_project';
+      const field = document.getElementById('destination-field');
+      field.hidden = !(isNew && persistent);
+      document.getElementById('destination').disabled = !(isNew && persistent);
+      document.getElementById('output-hint').textContent = persistent
+        ? 'The finished project is kept in the server’s configured output folder after the run.'
+        : 'The project is built in an isolated server workspace and reviewed from the task result; the workspace is then removed.';
     }
     syncTaskFields();
 
