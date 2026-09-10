@@ -3,15 +3,17 @@
 //! Every document here is rendered deterministically from task state — the
 //! audit history, acceptance criteria, verification results and the frozen
 //! agent selection — plus a few file-existence checks in the finished project.
-//! Nothing is asked of a model, so nothing can be invented: a command appears
-//! only if this run executed it, a decision only if it was recorded, and a
-//! timestamp only if it came from the audit log.
+//! Nothing is asked of a model, so nothing can be invented: an executed command
+//! comes from the run history, a detected startup command comes from a concrete
+//! project file and is marked unexecuted, a decision only if it was recorded,
+//! and a timestamp only if it came from the audit log.
 //!
 //! Documentation the run did not write is never overwritten. When a target
 //! path already holds something else, the generated document is written beside
 //! it instead and the original is reported as preserved.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -82,28 +84,155 @@ pub fn documents(inputs: &SubmissionInputs<'_>) -> Vec<(&'static str, String)> {
     rendered
 }
 
-/// Write the documents into the finished project.
+/// Write the complete document set into the finished project.
 ///
-/// A path that already holds a file this run did not generate is preserved and
-/// the document goes to `<name>.generated.md` beside it, so existing
-/// documentation is never destroyed and nothing is silently dropped.
+/// Every destination is resolved and every document is staged before an
+/// existing project file is changed. Finalization rolls back any replacement if
+/// a later rename fails, so a failed generation never looks like a successful,
+/// partial six-file submission. Hand-written documentation is only observed,
+/// never opened for writing.
 pub fn write_into(project: &Path, documents: &[(&'static str, String)]) -> Result<Submission> {
-    let mut submission = Submission::default();
-    for (name, contents) in documents {
-        let target = project.join(name);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("could not create the documentation folder for {name}"))?;
-        }
-        let (path, preserved) = destination(&target, name)?;
-        write_document(&path, contents)
-            .with_context(|| format!("could not write generated documentation {name}"))?;
-        if let Some(preserved) = preserved {
-            submission.preserved.push(preserved);
-        }
-        submission.written.push(relative(project, &path));
+    write_into_with(project, documents, |_, path, contents| {
+        fs::write(path, contents)
+    })
+}
+
+struct PlannedDocument {
+    name: &'static str,
+    destination: PathBuf,
+    preserved: Option<String>,
+}
+
+struct StagingDirectory {
+    path: PathBuf,
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        // This directory was created exclusively by this operation inside the
+        // project, and is only ever an unpublished staging area.
+        let _ = fs::remove_dir_all(&self.path);
     }
-    Ok(submission)
+}
+
+fn write_into_with<F>(
+    project: &Path,
+    documents: &[(&'static str, String)],
+    mut stage_write: F,
+) -> Result<Submission>
+where
+    F: FnMut(&str, &Path, &str) -> std::io::Result<()>,
+{
+    let planned = plan_documents(project, documents)?;
+    let stage = create_staging_directory(project)?;
+    let mut staged = Vec::with_capacity(planned.len());
+    for (index, (document, contents)) in documents.iter().enumerate() {
+        let path = stage.path.join(format!("document-{index}.md"));
+        stage_write(document, &path, contents)
+            .with_context(|| format!("could not stage generated documentation {document}"))?;
+        staged.push(path);
+    }
+    finalize_documents(project, &planned, &staged)
+}
+
+fn plan_documents(
+    project: &Path,
+    documents: &[(&'static str, String)],
+) -> Result<Vec<PlannedDocument>> {
+    if documents.len() != DOCUMENTS.len() || documents.iter().map(|(name, _)| *name).ne(DOCUMENTS) {
+        bail!("the complete required documentation set was not rendered");
+    }
+    documents
+        .iter()
+        .map(|(name, _)| {
+            let target = project.join(name);
+            let (destination, preserved) = destination(&target, name)?;
+            if let Ok(metadata) = fs::symlink_metadata(&destination)
+                && (crate::repository_file::is_link(&metadata)
+                    || !metadata.is_file()
+                    || !fs::read_to_string(&destination)
+                        .is_ok_and(|contents| contents.starts_with(MARKER)))
+            {
+                bail!("refusing to replace a linked, non-regular, or hand-written generated documentation file");
+            }
+            Ok(PlannedDocument {
+                name,
+                destination,
+                preserved,
+            })
+        })
+        .collect()
+}
+
+fn create_staging_directory(project: &Path) -> Result<StagingDirectory> {
+    let path = project.join(format!(".multiagent-chat-docs-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&path).context("could not create documentation staging directory")?;
+    Ok(StagingDirectory { path })
+}
+
+fn finalize_documents(
+    project: &Path,
+    planned: &[PlannedDocument],
+    staged: &[PathBuf],
+) -> Result<Submission> {
+    let mut finalized: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(planned.len());
+    for (index, (plan, staged)) in planned.iter().zip(staged).enumerate() {
+        if let Some(parent) = plan.destination.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            rollback_documents(&finalized);
+            return Err(error).with_context(|| {
+                format!(
+                    "could not create the documentation folder for {}",
+                    plan.name
+                )
+            });
+        }
+        let backup = if plan.destination.exists() {
+            let backup = staged.with_file_name(format!("backup-{index}.md"));
+            if let Err(error) = fs::rename(&plan.destination, &backup) {
+                rollback_documents(&finalized);
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not prepare generated documentation {} for replacement",
+                        plan.name
+                    )
+                });
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = fs::rename(staged, &plan.destination) {
+            if let Some(backup) = &backup {
+                let _ = fs::rename(backup, &plan.destination);
+            }
+            rollback_documents(&finalized);
+            return Err(error).with_context(|| {
+                format!("could not finalize generated documentation {}", plan.name)
+            });
+        }
+        finalized.push((plan.destination.clone(), backup));
+    }
+    Ok(Submission {
+        written: planned
+            .iter()
+            .map(|plan| relative(project, &plan.destination))
+            .collect(),
+        preserved: planned
+            .iter()
+            .filter_map(|plan| plan.preserved.clone())
+            .collect(),
+    })
+}
+
+fn rollback_documents(finalized: &[(PathBuf, Option<PathBuf>)]) {
+    for (destination, backup) in finalized.iter().rev() {
+        let _ = fs::remove_file(destination);
+        if let Some(backup) = backup {
+            let _ = fs::rename(backup, destination);
+        }
+    }
 }
 
 /// Where a document may go, and what was preserved to keep it safe.
@@ -130,24 +259,6 @@ fn destination(target: &Path, name: &str) -> Result<(PathBuf, Option<String>)> {
             ))
         }
     }
-}
-
-/// Replace by rename, so an existing directory entry is never opened.
-fn write_document(path: &Path, contents: &str) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (crate::repository_file::is_link(&metadata) || !metadata.is_file())
-    {
-        bail!("refusing to replace a linked or non-regular documentation file");
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("documentation path has no parent"))?;
-    let temporary = parent.join(format!(".docs-{}.tmp", uuid::Uuid::new_v4()));
-    let result = fs::write(&temporary, contents).and_then(|()| fs::rename(&temporary, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    Ok(result?)
 }
 
 fn relative(project: &Path, path: &Path) -> String {
@@ -189,6 +300,7 @@ fn readme(inputs: &SubmissionInputs<'_>) -> String {
          listed under **Verified commands** were executed there; no other start, build or \
          deployment command has been verified by this run.\n\n",
     );
+    startup_section(&mut markdown, inputs);
 
     let configuration = present_files(inputs.project, &[".env.example", ".env.sample", ".env"]);
     markdown.push_str("## Configuration\n\n");
@@ -267,6 +379,145 @@ fn readme(inputs: &SubmissionInputs<'_>) -> String {
         }
     }
     markdown
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupCommand {
+    scope: &'static str,
+    command: String,
+    detected_from: &'static str,
+}
+
+/// Startup commands supported by project metadata. These are documentation
+/// hints only: they are never merged into verification results.
+fn startup_commands(inputs: &SubmissionInputs<'_>) -> Vec<StartupCommand> {
+    let root = inputs.project;
+    let mut commands = Vec::new();
+    if root.join("Cargo.toml").is_file() && root.join("src/main.rs").is_file() {
+        commands.push(StartupCommand {
+            scope: "Local application",
+            command: "cargo run".into(),
+            detected_from: "Cargo.toml and src/main.rs",
+        });
+    }
+    if root.join("pom.xml").is_file()
+        && project_text(root, "pom.xml")
+            .is_some_and(|pom| pom.to_ascii_lowercase().contains("spring-boot"))
+    {
+        commands.push(StartupCommand {
+            scope: "Backend",
+            command: if root.join("mvnw").is_file() {
+                "./mvnw spring-boot:run"
+            } else {
+                "mvn spring-boot:run"
+            }
+            .into(),
+            detected_from: "pom.xml",
+        });
+    }
+    let gradle = ["build.gradle.kts", "build.gradle"]
+        .into_iter()
+        .find(|name| root.join(name).is_file());
+    if let Some(gradle) = gradle
+        && project_text(root, gradle)
+            .is_some_and(|build| build.to_ascii_lowercase().contains("spring-boot"))
+    {
+        commands.push(StartupCommand {
+            scope: "Backend",
+            command: if root.join("gradlew").is_file() {
+                "./gradlew bootRun"
+            } else {
+                "gradle bootRun"
+            }
+            .into(),
+            detected_from: gradle,
+        });
+    }
+    if let Some(scripts) = project_scripts(root) {
+        for (scope, names) in [
+            ("Local development", &["dev", "start"][..]),
+            (
+                "Backend",
+                &["dev:backend", "start:backend", "backend", "server", "api"][..],
+            ),
+            (
+                "Frontend",
+                &["dev:frontend", "start:frontend", "frontend", "client"][..],
+            ),
+        ] {
+            for name in names {
+                if scripts.contains(*name) {
+                    commands.push(StartupCommand {
+                        scope,
+                        command: if *name == "start" {
+                            "npm start".into()
+                        } else {
+                            format!("npm run {name}")
+                        },
+                        detected_from: "package.json",
+                    });
+                }
+            }
+        }
+    }
+    if root.join("manage.py").is_file() {
+        commands.push(StartupCommand {
+            scope: "Backend",
+            command: "python manage.py runserver".into(),
+            detected_from: "manage.py",
+        });
+    }
+    if let Some(compose) = ["docker-compose.yml", "docker-compose.yaml", "compose.yaml"]
+        .into_iter()
+        .find(|name| root.join(name).is_file())
+    {
+        commands.push(StartupCommand {
+            scope: "Containers",
+            command: format!("docker compose -f {compose} up"),
+            detected_from: compose,
+        });
+    }
+    commands
+}
+
+fn startup_section(markdown: &mut String, inputs: &SubmissionInputs<'_>) {
+    markdown.push_str("## Detected startup commands (not executed)\n\n");
+    let commands = startup_commands(inputs);
+    if commands.is_empty() {
+        markdown.push_str("No deterministic startup command was detected from project files.\n\n");
+        return;
+    }
+    markdown.push_str(
+        "These commands were derived from project files and were **not executed or verified** by this run.\n\n\
+         | Scope | Command | Detected from |\n| --- | --- | --- |\n",
+    );
+    for command in commands {
+        markdown.push_str(&format!(
+            "| {} | `{}` | `{}` |\n",
+            command.scope, command.command, command.detected_from
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn project_scripts(root: &Path) -> Option<std::collections::BTreeSet<String>> {
+    let text = project_text(root, "package.json")?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("scripts")?
+        .as_object()
+        .map(|scripts| scripts.keys().cloned().collect())
+}
+
+fn project_text(root: &Path, name: &str) -> Option<String> {
+    let path = root.join(name);
+    let mut text = String::new();
+    crate::repository_file::open(root, &path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 fn architecture(inputs: &SubmissionInputs<'_>) -> String {
@@ -1011,6 +1262,121 @@ mod tests {
             "{readme}"
         );
         assert!(!readme.contains("| Command | Result |"), "{readme}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn startup_commands_are_detected_but_never_claimed_as_verified() {
+        let root = project("startup");
+        let task = finished_task("unused-secret-value");
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"vite","start":"node app.js","dev:backend":"x","dev:frontend":"y"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("docker-compose.yml"), "services: {}\n").unwrap();
+
+        generate(&task, &root, &verification());
+
+        let readme = read(&root, "README.md");
+        assert!(
+            readme.contains("## Detected startup commands (not executed)"),
+            "{readme}"
+        );
+        assert!(readme.contains("`cargo run`"), "{readme}");
+        assert!(readme.contains("`npm run dev`"), "{readme}");
+        assert!(readme.contains("`npm start`"), "{readme}");
+        assert!(readme.contains("`npm run dev:backend`"), "{readme}");
+        assert!(readme.contains("`npm run dev:frontend`"), "{readme}");
+        assert!(
+            readme.contains("`docker compose -f docker-compose.yml up`"),
+            "{readme}"
+        );
+        assert!(
+            readme.contains("were **not executed or verified** by this run"),
+            "{readme}"
+        );
+        assert!(readme.contains("## Verified commands"), "{readme}");
+        assert!(readme.contains("| `cargo test` | passed |"), "{readme}");
+        assert!(!readme.contains("| `cargo run` | passed |"), "{readme}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_staging_write_failure_leaves_no_partial_document_set() {
+        let root = project("atomic-failure");
+        let task = finished_task("unused-secret-value");
+        fs::write(root.join("README.md"), "# Hand-written\nKeep exactly.\n").unwrap();
+        let documents = documents(&SubmissionInputs {
+            task: &task,
+            profile: &ProjectProfile::selected(TechStack::Rust),
+            verification: &verification(),
+            project: &root,
+        });
+
+        let error = write_into_with(&root, &documents, |name, path, contents| {
+            if name == "docs/AI_USAGE.md" {
+                return Err(std::io::Error::other("simulated staging failure"));
+            }
+            fs::write(path, contents)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("AI_USAGE"), "{error:#}");
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Hand-written\nKeep exactly.\n"
+        );
+        for name in DOCUMENTS {
+            assert!(
+                !root.join(name).is_file() || name == "README.md",
+                "{name} was finalized despite the failed complete set"
+            );
+        }
+        assert!(
+            fs::read_dir(&root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".multiagent-chat-docs-")),
+            "staging data was not cleaned"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn finalization_failure_rolls_back_documents_written_earlier_in_the_set() {
+        let root = project("atomic-finalize-failure");
+        let task = finished_task("unused-secret-value");
+        // README is finalized first. This regular file makes the later docs/
+        // parent impossible to create, forcing the rollback path.
+        fs::write(root.join("docs"), "hand-written blocker\n").unwrap();
+        let documents = documents(&SubmissionInputs {
+            task: &task,
+            profile: &ProjectProfile::selected(TechStack::Rust),
+            verification: &verification(),
+            project: &root,
+        });
+
+        let error = write_into(&root, &documents).unwrap_err();
+
+        assert!(
+            error.to_string().contains("documentation folder"),
+            "{error:#}"
+        );
+        assert!(
+            !root.join("README.md").exists(),
+            "README was not rolled back"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("docs")).unwrap(),
+            "hand-written blocker\n",
+            "existing project content changed"
+        );
+        fs::remove_file(root.join("docs")).unwrap();
         fs::remove_dir_all(root).ok();
     }
 }

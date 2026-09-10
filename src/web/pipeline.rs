@@ -609,7 +609,7 @@ async fn run(
         &all_verification,
         workspace_ref,
     )
-    .await;
+    .await?;
 
     let diff_path = workspace_ref.path.clone();
     let limits = state.config.execution.clone();
@@ -869,8 +869,8 @@ async fn execute_worker_stage(
 ///
 /// It runs after implementation, verification and review, so every statement it
 /// makes is backed by recorded state, and before the result is captured, so the
-/// documents are part of the diff and of any persisted project. A failure here
-/// is reported but does not fail a run whose code and verification succeeded.
+/// documents are part of the diff and of any persisted project. This is a
+/// required finalization step: failure cannot leave a task completed.
 async fn generate_documentation(
     state: &AppState,
     id: TaskId,
@@ -878,11 +878,11 @@ async fn generate_documentation(
     profile: &ProjectProfile,
     verification: &[VerificationResult],
     workspace: &TaskWorkspace,
-) {
+) -> Result<()> {
     // The REDACTED snapshot: generated documentation inherits the established
     // secret redaction rather than inventing its own.
     let Some(task) = state.manager.evidence_snapshot(id) else {
-        return;
+        bail!("could not capture task evidence for submission documentation");
     };
     let profile = profile.clone();
     let verification = verification.to_vec();
@@ -906,11 +906,18 @@ async fn generate_documentation(
                 ));
             }
             emitter.emit(crate::submission::generated_event(&submission));
+            Ok(())
         }
-        Ok(Err(error)) => emitter.warn(format!(
-            "submission documentation could not be generated: {error:#}"
-        )),
-        Err(error) => emitter.warn(format!("submission documentation task failed: {error}")),
+        Ok(Err(error)) => {
+            emitter.warn(format!(
+                "submission documentation could not be generated: {error:#}"
+            ));
+            Err(error)
+        }
+        Err(error) => {
+            emitter.warn(format!("submission documentation task failed: {error}"));
+            bail!("submission documentation task failed: {error}")
+        }
     }
 }
 
@@ -3464,7 +3471,8 @@ mod review_loop_tests {
                 &harness.passing_verification(),
                 &harness.workspace,
             )
-            .await;
+            .await
+            .unwrap();
 
             let project = &harness.workspace.path;
             assert_eq!(
@@ -3534,6 +3542,42 @@ mod review_loop_tests {
             assert!(
                 report.contains("Existing documentation left untouched: `README.md`"),
                 "{report}"
+            );
+        }
+
+        #[tokio::test]
+        async fn required_documentation_failure_is_not_audited_or_treated_as_success() {
+            let harness = Harness::new("submission-failure");
+            let docs = harness.workspace.path.join("docs");
+            std::fs::create_dir_all(docs.join("AI_USAGE.md")).unwrap();
+            std::fs::create_dir_all(docs.join("AI_USAGE.generated.md")).unwrap();
+
+            let error = generate_documentation(
+                &harness.state,
+                harness.task.id,
+                &harness.emitter,
+                &harness.profile,
+                &harness.passing_verification(),
+                &harness.workspace,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("refusing to replace"),
+                "{error:#}"
+            );
+            let stored = harness.stored();
+            assert!(
+                !stored.history.iter().any(|recorded| matches!(
+                    recorded.event,
+                    TaskEvent::SubmissionDocumentationGenerated { .. }
+                )),
+                "success is audited only after the complete documentation set finalizes"
+            );
+            assert!(
+                !harness.workspace.path.join("docs/ARCHITECTURE.md").exists(),
+                "a failed required documentation step may not leave partial output"
             );
         }
     }
