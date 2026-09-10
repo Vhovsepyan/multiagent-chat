@@ -197,6 +197,61 @@ fn milestone_list_html(milestones: &[crate::milestone::Milestone]) -> String {
     format!(r#"<ol class="milestones">{rows}</ol>"#)
 }
 
+/// The acceptance-criteria card (task 0012). Its inner region is replaced on
+/// every criterion event, so progress tracks task state instead of only
+/// accumulating log lines.
+fn acceptance_html(task: &Task) -> String {
+    format!(
+        r#"<div class="card"><h2 class="section">Acceptance criteria</h2><div id="acceptance" hx-swap="innerHTML">{}</div></div>"#,
+        acceptance_list_html(&task.acceptance)
+    )
+}
+
+/// Rendered from current task state, never from one event in isolation.
+fn acceptance_list_html(criteria: &[crate::acceptance::AcceptanceCriterion]) -> String {
+    use crate::acceptance::CriterionStatus;
+    if criteria.is_empty() {
+        return r#"<div class="hint">Acceptance criteria appear once the approved specification is planned.</div>"#
+            .into();
+    }
+    let passed = criteria
+        .iter()
+        .filter(|criterion| criterion.status == CriterionStatus::Passed)
+        .count();
+    let rows = criteria
+        .iter()
+        .map(|criterion| {
+            let class = match criterion.status {
+                CriterionStatus::Passed => "ok",
+                CriterionStatus::Failed => "err",
+                CriterionStatus::Implemented => "active",
+                CriterionStatus::Pending | CriterionStatus::Deferred => "pending",
+            };
+            let evidence = criterion
+                .evidence
+                .iter()
+                .chain(criterion.blocking_findings.iter())
+                .map(|line| format!(r#"<div class="hint">{}</div>"#, esc(line)))
+                .collect::<String>();
+            format!(
+                r#"<li><span class="milestone-status {class}">{}</span> <code>{}</code> {}<div class="hint">Milestones: {}</div>{evidence}</li>"#,
+                criterion.status.label(),
+                esc(&criterion.id),
+                esc(&criterion.description),
+                if criterion.milestones.is_empty() {
+                    "none".to_string()
+                } else {
+                    esc(&criterion.milestones.join(", "))
+                }
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<div class="hint">{passed} of {} passed</div><ol class="milestones">{rows}</ol>"#,
+        criteria.len()
+    )
+}
+
 /// The output card. Shown only for tasks that have an output target of their
 /// own — Feature and Bug Fix inherit the registered project's, so the option
 /// does not apply to them (task 0010).
@@ -696,6 +751,21 @@ fn event_html(
                 esc(error)
             ),
         )),
+        TaskEvent::AcceptanceCriteriaGenerated { criteria } => Some((
+            "build",
+            format!(
+                r#"<div class="notice ok">Acceptance criteria generated · {} criteria</div>"#,
+                criteria.len()
+            ),
+        )),
+        TaskEvent::AcceptanceCriterionUpdated { id, status, .. } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">{} · {}</div>"#,
+                esc(id),
+                esc(status.label())
+            ),
+        )),
         TaskEvent::ProjectPersistenceStarted { destination } => Some((
             "build",
             format!(
@@ -792,6 +862,7 @@ struct RenderState<'a> {
     spec: Option<&'a str>,
     agents: &'a AgentSelection,
     milestones: &'a [crate::milestone::Milestone],
+    acceptance: &'a [crate::acceptance::AcceptanceCriterion],
     output: Option<OutputTarget>,
     persistence: Option<&'a ProjectPersistence>,
 }
@@ -802,6 +873,7 @@ impl<'a> RenderState<'a> {
             spec: task.spec.as_deref(),
             agents: &task.agents,
             milestones: &task.milestones,
+            acceptance: &task.acceptance,
             output: task.output,
             persistence: task.persistence.as_ref(),
         }
@@ -830,7 +902,18 @@ fn event_updates(
             (name, html),
             ("spec", spec_readonly_html(state.spec)),
             ("milestones", milestone_list_html(state.milestones)),
+            ("acceptance", acceptance_list_html(state.acceptance)),
             ("output-summary", output()),
+        ];
+    }
+    if matches!(
+        recorded.event,
+        TaskEvent::AcceptanceCriteriaGenerated { .. }
+            | TaskEvent::AcceptanceCriterionUpdated { .. }
+    ) {
+        return vec![
+            (name, html),
+            ("acceptance", acceptance_list_html(state.acceptance)),
         ];
     }
     if matches!(
@@ -1104,6 +1187,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
     let agents = agents_html(&task.agents, task.git_mode);
+    let acceptance = acceptance_html(&task);
     let output = if task.output.is_some() {
         output_html(&task)
     } else {
@@ -1113,6 +1197,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         &task,
         &project_name,
         &agents,
+        &acceptance,
         &output,
         &debate,
         &spec,
@@ -1135,6 +1220,7 @@ fn page_html(
     task: &Task,
     project: &str,
     agents: &str,
+    acceptance: &str,
     output: &str,
     debate: &str,
     spec: &str,
@@ -1144,7 +1230,7 @@ fn page_html(
     let actions = actions_html(task.id);
     let milestones = milestones_html(task);
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{output}{actions}{milestones}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{output}{actions}{milestones}{acceptance}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
         id = task.id,
         title = esc(&task.title),
         kind = task.kind.label(),
@@ -1171,6 +1257,7 @@ pub async fn stream(
                         spec: None,
                         agents: &fallback,
                         milestones: &[],
+                        acceptance: &[],
                         output: None,
                         persistence: None,
                     },

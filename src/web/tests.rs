@@ -1686,6 +1686,7 @@ fn milestone_plan() -> Vec<crate::milestone::Milestone> {
             worker_result_summary: None,
             commit: None,
             review: None,
+            criteria: Vec::new(),
         })
         .collect()
 }
@@ -2317,5 +2318,69 @@ async fn the_form_offers_the_output_mode_and_submits_a_destination() {
             .contains("destination folder name"),
         "the form must say what is wrong"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Task 0012: the task page shows criterion progress, including what failed and
+/// what no milestone covers.
+#[tokio::test]
+async fn the_task_page_shows_acceptance_criteria_progress() {
+    let (state, root) = test_state("ui-acceptance");
+    let task = state.manager.create("Events", "Manage events", "legacy");
+    let emitter = state.manager.emitter(task.id);
+    let criteria = vec![
+        crate::acceptance::AcceptanceCriterion {
+            id: "AC-001".into(),
+            description: "Event creation".into(),
+            status: crate::acceptance::CriterionStatus::Passed,
+            milestones: vec!["m1".into()],
+            evidence: vec!["milestone m1: 1 verification command(s) passed: cargo test".into()],
+            blocking_findings: Vec::new(),
+        },
+        crate::acceptance::AcceptanceCriterion {
+            id: "AC-002".into(),
+            description: "Reminder delivery".into(),
+            status: crate::acceptance::CriterionStatus::Failed,
+            milestones: vec!["m2".into()],
+            evidence: Vec::new(),
+            blocking_findings: vec!["[blocker] AC-002: reminders never fire".into()],
+        },
+        crate::acceptance::AcceptanceCriterion {
+            id: "AC-003".into(),
+            description: "Realtime updates".into(),
+            status: crate::acceptance::CriterionStatus::Deferred,
+            milestones: Vec::new(),
+            evidence: Vec::new(),
+            blocking_findings: Vec::new(),
+        },
+    ];
+    emitter.emit(TaskEvent::AcceptanceCriteriaGenerated { criteria });
+
+    let html = body_text(
+        router(state)
+            .oneshot(get(&format!("/task/{}", task.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert!(html.contains("Acceptance criteria"), "{html}");
+    assert!(html.contains("1 of 3 passed"), "{html}");
+    for expected in [
+        "AC-001",
+        "Event creation",
+        "PASSED",
+        "AC-002",
+        "Reminder delivery",
+        "FAILED",
+        "reminders never fire",
+        "AC-003",
+        "Realtime updates",
+        "DEFERRED",
+    ] {
+        assert!(html.contains(expected), "page is missing {expected}");
+    }
+    // The milestone and review cards are untouched by this addition.
+    assert!(html.contains("Milestones"), "{html}");
     std::fs::remove_dir_all(&root).ok();
 }

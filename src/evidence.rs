@@ -730,6 +730,46 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Error: {}", markdown_inline(error)),
             ],
         ),
+        TaskEvent::AcceptanceCriteriaGenerated { criteria } => (
+            "Acceptance criteria generated".into(),
+            std::iter::once(format!("Criteria: {}", criteria.len()))
+                .chain(criteria.iter().map(|criterion| {
+                    format!(
+                        "{} [{}] {} (milestones: {})",
+                        markdown_inline(&criterion.id),
+                        criterion.status.label(),
+                        markdown_inline(&criterion.description),
+                        if criterion.milestones.is_empty() {
+                            "none".to_string()
+                        } else {
+                            criterion.milestones.join(", ")
+                        }
+                    )
+                }))
+                .collect(),
+        ),
+        TaskEvent::AcceptanceCriterionUpdated {
+            id,
+            status,
+            evidence,
+            blocking_finding,
+            findings_cleared,
+        } => {
+            let mut details = vec![format!("Status: {}", status.label())];
+            if let Some(evidence) = evidence {
+                details.push(format!("Evidence: {}", markdown_inline(evidence)));
+            }
+            if let Some(finding) = blocking_finding {
+                details.push(format!("Blocking finding: {}", markdown_inline(finding)));
+            }
+            if *findings_cleared {
+                details.push("Blocking findings cleared by a passing review".into());
+            }
+            (
+                format!("Acceptance criterion {} updated", markdown_inline(id)),
+                details,
+            )
+        }
         TaskEvent::ProjectPersistenceStarted { destination } => (
             "Project persistence started".into(),
             vec![format!("Destination: `{}`", markdown_inline(destination))],
@@ -1086,6 +1126,60 @@ fn final_report(task: &Task) -> String {
         }
         markdown.push('\n');
     }
+    // Task 0012: what was required, who implemented it, how it was verified,
+    // and what remains. Deliberately concise: verification logs stay in the
+    // task result rather than being duplicated per criterion.
+    markdown.push_str("## Acceptance criteria\n\n");
+    if task.acceptance.is_empty() {
+        markdown.push_str("No acceptance criteria were generated for this task.\n\n");
+    } else {
+        let passed = task
+            .acceptance
+            .iter()
+            .filter(|criterion| criterion.status == crate::acceptance::CriterionStatus::Passed)
+            .count();
+        markdown.push_str(&format!(
+            "{passed} of {} criteria passed.\n\n",
+            task.acceptance.len()
+        ));
+        for criterion in &task.acceptance {
+            markdown.push_str(&format!(
+                "- `{}` — {} — **{}** (milestones: {})\n",
+                markdown_inline(&criterion.id),
+                markdown_inline(&criterion.description),
+                criterion.status.label(),
+                if criterion.milestones.is_empty() {
+                    "none".to_string()
+                } else {
+                    criterion.milestones.join(", ")
+                }
+            ));
+            for evidence in &criterion.evidence {
+                markdown.push_str(&format!("  Evidence: {}\n", markdown_inline(evidence)));
+            }
+            for finding in &criterion.blocking_findings {
+                markdown.push_str(&format!(
+                    "  Unresolved finding: {}\n",
+                    markdown_inline(finding)
+                ));
+            }
+        }
+        let outstanding = task
+            .acceptance
+            .iter()
+            .filter(|criterion| criterion.status.is_outstanding())
+            .map(|criterion| criterion.id.as_str())
+            .collect::<Vec<_>>();
+        markdown.push_str(&format!(
+            "\nOutstanding: {}\n\n",
+            if outstanding.is_empty() {
+                "none".to_string()
+            } else {
+                outstanding.join(", ")
+            }
+        ));
+    }
+
     markdown.push_str("## Known errors/failures\n\n");
     if errors.is_empty() {
         markdown.push_str("None recorded.\n");

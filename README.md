@@ -271,6 +271,39 @@ Cancellation preserves completed milestones and prevents future milestones
 from starting. Durable task cancellation controls and acceptance tracking are
 outside this milestone-execution task.
 
+### Acceptance criteria
+
+Before any milestone runs, the approved specification is turned into stable,
+numbered criteria (`AC-001`, `AC-002`, …) stored on the task for the life of the
+run. An explicit `## Acceptance criteria` section is used when the specification
+states one; otherwise they are derived from `## Steps`, so every step stays
+traceable. Criteria derived from the steps map one-to-one onto the milestones;
+stated criteria are matched to the milestone that covers them, and a criterion
+no milestone covers is recorded as `deferred` rather than dropped. Each milestone
+lists the criteria it is responsible for.
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Generated; its milestone has not run yet. |
+| `implemented` | The worker reported the milestone done — a claim, not proof. |
+| `passed` | Supported by actual verification, with no finding open against it. |
+| `failed` | Verification failed, or a critic finding is open against it. |
+| `deferred` | No milestone in this run is responsible for it. |
+
+A criterion reaches `passed` only when its milestone verified **and** passed the
+implementation review; a worker report alone never passes one. Critic findings
+that name a criterion (`AC-004: …`) are recorded against it and keep it from
+passing until a later review resolves them — the critic is shown the criteria it
+may reference. Failed verification marks the affected criteria failed.
+
+Criterion generation and every state change are audit events
+(`acceptance_criteria_generated`, `acceptance_criterion_updated`) carrying
+concise evidence — the command that verified it, never a copy of its log, which
+stays in the task result. The task page shows the criteria with their status,
+milestones, evidence and unresolved findings, and `FINAL_REPORT.md` ends with an
+acceptance-criteria summary answering what was required, which milestone
+implemented it, how it was verified, whether it passed, and what is outstanding.
+
 ### Implementation review and fix loop
 
 After a milestone verifies, the task's own critic reviews what was actually
@@ -559,6 +592,7 @@ src/
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
   persistence.rs   persistent New Project output: safe destination and finalization
+  acceptance.rs    acceptance criteria generated from the approved specification
   review.rs        structured post-implementation critic review and its findings
   review_baseline.rs per-milestone review baseline, separate from task results
   process_environment.rs explicit child-process environment policy

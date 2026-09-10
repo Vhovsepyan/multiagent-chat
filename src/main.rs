@@ -4,6 +4,7 @@
 //! target repo, the Proposer/Critic debate (Gate 1), SPEC.md, and the human
 //! approval gate (Gate 2). Phase 5 adds the implementer.
 
+mod acceptance;
 mod agent;
 mod api;
 mod approve;

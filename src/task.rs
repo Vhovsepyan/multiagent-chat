@@ -424,6 +424,23 @@ pub enum TaskEvent {
         commit: MilestoneCommit,
     },
 
+    /// Task 0012: the acceptance criteria this run must satisfy, generated
+    /// from the approved specification before any milestone executes.
+    AcceptanceCriteriaGenerated {
+        criteria: Vec<crate::acceptance::AcceptanceCriterion>,
+    },
+    /// One criterion changed state. `evidence` is a concise reference to what
+    /// supports it, never a copy of a verification log.
+    AcceptanceCriterionUpdated {
+        id: String,
+        status: crate::acceptance::CriterionStatus,
+        evidence: Option<String>,
+        /// A critic finding that now blocks this criterion from passing.
+        blocking_finding: Option<String>,
+        /// Set when a passing review cleared the findings against it.
+        findings_cleared: bool,
+    },
+
     /// Task 0011: the critic reviewing the implemented milestone, and the
     /// bounded fix cycle its findings drive. `iteration` is 0 for the first
     /// review and counts the fixes applied before each later one.
@@ -711,6 +728,32 @@ impl TaskEvent {
                 clean(title);
                 clean(&mut commit.message);
             }
+            Self::AcceptanceCriteriaGenerated { criteria } => {
+                for criterion in criteria {
+                    clean(&mut criterion.id);
+                    clean(&mut criterion.description);
+                    for evidence in &mut criterion.evidence {
+                        clean(evidence);
+                    }
+                    for finding in &mut criterion.blocking_findings {
+                        clean(finding);
+                    }
+                }
+            }
+            Self::AcceptanceCriterionUpdated {
+                id,
+                evidence,
+                blocking_finding,
+                ..
+            } => {
+                clean(id);
+                if let Some(evidence) = evidence {
+                    clean(evidence);
+                }
+                if let Some(finding) = blocking_finding {
+                    clean(finding);
+                }
+            }
             Self::ImplementationReviewStarted {
                 milestone_id,
                 model,
@@ -994,6 +1037,8 @@ pub struct Task {
     pub decision: Option<Decision>,
     /// Ordered approved-spec execution plan and live milestone state.
     pub milestones: Vec<Milestone>,
+    /// What this run must satisfy, and how far each criterion has got (0012).
+    pub acceptance: Vec<crate::acceptance::AcceptanceCriterion>,
     /// The Git behavior chosen for this run, frozen at creation (task 0009).
     pub git_mode: GitMode,
     #[serde(skip)]
@@ -1032,6 +1077,7 @@ impl Task {
             error: None,
             decision: None,
             milestones: Vec::new(),
+            acceptance: Vec::new(),
             git_mode: GitMode::None,
             cancelled: false,
         }
@@ -1069,6 +1115,7 @@ impl Task {
             error: None,
             decision: None,
             milestones: Vec::new(),
+            acceptance: Vec::new(),
             cancelled: false,
         })
     }
@@ -1157,6 +1204,35 @@ impl Task {
                 if let Some(milestone) = self.milestones.iter_mut().find(|item| item.id == *id) {
                     milestone.status = MilestoneStatus::Cancelled;
                     milestone.completed_at = Some(timestamp);
+                }
+            }
+            // Task 0012: criterion state is rebuilt from its own events, so a
+            // snapshot can never disagree with the audit about what passed.
+            TaskEvent::AcceptanceCriteriaGenerated { ref criteria } => {
+                self.acceptance = criteria.clone();
+            }
+            TaskEvent::AcceptanceCriterionUpdated {
+                ref id,
+                status,
+                ref evidence,
+                ref blocking_finding,
+                findings_cleared,
+            } => {
+                if let Some(criterion) = self.acceptance.iter_mut().find(|item| item.id == *id) {
+                    criterion.status = status;
+                    if findings_cleared {
+                        criterion.blocking_findings.clear();
+                    }
+                    if let Some(finding) = blocking_finding
+                        && !criterion.blocking_findings.contains(finding)
+                    {
+                        criterion.blocking_findings.push(finding.clone());
+                    }
+                    if let Some(evidence) = evidence
+                        && !criterion.evidence.contains(evidence)
+                    {
+                        criterion.evidence.push(evidence.clone());
+                    }
                 }
             }
             // Task 0011: the milestone carries the latest critic disposition,
@@ -1336,6 +1412,16 @@ impl Task {
                 clean(&mut verification.output);
             }
         }
+        for criterion in &mut self.acceptance {
+            clean(&mut criterion.id);
+            clean(&mut criterion.description);
+            for evidence in &mut criterion.evidence {
+                clean(evidence);
+            }
+            for finding in &mut criterion.blocking_findings {
+                clean(finding);
+            }
+        }
         for milestone in &mut self.milestones {
             clean(&mut milestone.id);
             clean(&mut milestone.title);
@@ -1345,6 +1431,9 @@ impl Task {
             }
             if let Some(summary) = &mut milestone.worker_result_summary {
                 clean(summary);
+            }
+            for criterion in &mut milestone.criteria {
+                clean(criterion);
             }
             if let Some(review) = &mut milestone.review {
                 for finding in &mut review.findings {

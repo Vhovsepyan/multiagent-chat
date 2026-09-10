@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 
+use crate::acceptance::{AcceptanceCriterion, CriterionStatus};
 use crate::agent::{ChatAgent, ChatAgentConfig, CodingAgent, CodingAgentConfig, CodingTaskRequest};
 use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
 use crate::inspection::{InspectionRequest, inspect};
@@ -329,9 +330,31 @@ async fn run(
             .await??;
         emitter.notice("milestone commits enabled for this run");
     }
+    // Task 0012: what the run must satisfy, derived from the approved
+    // specification and mapped onto the plan before anything executes.
+    let mut milestones = milestones;
+    let criteria =
+        crate::acceptance::plan(&approved_spec, &mut milestones).map_err(anyhow::Error::msg)?;
     emitter.emit(TaskEvent::MilestonePlanCreated {
         milestones: milestones.clone(),
     });
+    emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
+        criteria: criteria.clone(),
+    });
+    let deferred = criteria
+        .iter()
+        .filter(|criterion| criterion.status == CriterionStatus::Deferred)
+        .count();
+    if deferred > 0 {
+        emitter.warn(format!(
+            "{deferred} acceptance criterion(s) map to no milestone in this plan and are recorded as deferred"
+        ));
+    }
+    let acceptance = Acceptance {
+        manager: &state.manager,
+        emitter,
+        id,
+    };
     let total = milestones.len();
     let mut all_verification = Vec::new();
     for milestone in milestones {
@@ -409,6 +432,7 @@ async fn run(
             });
             return Err(error);
         }
+        acceptance.implemented(&milestone.id);
         if state.manager.is_cancelled(id) {
             emitter.emit(TaskEvent::MilestoneCancelled {
                 id: milestone.id,
@@ -452,6 +476,7 @@ async fn run(
         }
         all_verification.extend(verification.clone());
         if verification.iter().any(|result| !result.success) {
+            acceptance.verification_failed(&milestone.id, &verification);
             return MilestoneFailure {
                 state,
                 emitter,
@@ -485,6 +510,8 @@ async fn run(
             review_baseline: &review_baseline,
             commands: &commands,
             total,
+            acceptance,
+            criteria: &milestone.criteria,
         }
         .run(&milestone, &mut verification, &mut all_verification)
         .await?;
@@ -492,6 +519,10 @@ async fn run(
             // The loop already recorded why the milestone stopped.
             return Ok(());
         };
+        // Only a milestone that verified AND passed review can satisfy what
+        // it owns, and only where no finding is still open against it.
+        acceptance.findings_cleared(&milestone.id);
+        acceptance.verified(&milestone.id, &verification);
         let worker_summary = if review.iterations_used == 0 {
             "Worker completed successfully.".to_string()
         } else {
@@ -808,6 +839,157 @@ async fn execute_worker_stage(
 }
 
 // ---------------------------------------------------------------------------
+// Task 0012: acceptance-criteria tracking
+// ---------------------------------------------------------------------------
+
+/// Moves acceptance criteria through the run, reading their current state from
+/// the task itself so a decision is never made against a stale copy.
+///
+/// A criterion reaches `Passed` only from real verification, and only while no
+/// critic finding is open against it. Nothing here trusts a worker report.
+#[derive(Clone, Copy)]
+struct Acceptance<'a> {
+    manager: &'a TaskManager,
+    emitter: &'a Emitter,
+    id: TaskId,
+}
+
+impl Acceptance<'_> {
+    fn criteria(&self) -> Vec<AcceptanceCriterion> {
+        self.manager
+            .get(self.id)
+            .map(|task| task.acceptance)
+            .unwrap_or_default()
+    }
+
+    fn update(
+        &self,
+        criterion: &AcceptanceCriterion,
+        status: CriterionStatus,
+        evidence: Option<String>,
+        blocking_finding: Option<String>,
+        findings_cleared: bool,
+    ) {
+        self.emitter.emit(TaskEvent::AcceptanceCriterionUpdated {
+            id: criterion.id.clone(),
+            status,
+            evidence,
+            blocking_finding,
+            findings_cleared,
+        });
+    }
+
+    /// The worker finished the milestone. That is a claim, not proof, so the
+    /// criteria it owns become `Implemented` and never `Passed`.
+    fn implemented(&self, milestone_id: &str) {
+        for criterion in crate::acceptance::owned_by(&self.criteria(), milestone_id) {
+            if criterion.status == CriterionStatus::Pending {
+                self.update(criterion, CriterionStatus::Implemented, None, None, false);
+            }
+        }
+    }
+
+    /// Verification failed: the criteria this milestone owns are not satisfied.
+    fn verification_failed(&self, milestone_id: &str, verification: &[VerificationResult]) {
+        let evidence = crate::acceptance::evidence_line(&format!(
+            "milestone {milestone_id}: {}",
+            summarize(verification)
+        ));
+        for criterion in crate::acceptance::owned_by(&self.criteria(), milestone_id) {
+            self.update(
+                criterion,
+                CriterionStatus::Failed,
+                Some(evidence.clone()),
+                None,
+                false,
+            );
+        }
+    }
+
+    /// A reviewed, verified milestone. Only now may its criteria pass, and only
+    /// those with nothing open against them.
+    fn verified(&self, milestone_id: &str, verification: &[VerificationResult]) {
+        let evidence = crate::acceptance::evidence_line(&format!(
+            "milestone {milestone_id}: {}",
+            summarize(verification)
+        ));
+        for criterion in crate::acceptance::owned_by(&self.criteria(), milestone_id) {
+            let status = if criterion.may_pass() {
+                CriterionStatus::Passed
+            } else {
+                CriterionStatus::Failed
+            };
+            self.update(criterion, status, Some(evidence.clone()), None, false);
+        }
+    }
+
+    /// Critic findings that name a criterion block exactly that criterion
+    /// (task 0011 findings, task 0012 traceability).
+    fn findings_raised(&self, milestone_id: &str, review: &Review) {
+        let criteria = self.criteria();
+        for finding in &review.findings {
+            let text = format!(
+                "{} {} {}",
+                finding.requirement, finding.evidence, finding.correction
+            );
+            for id in crate::acceptance::referenced_ids(&text) {
+                let Some(criterion) = criteria.iter().find(|criterion| criterion.id == id) else {
+                    continue;
+                };
+                self.update(
+                    criterion,
+                    CriterionStatus::Failed,
+                    None,
+                    Some(crate::acceptance::evidence_line(&format!(
+                        "[{}] {}",
+                        finding.severity.label(),
+                        finding.requirement
+                    ))),
+                    false,
+                );
+            }
+        }
+        // A finding naming no criterion still blocks the milestone itself, so
+        // nothing it owns can pass while the review is unresolved.
+        let _ = milestone_id;
+    }
+
+    /// The review passed: findings raised earlier no longer block anything.
+    fn findings_cleared(&self, milestone_id: &str) {
+        for criterion in crate::acceptance::owned_by(&self.criteria(), milestone_id) {
+            if !criterion.blocking_findings.is_empty() {
+                self.update(criterion, criterion.status, None, None, true);
+            }
+        }
+    }
+}
+
+/// A concise, log-free description of what verification did.
+fn summarize(verification: &[VerificationResult]) -> String {
+    if verification.is_empty() {
+        return "no automatic verification commands were available".into();
+    }
+    let failed = verification
+        .iter()
+        .filter(|result| !result.success)
+        .map(|result| result.command.as_str())
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        format!(
+            "{} verification command(s) passed: {}",
+            verification.len(),
+            verification
+                .iter()
+                .map(|result| result.command.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        format!("verification failed: {}", failed.join(", "))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 0011: implementation review and the bounded fix loop
 // ---------------------------------------------------------------------------
 
@@ -875,6 +1057,9 @@ struct ReviewLoop<'a> {
     review_baseline: &'a crate::review_baseline::ReviewBaseline,
     commands: &'a [VerificationCommand],
     total: usize,
+    /// Task 0012: findings that name a criterion block that criterion.
+    acceptance: Acceptance<'a>,
+    criteria: &'a [String],
 }
 
 impl ReviewLoop<'_> {
@@ -936,6 +1121,9 @@ impl ReviewLoop<'_> {
                         .await;
                 }
             };
+            if !review.status.is_pass() {
+                self.acceptance.findings_raised(&milestone.id, &review);
+            }
             if review.status.is_pass() {
                 return Ok(Some(MilestoneReview {
                     status: review.status,
@@ -1003,6 +1191,8 @@ impl ReviewLoop<'_> {
             };
             all_verification.extend(verification.clone());
             if verification.iter().any(|result| !result.success) {
+                self.acceptance
+                    .verification_failed(&milestone.id, verification);
                 return self
                     .fail(
                         milestone,
@@ -1040,6 +1230,7 @@ impl ReviewLoop<'_> {
             kind: self.kind,
             milestone,
             total: self.total,
+            criteria: &self.acceptance_criteria(),
             approved_spec: self.approved_spec,
             diff,
             verification,
@@ -1122,6 +1313,15 @@ impl ReviewLoop<'_> {
                 bail!("{message}")
             }
         }
+    }
+
+    /// The criteria this milestone owns, in their current state.
+    fn acceptance_criteria(&self) -> Vec<AcceptanceCriterion> {
+        let criteria = self.acceptance.criteria();
+        criteria
+            .into_iter()
+            .filter(|criterion| self.criteria.contains(&criterion.id))
+            .collect()
     }
 
     /// Hand the findings back to the worker, and nothing else.
@@ -2058,6 +2258,9 @@ mod review_loop_tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    /// The approved specification the harness plans from.
+    const HARNESS_SPEC: &str = "## Steps\n1. Add the invoice module";
+
     const PASS: &str = r#"{"status":"PASS","findings":[]}"#;
     const FIX: &str = r#"{"status":"FIX_REQUIRED","findings":[{"requirement":"Spec step 1",
         "severity":"blocker","evidence":"the module is missing","correction":"add the invoice module"}]}"#;
@@ -2179,7 +2382,7 @@ mod review_loop_tests {
             )
             .unwrap();
             std::fs::write(workspace.path.join("invoice.rs"), "fn invoice() {}\n").unwrap();
-            let milestone = Milestone {
+            let mut milestone = Milestone {
                 id: "m1".into(),
                 order: 1,
                 title: "Invoice module".into(),
@@ -2191,12 +2394,17 @@ mod review_loop_tests {
                 worker_result_summary: None,
                 commit: None,
                 review: None,
+                criteria: Vec::new(),
             };
             // The plan has to exist in task state for the milestone to carry
-            // its review disposition.
+            // its review disposition and its acceptance criteria.
+            let criteria =
+                crate::acceptance::plan(HARNESS_SPEC, std::slice::from_mut(&mut milestone))
+                    .unwrap();
             emitter.emit(TaskEvent::MilestonePlanCreated {
                 milestones: vec![milestone.clone()],
             });
+            emitter.emit(TaskEvent::AcceptanceCriteriaGenerated { criteria });
             let spec_path = workspace.artifacts().join("approved-spec.md");
             Harness {
                 state,
@@ -2227,12 +2435,18 @@ mod review_loop_tests {
                 worker_selection: &self.task.agents.worker,
                 kind: self.task.kind,
                 profile: &self.profile,
-                approved_spec: "## Steps\n1. Add the invoice module",
+                approved_spec: HARNESS_SPEC,
                 spec_path: &self.spec_path,
                 workspace: &self.workspace,
                 review_baseline: &self.review_baseline,
                 commands,
                 total: 1,
+                acceptance: Acceptance {
+                    manager: &self.state.manager,
+                    emitter: &self.emitter,
+                    id: self.task.id,
+                },
+                criteria: &self.milestone.criteria,
             }
         }
 
@@ -2242,6 +2456,22 @@ mod review_loop_tests {
                 success: true,
                 output: "ok".into(),
             }]
+        }
+
+        fn acceptance(&self) -> Acceptance<'_> {
+            Acceptance {
+                manager: &self.state.manager,
+                emitter: &self.emitter,
+                id: self.task.id,
+            }
+        }
+
+        fn criterion(&self) -> AcceptanceCriterion {
+            self.stored()
+                .acceptance
+                .into_iter()
+                .find(|criterion| criterion.id == "AC-001")
+                .expect("the harness plans one criterion")
         }
 
         fn stored(&self) -> Task {
@@ -2779,5 +3009,211 @@ mod review_loop_tests {
         assert!(kinds.contains(&"milestone_cancelled".to_string()));
         assert!(!kinds.contains(&"milestone_failed".to_string()));
         assert!(!kinds.contains(&"milestone_completed".to_string()));
+    }
+
+    /// Task 0012: acceptance criteria tracked from the approved specification
+    /// through implementation, verification, review, and the final report.
+    #[cfg(test)]
+    mod acceptance_tests {
+        use super::*;
+        use crate::acceptance::CriterionStatus;
+        use crate::agent::ChatProvider;
+        use crate::agent::chat::ScriptedAgent;
+
+        fn passing() -> Vec<VerificationResult> {
+            vec![VerificationResult {
+                command: "cargo test".into(),
+                success: true,
+                output: "ok".into(),
+            }]
+        }
+
+        fn failing() -> Vec<VerificationResult> {
+            vec![VerificationResult {
+                command: "cargo test".into(),
+                success: false,
+                output: "1 test failed".into(),
+            }]
+        }
+
+        /// Required test 4: real verification is what promotes a criterion, and the
+        /// evidence it records names the command rather than copying its log.
+        #[tokio::test]
+        async fn successful_verification_passes_the_criteria_of_its_milestone() {
+            let harness = Harness::new("acceptance-passed");
+            let acceptance = harness.acceptance();
+
+            acceptance.implemented("m1");
+            assert_eq!(harness.criterion().status, CriterionStatus::Implemented);
+
+            acceptance.verified("m1", &passing());
+
+            let criterion = harness.criterion();
+            assert_eq!(criterion.status, CriterionStatus::Passed);
+            assert_eq!(criterion.milestones, vec!["m1".to_string()]);
+            let evidence = criterion.evidence.join(" ");
+            assert!(evidence.contains("cargo test"), "{evidence}");
+            assert!(evidence.contains("passed"), "{evidence}");
+            assert!(!evidence.contains("1 test failed"), "no logs: {evidence}");
+        }
+
+        /// Required test 5: a worker claim never passes a criterion, and failed
+        /// verification leaves it failed.
+        #[tokio::test]
+        async fn failed_verification_never_passes_a_criterion() {
+            let harness = Harness::new("acceptance-failed");
+            let acceptance = harness.acceptance();
+
+            acceptance.implemented("m1");
+            acceptance.verification_failed("m1", &failing());
+
+            let criterion = harness.criterion();
+            assert_eq!(criterion.status, CriterionStatus::Failed);
+            assert!(
+                criterion.evidence.join(" ").contains("verification failed"),
+                "{criterion:?}"
+            );
+            assert!(
+                !harness
+                    .stored()
+                    .acceptance
+                    .iter()
+                    .any(|criterion| criterion.status == CriterionStatus::Passed)
+            );
+        }
+
+        /// Required test 6: a finding naming a criterion keeps it from passing
+        /// until a later review resolves it.
+        #[tokio::test]
+        async fn a_finding_against_a_criterion_blocks_it_until_resolved() {
+            let harness = Harness::new("acceptance-finding");
+            let acceptance = harness.acceptance();
+            acceptance.implemented("m1");
+            let review = crate::review::parse(
+                r#"{"status":"FIX_REQUIRED","findings":[{"requirement":"AC-001: the invoice module",
+                    "severity":"blocker","evidence":"no module","correction":"add it"}]}"#,
+            )
+            .unwrap();
+
+            acceptance.findings_raised("m1", &review);
+
+            let blocked = harness.criterion();
+            assert_eq!(blocked.status, CriterionStatus::Failed);
+            assert_eq!(blocked.blocking_findings.len(), 1);
+            assert!(blocked.blocking_findings[0].contains("AC-001"));
+            assert!(!blocked.may_pass(), "an open finding blocks the pass");
+
+            // Verification passing while the finding is open is not enough.
+            acceptance.verified("m1", &passing());
+            assert_eq!(harness.criterion().status, CriterionStatus::Failed);
+
+            // The next review passes, so the finding no longer blocks it.
+            acceptance.findings_cleared("m1");
+            acceptance.verified("m1", &passing());
+            let resolved = harness.criterion();
+            assert_eq!(resolved.status, CriterionStatus::Passed);
+            assert!(resolved.blocking_findings.is_empty());
+        }
+
+        /// The same rule on the real path: a review that reports findings against a
+        /// criterion records them, and a passing review clears them.
+        #[tokio::test]
+        async fn the_review_loop_records_findings_against_criteria() {
+            let harness = Harness::new("acceptance-review-loop");
+            let critic = ScriptedAgent::new(
+                ChatProvider::Anthropic,
+                &[
+                    r#"{"status":"FIX_REQUIRED","findings":[{"requirement":"AC-001: invoice module missing",
+                        "severity":"blocker","evidence":"no invoice.rs symbol","correction":"add the module"}]}"#,
+                    PASS,
+                ],
+            );
+            let worker = ScriptedWorker::new(vec![Ok(())]);
+            let mut verification = harness.passing_verification();
+            let mut all = verification.clone();
+
+            harness
+                .review_loop(&critic, &worker, &[])
+                .run(&harness.milestone, &mut verification, &mut all)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // The loop raised the finding against the criterion it named.
+            let recorded = harness.stored();
+            assert!(
+                recorded.history.iter().any(|event| matches!(&event.event,
+                        TaskEvent::AcceptanceCriterionUpdated { id, blocking_finding: Some(_), .. }
+                            if id == "AC-001")),
+                "the finding must be traceable to its criterion"
+            );
+            // The critic was told which criteria it may reference.
+            let (_, messages) = critic.call(0);
+            assert!(
+                messages[0].content.contains("AC-001"),
+                "{}",
+                messages[0].content
+            );
+            // Mirror what the pipeline does once the review passes.
+            harness.acceptance().findings_cleared("m1");
+            harness.acceptance().verified("m1", &passing());
+            assert_eq!(harness.criterion().status, CriterionStatus::Passed);
+        }
+
+        /// Required tests 7 and 8: what remains incomplete stays visible, and the
+        /// export answers the traceability questions concisely.
+        #[tokio::test]
+        async fn the_export_summarizes_criteria_including_what_remains() {
+            let harness = Harness::new("acceptance-export");
+            let acceptance = harness.acceptance();
+            // A second, deferred criterion that no milestone covers.
+            let mut criteria = harness.stored().acceptance;
+            criteria.push(crate::acceptance::AcceptanceCriterion {
+                id: "AC-002".into(),
+                description: "Published dashboards refresh".into(),
+                status: CriterionStatus::Deferred,
+                milestones: Vec::new(),
+                evidence: Vec::new(),
+                blocking_findings: Vec::new(),
+            });
+            harness
+                .emitter
+                .emit(TaskEvent::AcceptanceCriteriaGenerated { criteria });
+            acceptance.implemented("m1");
+            acceptance.verified("m1", &passing());
+
+            let snapshot = harness
+                .state
+                .manager
+                .evidence_snapshot(harness.task.id)
+                .unwrap();
+            let files = crate::evidence::export(&snapshot).unwrap().files;
+            let file = |name: &str| {
+                files
+                    .iter()
+                    .find(|(entry, _)| entry == name)
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+
+            let report = file(crate::evidence::FINAL_REPORT_FILENAME);
+            assert!(report.contains("## Acceptance criteria"), "{report}");
+            assert!(report.contains("1 of 2 criteria passed"), "{report}");
+            assert!(report.contains("`AC-001`"), "{report}");
+            assert!(report.contains("**PASSED**"), "{report}");
+            assert!(report.contains("**DEFERRED**"), "{report}");
+            assert!(report.contains("Outstanding: AC-002"), "{report}");
+            assert!(report.contains("Evidence: milestone m1"), "{report}");
+
+            let jsonl = file(crate::evidence::JSONL_FILENAME);
+            assert!(jsonl.contains("acceptance_criteria_generated"), "{jsonl}");
+            assert!(jsonl.contains("acceptance_criterion_updated"), "{jsonl}");
+            let log = file(crate::evidence::DEVELOPMENT_LOG_FILENAME);
+            assert!(log.contains("Acceptance criteria generated"), "{log}");
+            assert!(log.contains("Acceptance criterion AC-001 updated"), "{log}");
+            // Deferred work is never quietly dropped from the record.
+            assert!(log.contains("Published dashboards refresh"), "{log}");
+        }
     }
 }

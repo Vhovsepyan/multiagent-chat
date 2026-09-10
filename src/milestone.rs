@@ -45,6 +45,9 @@ pub struct Milestone {
     /// The critic's disposition of the implemented milestone (task 0011).
     /// Absent until the implementation review has produced a result.
     pub review: Option<crate::review::MilestoneReview>,
+    /// The acceptance criteria this milestone is responsible for (task 0012).
+    #[serde(default)]
+    pub criteria: Vec<String>,
 }
 
 /// Build a non-empty, ordered plan from the approved specification. The
@@ -106,6 +109,7 @@ pub fn plan_from_spec(
             worker_result_summary: None,
             commit: None,
             review: None,
+            criteria: Vec::new(),
         })
         .collect())
 }

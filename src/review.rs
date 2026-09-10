@@ -184,6 +184,8 @@ the evidence in the diff or verification output, and state the correction.
 answer is PASS.
 - Do not request work belonging to a later milestone, speculative hardening, \
 refactors, or style preferences.
+- When a finding is about one of the acceptance criteria listed in the request, \
+start its requirement with that criterion id, for example \"AC-004: ...\".
 - Do not rewrite the code yourself.";
 
 /// Everything the critic is shown about one implemented milestone.
@@ -192,6 +194,8 @@ pub struct ReviewRequest<'a> {
     pub milestone: &'a Milestone,
     pub total: usize,
     pub approved_spec: &'a str,
+    /// The acceptance criteria this milestone owns (task 0012).
+    pub criteria: &'a [crate::acceptance::AcceptanceCriterion],
     /// The current milestone's change (including its fixes), already bounded.
     pub diff: &'a str,
     pub verification: &'a [VerificationResult],
@@ -228,6 +232,7 @@ impl ReviewRequest<'_> {
              Objective: {objective}\n\
              Verification planned for this milestone: {checks}\n\
              Review round: {round} (up to {max} fix iteration(s) are available)\n\n\
+             Acceptance criteria this milestone must satisfy:\n{criteria}\n\n\
              Approved specification:\n{spec}\n\n\
              Worker report and known limitations:\n{summary}\n\n\
              Verification results:\n{verification}\n\n\
@@ -241,11 +246,31 @@ impl ReviewRequest<'_> {
             checks = self.milestone.verification_instructions.join("; "),
             round = self.iteration + 1,
             max = self.max_iterations,
+            criteria = self.criteria_text(),
             spec = self.approved_spec,
             summary = self.worker_summary,
             truncation = self.truncation_note(),
             diff = self.diff,
         )
+    }
+
+    /// The criteria under review, so a finding can name the one it is about.
+    fn criteria_text(&self) -> String {
+        if self.criteria.is_empty() {
+            return "None are mapped to this milestone.".into();
+        }
+        self.criteria
+            .iter()
+            .map(|criterion| {
+                format!(
+                    "- {} [{}]: {}",
+                    criterion.id,
+                    criterion.status.label(),
+                    criterion.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Say so when the change did not fit the review budget.
@@ -386,6 +411,7 @@ mod tests {
             worker_result_summary: None,
             commit: None,
             review: None,
+            criteria: Vec::new(),
         }
     }
 
@@ -501,6 +527,7 @@ That is all."#,
                 milestone: &milestone,
                 total: 2,
                 approved_spec: "## Steps\n1. Store invoices",
+                criteria: &[],
                 diff,
                 verification: &[],
                 worker_summary: "Worker completed.",
@@ -537,6 +564,14 @@ That is all."#,
     #[test]
     fn the_review_request_carries_scope_evidence_and_verification() {
         let milestone = milestone();
+        let criteria = [crate::acceptance::AcceptanceCriterion {
+            id: "AC-002".into(),
+            description: "Invoices are stored durably".into(),
+            status: crate::acceptance::CriterionStatus::Implemented,
+            milestones: vec!["m2".into()],
+            evidence: Vec::new(),
+            blocking_findings: Vec::new(),
+        }];
         let verification = [VerificationResult {
             command: "cargo test".into(),
             success: false,
@@ -547,6 +582,7 @@ That is all."#,
             milestone: &milestone,
             total: 4,
             approved_spec: "## Steps\n1. Store invoices",
+            criteria: &criteria,
             diff: "+fn store() {}",
             verification: &verification,
             worker_summary: "Worker completed; storage is in memory only.",
@@ -565,6 +601,10 @@ That is all."#,
         assert!(message.contains("`cargo test` — FAILED"), "{message}");
         assert!(message.contains("storage is in memory only"), "{message}");
         assert!(message.contains("Review round: 2"), "{message}");
+        assert!(
+            message.contains("- AC-002 [IMPLEMENTED]: Invoices are stored durably"),
+            "the critic sees what it may reference: {message}"
+        );
     }
 
     #[test]

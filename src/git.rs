@@ -340,6 +340,7 @@ mod tests {
             worker_result_summary: None,
             commit: None,
             review: None,
+            criteria: Vec::new(),
         }
     }
 
