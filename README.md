@@ -284,9 +284,14 @@ must answer with one JSON object:
                "evidence": "...", "correction": "..."}]}
 ```
 
-Prose is not a result: an unparseable answer, an unknown status, or
-`FIX_REQUIRED` with no actionable finding fails the review rather than being
-interpreted. `PASS` finishes the milestone normally. `FIX_REQUIRED` sends the
+Prose is not a result: an unparseable answer, an unknown status, `PASS` with
+any findings, or `FIX_REQUIRED` without findings fails the review. Every finding
+must have a non-empty requirement, evidence, and correction; incomplete entries
+and more than 20 findings are rejected, never dropped or filled with placeholders.
+A rejected reply is quoted in the audit only as a bounded excerpt; the reply
+itself is retained under the evidence cap, so model output can never enter task
+history unbounded.
+`PASS` finishes the milestone normally. `FIX_REQUIRED` sends the
 findings — and only those findings — back to the same worker, then verification
 reruns and the critic reviews again:
 
@@ -301,6 +306,18 @@ fails after a fix. **None of these are reported as success**, and each failure
 still publishes the work produced so far as a task result. The milestone is
 committed (when `git_mode` asks for commits) only after the review passes, so a
 milestone commit contains the reviewed and corrected work.
+
+The review diff covers only the current milestone, including its fix iterations.
+Its baseline is captured before worker execution: the previous committed state
+in commit-per-milestone mode, or an external working-tree snapshot in no-commit
+mode. Snapshots include tracked and non-ignored untracked files without changing
+the repository or Git index/history. They are limited to 10,000 files and 64 MiB
+per snapshot; unsupported links or exceeded limits fail review preparation
+explicitly. Scratch snapshots are disposable and released after use. The critic
+diff is capped at 32 KiB with an explicit truncation marker, and a truncated
+change is announced in the prompt so the critic never reports work as missing
+because it was cut out. Earlier milestones do not consume that budget; the final
+task result still includes all milestones.
 
 Review rounds, findings, fix iterations, the verification after each fix, and
 the final disposition are recorded as `implementation_review_started` /
@@ -543,6 +560,7 @@ src/
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
   persistence.rs   persistent New Project output: safe destination and finalization
   review.rs        structured post-implementation critic review and its findings
+  review_baseline.rs per-milestone review baseline, separate from task results
   process_environment.rs explicit child-process environment policy
   execution_limits.rs centralized timeout, output, history, recovery settings
   process_runner.rs bounded process execution and output streaming

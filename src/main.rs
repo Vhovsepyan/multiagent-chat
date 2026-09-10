@@ -24,6 +24,7 @@ mod process_runner;
 mod project;
 mod repository_file;
 mod review;
+mod review_baseline;
 #[cfg(test)]
 mod safety_tests;
 mod spec;

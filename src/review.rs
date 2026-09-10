@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution_limits::bounded_text;
+use crate::execution_limits::{TRUNCATED, bounded_text};
 use crate::milestone::Milestone;
 use crate::task::TaskKind;
 use crate::verification::VerificationResult;
@@ -30,6 +30,18 @@ pub const FINDING_TEXT_BYTES: usize = 2 * 1024;
 
 /// More findings than this is not a review the worker can act on.
 pub const MAX_FINDINGS: usize = 20;
+
+/// How much of an unusable reply is quoted when a review is rejected.
+///
+/// The reply itself is retained as evidence under the far larger evidence cap,
+/// so the audit event only needs enough of it to see what went wrong. Without
+/// this, a malformed answer would put unbounded model output into task history.
+pub const REPLY_EXCERPT_BYTES: usize = 1024;
+
+/// Quote just enough of a rejected reply to debug it.
+pub fn reply_excerpt(reply: &str) -> String {
+    bounded_text(reply.trim(), REPLY_EXCERPT_BYTES)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,7 +192,7 @@ pub struct ReviewRequest<'a> {
     pub milestone: &'a Milestone,
     pub total: usize,
     pub approved_spec: &'a str,
-    /// The change the run has produced so far, already bounded.
+    /// The current milestone's change (including its fixes), already bounded.
     pub diff: &'a str,
     pub verification: &'a [VerificationResult],
     /// What the worker reported, which is the known-limitations input.
@@ -219,7 +231,7 @@ impl ReviewRequest<'_> {
              Approved specification:\n{spec}\n\n\
              Worker report and known limitations:\n{summary}\n\n\
              Verification results:\n{verification}\n\n\
-             Implementation produced so far:\n{diff}",
+             Current milestone implementation change:{truncation}\n{diff}",
             kind = self.kind.label(),
             order = self.milestone.order,
             total = self.total,
@@ -231,8 +243,21 @@ impl ReviewRequest<'_> {
             max = self.max_iterations,
             spec = self.approved_spec,
             summary = self.worker_summary,
+            truncation = self.truncation_note(),
             diff = self.diff,
         )
+    }
+
+    /// Say so when the change did not fit the review budget.
+    ///
+    /// Without this a critic can read a cut-off diff as missing work and
+    /// report findings for code it was simply never shown.
+    fn truncation_note(&self) -> &'static str {
+        if self.diff.contains(TRUNCATED) {
+            " (TRUNCATED: this change did not fit the review budget. Judge only              what is shown below; never report something as missing or incomplete              because it falls outside the truncated part.)"
+        } else {
+            ""
+        }
     }
 }
 
@@ -243,7 +268,6 @@ impl ReviewRequest<'_> {
 #[derive(Deserialize)]
 struct WireReview {
     status: String,
-    #[serde(default)]
     findings: Vec<WireFinding>,
 }
 
@@ -283,33 +307,44 @@ pub fn parse(reply: &str) -> Result<Review, String> {
             ));
         }
     };
+    if status == ReviewStatus::Pass && !wire.findings.is_empty() {
+        return Err("the review reported PASS with findings; PASS requires zero findings".into());
+    }
+    if status == ReviewStatus::FixRequired && wire.findings.is_empty() {
+        return Err("the review reported FIX_REQUIRED without any actionable finding".into());
+    }
+    if wire.findings.len() > MAX_FINDINGS {
+        return Err(format!(
+            "the review exceeded the limit of {MAX_FINDINGS} findings"
+        ));
+    }
+    // Validate every entry before bounding text. Never drop an incomplete
+    // finding or manufacture evidence for a correction the critic did not give.
+    for (index, finding) in wire.findings.iter().enumerate() {
+        for (name, value) in [
+            ("requirement", &finding.requirement),
+            ("evidence", &finding.evidence),
+            ("correction", &finding.correction),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "review finding {} has an empty or missing {name}",
+                    index + 1
+                ));
+            }
+        }
+    }
     let findings = wire
         .findings
         .into_iter()
-        .filter(|finding| {
-            // A finding the worker cannot act on is not a finding.
-            !finding.requirement.trim().is_empty() || !finding.correction.trim().is_empty()
-        })
-        .take(MAX_FINDINGS)
         .map(|finding| Finding {
-            requirement: bound(&finding.requirement, "unspecified requirement"),
+            requirement: bounded_text(finding.requirement.trim(), FINDING_TEXT_BYTES),
             severity: Severity::from_label(&finding.severity),
-            evidence: bound(&finding.evidence, "no evidence recorded"),
-            correction: bound(&finding.correction, "no correction recorded"),
+            evidence: bounded_text(finding.evidence.trim(), FINDING_TEXT_BYTES),
+            correction: bounded_text(finding.correction.trim(), FINDING_TEXT_BYTES),
         })
         .collect::<Vec<_>>();
-    if status == ReviewStatus::FixRequired && findings.is_empty() {
-        return Err("the review reported FIX_REQUIRED without any actionable finding".to_string());
-    }
     Ok(Review { status, findings })
-}
-
-fn bound(value: &str, fallback: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return fallback.to_string();
-    }
-    bounded_text(value, FINDING_TEXT_BYTES)
 }
 
 fn normalize_status(status: &str) -> String {
@@ -413,20 +448,90 @@ That is all."#,
         assert!(error.contains("without any actionable finding"), "{error}");
         let error =
             parse(r#"{"status":"FIX_REQUIRED","findings":[{"evidence":"  "}]}"#).unwrap_err();
-        assert!(error.contains("without any actionable finding"), "{error}");
+        assert!(error.contains("empty or missing requirement"), "{error}");
     }
 
     #[test]
-    fn oversized_and_missing_fields_stay_bounded_and_explicit() {
+    fn oversized_valid_fields_stay_bounded_and_explicit() {
         let long = "x".repeat(FINDING_TEXT_BYTES * 2);
         let review = parse(&format!(
-            r#"{{"status":"FIX_REQUIRED","findings":[{{"requirement":"{long}","correction":"fix it"}}]}}"#
+            r#"{{"status":"FIX_REQUIRED","findings":[{{"requirement":"{long}","evidence":"observed defect","correction":"fix it"}}]}}"#
         ))
         .unwrap();
         let finding = &review.findings[0];
         assert!(finding.requirement.len() <= FINDING_TEXT_BYTES);
-        assert_eq!(finding.evidence, "no evidence recorded");
+        assert!(finding.requirement.contains("truncated"));
+        assert_eq!(finding.evidence, "observed defect");
         assert_eq!(finding.severity, Severity::Major, "unknown severity");
+    }
+
+    #[test]
+    fn contradictory_or_incomplete_findings_fail_the_entire_review() {
+        let valid = serde_json::json!({"requirement":"step 1", "evidence":"missing function", "correction":"implement it"});
+        for finding in [valid.clone(), serde_json::json!({})] {
+            assert!(
+                parse(&serde_json::json!({"status":"PASS", "findings":[finding]}).to_string())
+                    .is_err()
+            );
+        }
+        for field in ["requirement", "evidence", "correction"] {
+            for missing in [false, true] {
+                let mut invalid = valid.clone();
+                if missing {
+                    invalid.as_object_mut().unwrap().remove(field);
+                } else {
+                    invalid[field] = serde_json::json!(" \t\n ");
+                }
+                let reply = serde_json::json!({"status":"FIX_REQUIRED", "findings":[valid.clone(), invalid]});
+                assert!(parse(&reply.to_string()).unwrap_err().contains(field));
+            }
+        }
+        assert!(parse(r#"{"status":"PASS"}"#).is_err());
+        assert!(parse(&serde_json::json!({"status":"FIX_REQUIRED", "findings":vec![valid; MAX_FINDINGS + 1]}).to_string()).is_err());
+    }
+
+    /// A truncated change must be announced, so the critic never reports work
+    /// as missing when it was merely cut out of the prompt.
+    #[test]
+    fn a_truncated_change_is_announced_to_the_critic() {
+        let milestone = milestone();
+        let request = |diff: &str| {
+            ReviewRequest {
+                kind: TaskKind::Feature,
+                milestone: &milestone,
+                total: 2,
+                approved_spec: "## Steps\n1. Store invoices",
+                diff,
+                verification: &[],
+                worker_summary: "Worker completed.",
+                iteration: 0,
+                max_iterations: 2,
+            }
+            .message()
+        };
+
+        let complete = request("+fn store() {}");
+        assert!(!complete.contains("TRUNCATED"), "{complete}");
+
+        let cut = request(&bounded_text(&"+long change\n".repeat(4096), 512));
+        assert!(cut.contains(TRUNCATED), "the marker itself survives: {cut}");
+        assert!(cut.contains("(TRUNCATED:"), "{cut}");
+        assert!(
+            cut.contains("never report something as missing or incomplete"),
+            "{cut}"
+        );
+    }
+
+    /// A rejected reply is quoted only in part: it is still model output, and
+    /// the audit event carrying it is not otherwise bounded.
+    #[test]
+    fn a_rejected_reply_is_quoted_only_in_part() {
+        let short = reply_excerpt("  {\"status\": \"MAYBE\"}  ");
+        assert_eq!(short, "{\"status\": \"MAYBE\"}");
+
+        let excerpt = reply_excerpt(&"prose that is not a review. ".repeat(4096));
+        assert!(excerpt.len() <= REPLY_EXCERPT_BYTES, "{}", excerpt.len());
+        assert!(excerpt.ends_with(TRUNCATED), "{excerpt}");
     }
 
     #[test]

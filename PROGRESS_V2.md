@@ -23,6 +23,18 @@ arbitrary server filesystem paths.
 - Re-package the distributable with its static frontend assets.
 
 ## Decisions made
+- Task 0011 review corrections (2026-09-10): critic parsing now enforces PASS
+  with zero findings and FIX_REQUIRED with at least one complete finding. Missing
+  requirement/evidence/correction, contradictory results, and excess findings
+  fail review rather than being silently repaired or dropped.
+  `review_baseline.rs` separates milestone review from cumulative task results:
+  capture the previous commit before the worker in commit mode, or use bounded
+  external working-tree snapshots in no-commit mode (10,000 files / 64 MiB each).
+  The same baseline survives every fix iteration; only the current milestone's
+  diff is bounded to 32 KiB for the critic, with explicit truncation. Snapshot
+  comparisons never modify target files, the index, or history. Final task
+  results remain cumulative. Regression tests cover large earlier milestones
+  in both Git modes, strict result validation, unchanged Git state, and bounds.
 - DP-28 (2026-09-09, task 0009 follow-up): a task result is measured from the
   task's own baseline, not from `HEAD`. `workspace::task_result_diff` takes
   `TaskWorkspace::revision`: `Some(revision)` compares the working tree with

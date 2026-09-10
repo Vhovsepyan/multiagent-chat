@@ -351,6 +351,31 @@ async fn run(
             worker_tool: task.agents.worker.tool,
             worker_model: task.agents.worker.model.clone(),
         });
+        // Freeze the review baseline BEFORE implementation, not after the
+        // worker or at the start of each correction round.
+        let review_baseline = {
+            let workspace = workspace_ref.clone();
+            let mode = task.git_mode;
+            let limits = state.config.execution.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::review_baseline::ReviewBaseline::capture(&workspace, mode, &limits)
+            })
+            .await?
+            {
+                Ok(baseline) => baseline,
+                Err(error) => {
+                    emitter.emit(TaskEvent::MilestoneFailed {
+                        id: milestone.id,
+                        order: milestone.order,
+                        title: milestone.title,
+                        verification: Vec::new(),
+                        worker_result_summary: None,
+                        error: format!("could not capture milestone review baseline: {error:#}"),
+                    });
+                    return Err(error);
+                }
+            }
+        };
         // One authoritative instruction per milestone (task 0008): scope lives
         // here, not in the common worker prompt.
         let instructions = crate::workflow::milestone_prompt(
@@ -457,6 +482,7 @@ async fn run(
             approved_spec: &approved_spec,
             spec_path: &spec_path,
             workspace: workspace_ref,
+            review_baseline: &review_baseline,
             commands: &commands,
             total,
         }
@@ -846,6 +872,7 @@ struct ReviewLoop<'a> {
     approved_spec: &'a str,
     spec_path: &'a std::path::Path,
     workspace: &'a TaskWorkspace,
+    review_baseline: &'a crate::review_baseline::ReviewBaseline,
     commands: &'a [VerificationCommand],
     total: usize,
 }
@@ -1033,7 +1060,14 @@ impl ReviewLoop<'_> {
                 // The reply is kept as evidence even when it is unusable.
                 crate::review::parse(&reply)
                     .map(|review| (reply.clone(), review))
-                    .map_err(|error| format!("{error}; reply was: {reply}"))
+                    .map_err(|error| {
+                        // Only an excerpt: a malformed reply is still model
+                        // output, and the audit event is not otherwise bounded.
+                        format!(
+                            "{error}; reply was: {}",
+                            crate::review::reply_excerpt(&reply)
+                        )
+                    })
             });
         match outcome {
             Ok((reply, review)) => {
@@ -1126,19 +1160,12 @@ impl ReviewLoop<'_> {
         .await
     }
 
-    /// What the run has produced so far, bounded for a prompt.
+    /// Only this milestone's change, including corrections, bounded for a prompt.
     async fn change_so_far(&self) -> Result<String> {
-        let path = self.workspace.path.clone();
+        let workspace = self.workspace.clone();
         let limits = self.state.config.execution.clone();
-        let baseline = self.workspace.revision.clone();
-        let diff = tokio::task::spawn_blocking(move || {
-            task_result_diff(&path, baseline.as_deref(), &limits)
-        })
-        .await??;
-        Ok(crate::execution_limits::bounded_text(
-            &diff,
-            crate::review::REVIEW_DIFF_BYTES,
-        ))
+        let baseline = self.review_baseline.clone();
+        tokio::task::spawn_blocking(move || baseline.diff(&workspace, &limits)).await?
     }
 
     fn cancelled(&self, milestone: &Milestone, reason: &str) -> bool {
@@ -2097,6 +2124,7 @@ mod review_loop_tests {
         task: Task,
         emitter: Emitter,
         workspace: TaskWorkspace,
+        review_baseline: crate::review_baseline::ReviewBaseline,
         spec_path: std::path::PathBuf,
         profile: ProjectProfile,
         milestone: Milestone,
@@ -2144,6 +2172,12 @@ mod review_loop_tests {
                     revision: None,
                 })
                 .unwrap();
+            let review_baseline = crate::review_baseline::ReviewBaseline::capture(
+                &workspace,
+                crate::git::GitMode::None,
+                &state.config.execution,
+            )
+            .unwrap();
             std::fs::write(workspace.path.join("invoice.rs"), "fn invoice() {}\n").unwrap();
             let milestone = Milestone {
                 id: "m1".into(),
@@ -2170,6 +2204,7 @@ mod review_loop_tests {
                 task,
                 emitter,
                 workspace,
+                review_baseline,
                 spec_path,
                 profile: ProjectProfile::selected(TechStack::Rust),
                 milestone,
@@ -2195,6 +2230,7 @@ mod review_loop_tests {
                 approved_spec: "## Steps\n1. Add the invoice module",
                 spec_path: &self.spec_path,
                 workspace: &self.workspace,
+                review_baseline: &self.review_baseline,
                 commands,
                 total: 1,
             }
@@ -2394,6 +2430,18 @@ mod review_loop_tests {
         for (tag, replies) in [
             ("review-critic-prose", vec!["Looks fine to me, ship it."]),
             ("review-critic-error", Vec::new()),
+            (
+                "review-critic-contradiction",
+                vec![
+                    r#"{"status":"PASS","findings":[{"requirement":"step 1","evidence":"missing module","correction":"add it"}]}"#,
+                ],
+            ),
+            (
+                "review-critic-incomplete",
+                vec![
+                    r#"{"status":"FIX_REQUIRED","findings":[{"requirement":"step 1","correction":"add it"}]}"#,
+                ],
+            ),
         ] {
             let harness = Harness::new(tag);
             let critic = ScriptedAgent::new(ChatProvider::Anthropic, &replies);
@@ -2415,6 +2463,140 @@ mod review_loop_tests {
             assert!(kinds.contains(&"milestone_failed".to_string()));
             assert!(!kinds.contains(&"milestone_completed".to_string()));
             assert_eq!(worker.calls(), 0);
+        }
+    }
+
+    /// A malformed reply must not put unbounded model output into the audit.
+    #[tokio::test]
+    async fn a_rejected_review_records_only_a_bounded_excerpt_of_the_reply() {
+        let harness = Harness::new("review-unbounded-reply");
+        let flood = format!("Looks good to me. {}", "padding ".repeat(200_000));
+        assert!(flood.len() > 1_000_000);
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[&flood]);
+        let worker = ScriptedWorker::new(vec![]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap_err();
+
+        let stored = harness.stored();
+        let recorded = stored
+            .history
+            .iter()
+            .find_map(|recorded| match &recorded.event {
+                TaskEvent::ImplementationReviewFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("the rejected review is audited");
+        assert!(
+            recorded.len() < crate::review::REPLY_EXCERPT_BYTES * 2,
+            "the audit carried {} bytes of model output",
+            recorded.len()
+        );
+        assert!(recorded.contains("no JSON object"), "{recorded}");
+        assert!(
+            recorded.contains(crate::execution_limits::TRUNCATED),
+            "{recorded}"
+        );
+        // The reply itself is still retained, under the evidence cap.
+        let evidence = serde_json::to_string(&stored.evidence).unwrap();
+        assert!(
+            evidence.contains("padding padding"),
+            "the reply is evidence"
+        );
+    }
+
+    /// Earlier milestones must not consume the critic's diff budget, even
+    /// when the current change edits the very same large, previously new file.
+    #[tokio::test]
+    async fn current_milestone_reaches_the_critic_in_both_git_modes() {
+        use crate::git::GitMode;
+        use crate::review::REVIEW_DIFF_BYTES;
+        use crate::review_baseline::ReviewBaseline;
+        for mode in [GitMode::None, GitMode::CommitPerMilestone] {
+            let mut harness = Harness::new(&format!("review-milestone-{}", mode.id()));
+            let earlier = "earlier milestone implementation\n".repeat(REVIEW_DIFF_BYTES / 8);
+            assert!(earlier.len() > REVIEW_DIFF_BYTES);
+            let path = harness.workspace.path.join("aaa_earlier.rs");
+            std::fs::write(&path, &earlier).unwrap();
+            let git = |args: &[&str]| {
+                let mut command = crate::process_environment::command("git");
+                command.current_dir(&harness.workspace.path).args(args);
+                let output =
+                    crate::workspace::run_git(command, &harness.state.config.execution).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            if mode.commits_enabled() {
+                // Only this temporary fixture's prior milestone is committed.
+                git(&["add", "."]);
+                git(&[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "earlier milestone",
+                ]);
+            }
+            harness.review_baseline =
+                ReviewBaseline::capture(&harness.workspace, mode, &harness.state.config.execution)
+                    .unwrap();
+            std::fs::write(
+                path,
+                format!("{earlier}fn current_milestone_change() {{}}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                harness.workspace.path.join("zzz_current.rs"),
+                "fn current_new_file() {}\n",
+            )
+            .unwrap();
+            let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+            let worker = ScriptedWorker::new(vec![Ok(())]);
+            let mut verification = harness.passing_verification();
+            let mut all = verification.clone();
+            harness
+                .review_loop(&critic, &worker, &[])
+                .run(&harness.milestone, &mut verification, &mut all)
+                .await
+                .unwrap()
+                .unwrap();
+            for round in 0..2 {
+                let (_, messages) = critic.call(round);
+                let sent = &messages[0].content;
+                assert!(sent.contains("+fn current_milestone_change() {}"), "{sent}");
+                assert!(sent.contains("+fn current_new_file() {}"), "{sent}");
+                assert!(
+                    !sent.contains("+earlier milestone implementation"),
+                    "{sent}"
+                );
+                let diff = sent
+                    .split("Current milestone implementation change:\n")
+                    .nth(1)
+                    .unwrap();
+                assert!(diff.len() <= REVIEW_DIFF_BYTES);
+            }
+            let final_diff = task_result_diff(
+                &harness.workspace.path,
+                harness.workspace.revision.as_deref(),
+                &harness.state.config.execution,
+            )
+            .unwrap();
+            assert!(
+                final_diff.contains("+earlier milestone implementation"),
+                "final result remains cumulative"
+            );
         }
     }
 
