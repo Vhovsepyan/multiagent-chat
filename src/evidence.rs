@@ -120,6 +120,17 @@ pub enum WorkerRole {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStage {
     Implementation,
+    /// Correcting the implementation-review findings (task 0011).
+    Fix,
+}
+
+impl WorkerStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Fix => "fix",
+        }
+    }
 }
 
 impl EvidenceRecord {
@@ -603,6 +614,122 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Commit message: {}", markdown_inline(&commit.message)),
             ],
         ),
+        TaskEvent::ImplementationReviewStarted {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            provider,
+            model,
+        } => (
+            format!("Implementation review started for milestone {order}"),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Review round: {} of up to {}", iteration + 1, of + 1),
+                format!(
+                    "Critic: {} / `{}`",
+                    provider.label(),
+                    markdown_inline(model)
+                ),
+            ],
+        ),
+        TaskEvent::ImplementationReviewCompleted {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            status,
+            findings,
+        } => {
+            let mut details = vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Result: {}", status.label()),
+                format!("Fix iterations used: {iteration} of {of}"),
+                format!("Findings: {}", findings.len()),
+            ];
+            for (index, finding) in findings.iter().enumerate() {
+                details.push(format!(
+                    "Finding {}: [{}] {} — evidence: {} — correction: {}",
+                    index + 1,
+                    finding.severity.label(),
+                    markdown_inline(&finding.requirement),
+                    markdown_inline(&finding.evidence),
+                    markdown_inline(&finding.correction),
+                ));
+            }
+            (
+                format!("Implementation review completed for milestone {order}"),
+                details,
+            )
+        }
+        TaskEvent::ImplementationReviewFailed {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            provider,
+            model,
+            error,
+        } => (
+            format!("Implementation review failed for milestone {order}"),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Review round: {} of up to {}", iteration + 1, of + 1),
+                format!(
+                    "Critic: {} / `{}`",
+                    provider.label(),
+                    markdown_inline(model)
+                ),
+                format!("Error: {}", markdown_inline(error)),
+            ],
+        ),
+        TaskEvent::FixStarted {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            tool,
+            model,
+        } => (
+            format!("Review fix iteration {iteration} started for milestone {order}"),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Fix iteration: {iteration} of {of}"),
+                format!("Worker: {} / `{}`", tool.label(), markdown_inline(model)),
+            ],
+        ),
+        TaskEvent::FixCompleted {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            tool,
+            model,
+        } => (
+            format!("Review fix iteration {iteration} completed for milestone {order}"),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Fix iteration: {iteration} of {of}"),
+                format!("Worker: {} / `{}`", tool.label(), markdown_inline(model)),
+            ],
+        ),
+        TaskEvent::FixFailed {
+            milestone_id,
+            order,
+            iteration,
+            of,
+            tool,
+            model,
+            error,
+        } => (
+            format!("Review fix iteration {iteration} failed for milestone {order}"),
+            vec![
+                format!("Milestone id: `{}`", markdown_inline(milestone_id)),
+                format!("Fix iteration: {iteration} of {of}"),
+                format!("Worker: {} / `{}`", tool.label(), markdown_inline(model)),
+                format!("Error: {}", markdown_inline(error)),
+            ],
+        ),
         TaskEvent::ProjectPersistenceStarted { destination } => (
             "Project persistence started".into(),
             vec![format!("Destination: `{}`", markdown_inline(destination))],
@@ -726,6 +853,7 @@ fn describe_evidence(record: &EvidenceRecord) -> (String, Vec<String>) {
         EvidencePayload::WorkerExecution {
             tool,
             model,
+            stage,
             milestone_id,
             milestone_title,
             status,
@@ -736,6 +864,7 @@ fn describe_evidence(record: &EvidenceRecord) -> (String, Vec<String>) {
             let mut details = vec![
                 format!("Tool: {}", tool.label()),
                 format!("Model: `{}`", markdown_inline(model)),
+                format!("Stage: {}", stage.label()),
                 format!("Duration: {duration_ms} ms"),
             ];
             if let Some(id) = milestone_id {
@@ -941,6 +1070,19 @@ fn final_report(task: &Task) -> String {
             if let Some(summary) = &milestone.worker_result_summary {
                 markdown.push_str(&format!("  Worker result: {}\n", markdown_inline(summary)));
             }
+            // Task 0011: the disposition of the implementation review is part
+            // of what a milestone actually produced.
+            if let Some(review) = &milestone.review {
+                markdown.push_str(&format!("  Implementation review: {}\n", review.summary()));
+                for finding in &review.findings {
+                    markdown.push_str(&format!(
+                        "    Outstanding finding: [{}] {} — {}\n",
+                        finding.severity.label(),
+                        markdown_inline(&finding.requirement),
+                        markdown_inline(&finding.correction),
+                    ));
+                }
+            }
         }
         markdown.push('\n');
     }
@@ -1100,6 +1242,7 @@ fn stage_label(stage: AgentStage) -> &'static str {
     match stage {
         AgentStage::Debate => "debate",
         AgentStage::Specification => "specification",
+        AgentStage::ImplementationReview => "implementation review",
     }
 }
 

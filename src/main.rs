@@ -23,6 +23,7 @@ mod process_job;
 mod process_runner;
 mod project;
 mod repository_file;
+mod review;
 #[cfg(test)]
 mod safety_tests;
 mod spec;

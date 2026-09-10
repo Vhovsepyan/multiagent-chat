@@ -154,8 +154,39 @@ fn milestone_list_html(milestones: &[crate::milestone::Milestone]) -> String {
                     )
                 })
                 .unwrap_or_default();
+            // Task 0011: what the critic made of the implemented milestone.
+            let review = milestone
+                .review
+                .as_ref()
+                .map(|review| {
+                    let class = if review.status.is_pass() { "ok" } else { "err" };
+                    let findings = review
+                        .findings
+                        .iter()
+                        .map(|finding| {
+                            format!(
+                                "<li>[{}] {} — {}</li>",
+                                esc(finding.severity.label()),
+                                esc(&finding.requirement),
+                                esc(&finding.correction)
+                            )
+                        })
+                        .collect::<String>();
+                    format!(
+                        r#"<div class="hint">Implementation review: <span class="milestone-status {class}">{}</span> · fix iteration {}/{}</div>{}"#,
+                        esc(review.status.label()),
+                        review.iterations_used,
+                        review.max_iterations,
+                        if findings.is_empty() {
+                            String::new()
+                        } else {
+                            format!("<ul class=\"hint\">{findings}</ul>")
+                        }
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                r#"<li><span class="milestone-status {class}">{}</span> <strong>{}. {}</strong><div class="hint">{}</div>{commit}</li>"#,
+                r#"<li><span class="milestone-status {class}">{}</span> <strong>{}. {}</strong><div class="hint">{}</div>{commit}{review}</li>"#,
                 milestone.status.label(),
                 milestone.order,
                 esc(&milestone.title),
@@ -573,6 +604,98 @@ fn event_html(
                 esc(&commit.short_sha)
             ),
         )),
+        TaskEvent::ImplementationReviewStarted {
+            order,
+            iteration,
+            of,
+            ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Implementation review started · milestone {order} · round {} of up to {}</div>"#,
+                iteration + 1,
+                of + 1
+            ),
+        )),
+        TaskEvent::ImplementationReviewCompleted {
+            order,
+            iteration,
+            of,
+            status,
+            findings,
+            ..
+        } => {
+            let class = if status.is_pass() { "ok" } else { "warn" };
+            let detail = findings
+                .iter()
+                .map(|finding| {
+                    format!(
+                        r#"<li>[{}] {} — {}</li>"#,
+                        esc(finding.severity.label()),
+                        esc(&finding.requirement),
+                        esc(&finding.correction)
+                    )
+                })
+                .collect::<String>();
+            let list = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("<ul>{detail}</ul>")
+            };
+            Some((
+                "build",
+                format!(
+                    r#"<div class="notice {class}">Implementation review: {} · milestone {order} · fix iteration {iteration}/{of}</div>{list}"#,
+                    esc(status.label())
+                ),
+            ))
+        }
+        TaskEvent::ImplementationReviewFailed { order, error, .. } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Implementation review failed · milestone {order} · {}</div>"#,
+                esc(error)
+            ),
+        )),
+        TaskEvent::FixStarted {
+            order,
+            iteration,
+            of,
+            tool,
+            model,
+            ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Fix iteration {iteration}/{of} started · milestone {order} · {} / {}</div>"#,
+                esc(tool.label()),
+                esc(model)
+            ),
+        )),
+        TaskEvent::FixCompleted {
+            order,
+            iteration,
+            of,
+            ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice ok">Fix iteration {iteration}/{of} completed · milestone {order}</div>"#
+            ),
+        )),
+        TaskEvent::FixFailed {
+            order,
+            iteration,
+            of,
+            error,
+            ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Fix iteration {iteration}/{of} failed · milestone {order} · {}</div>"#,
+                esc(error)
+            ),
+        )),
         TaskEvent::ProjectPersistenceStarted { destination } => Some((
             "build",
             format!(
@@ -726,6 +849,8 @@ fn event_updates(
             | TaskEvent::MilestoneFailed { .. }
             | TaskEvent::MilestoneCancelled { .. }
             | TaskEvent::MilestoneCommitCreated { .. }
+            | TaskEvent::ImplementationReviewCompleted { .. }
+            | TaskEvent::FixCompleted { .. }
     ) {
         return vec![
             (name, html),

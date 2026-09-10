@@ -86,6 +86,7 @@ pub(crate) fn test_config() -> Config {
         workspace_root: None,
         persistent_output_root: None,
         max_rounds: 1,
+        max_fix_iterations: 2,
         gemini_model: "proposer-model".into(),
         critic_model: "critic-model".into(),
         implementer_model: "worker-model".into(),

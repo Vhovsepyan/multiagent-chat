@@ -279,6 +279,8 @@ impl TaskStatus {
 pub enum AgentStage {
     Debate,
     Specification,
+    /// The critic reviewing what was actually built (task 0011).
+    ImplementationReview,
 }
 
 /// Everything worth telling a watcher about, as it happens.
@@ -420,6 +422,60 @@ pub enum TaskEvent {
         order: u32,
         title: String,
         commit: MilestoneCommit,
+    },
+
+    /// Task 0011: the critic reviewing the implemented milestone, and the
+    /// bounded fix cycle its findings drive. `iteration` is 0 for the first
+    /// review and counts the fixes applied before each later one.
+    ImplementationReviewStarted {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        provider: crate::agent::ChatProvider,
+        model: String,
+    },
+    ImplementationReviewCompleted {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        status: crate::review::ReviewStatus,
+        findings: Vec<crate::review::Finding>,
+    },
+    ImplementationReviewFailed {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        provider: crate::agent::ChatProvider,
+        model: String,
+        error: String,
+    },
+    FixStarted {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        tool: crate::agent::CodingTool,
+        model: String,
+    },
+    FixCompleted {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        tool: crate::agent::CodingTool,
+        model: String,
+    },
+    FixFailed {
+        milestone_id: String,
+        order: u32,
+        iteration: u32,
+        of: u32,
+        tool: crate::agent::CodingTool,
+        model: String,
+        error: String,
     },
 
     /// Persistent New Project output (task 0010). `destination` is always the
@@ -654,6 +710,59 @@ impl TaskEvent {
                 clean(id);
                 clean(title);
                 clean(&mut commit.message);
+            }
+            Self::ImplementationReviewStarted {
+                milestone_id,
+                model,
+                ..
+            } => {
+                clean(milestone_id);
+                clean(model);
+            }
+            Self::ImplementationReviewCompleted {
+                milestone_id,
+                findings,
+                ..
+            } => {
+                clean(milestone_id);
+                for finding in findings {
+                    clean(&mut finding.requirement);
+                    clean(&mut finding.evidence);
+                    clean(&mut finding.correction);
+                }
+            }
+            Self::ImplementationReviewFailed {
+                milestone_id,
+                model,
+                error,
+                ..
+            } => {
+                clean(milestone_id);
+                clean(model);
+                clean(error);
+            }
+            Self::FixStarted {
+                milestone_id,
+                model,
+                ..
+            }
+            | Self::FixCompleted {
+                milestone_id,
+                model,
+                ..
+            } => {
+                clean(milestone_id);
+                clean(model);
+            }
+            Self::FixFailed {
+                milestone_id,
+                model,
+                error,
+                ..
+            } => {
+                clean(milestone_id);
+                clean(model);
+                clean(error);
             }
             Self::ProjectPersistenceStarted { destination } => clean(destination),
             Self::ProjectPersisted {
@@ -1050,6 +1159,29 @@ impl Task {
                     milestone.completed_at = Some(timestamp);
                 }
             }
+            // Task 0011: the milestone carries the latest critic disposition,
+            // so the UI and the export never re-derive it from raw events.
+            TaskEvent::ImplementationReviewCompleted {
+                ref milestone_id,
+                iteration,
+                of,
+                status,
+                ref findings,
+                ..
+            } => {
+                if let Some(milestone) = self
+                    .milestones
+                    .iter_mut()
+                    .find(|item| item.id == *milestone_id)
+                {
+                    milestone.review = Some(crate::review::MilestoneReview {
+                        status,
+                        iterations_used: iteration,
+                        max_iterations: of,
+                        findings: findings.clone(),
+                    });
+                }
+            }
             // Task 0010: persistent-output state is rebuilt from its events, so
             // a snapshot and the audit log can never disagree about it.
             TaskEvent::ProjectPersistenceStarted { ref destination } => {
@@ -1213,6 +1345,13 @@ impl Task {
             }
             if let Some(summary) = &mut milestone.worker_result_summary {
                 clean(summary);
+            }
+            if let Some(review) = &mut milestone.review {
+                for finding in &mut review.findings {
+                    clean(&mut finding.requirement);
+                    clean(&mut finding.evidence);
+                    clean(&mut finding.correction);
+                }
             }
         }
     }

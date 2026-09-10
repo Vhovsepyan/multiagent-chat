@@ -42,6 +42,9 @@ pub struct Milestone {
     /// Set when this milestone was committed (task 0009). Absent means no
     /// commit was requested, or none was needed.
     pub commit: Option<MilestoneCommit>,
+    /// The critic's disposition of the implemented milestone (task 0011).
+    /// Absent until the implementation review has produced a result.
+    pub review: Option<crate::review::MilestoneReview>,
 }
 
 /// Build a non-empty, ordered plan from the approved specification. The
@@ -102,6 +105,7 @@ pub fn plan_from_spec(
             completed_at: None,
             worker_result_summary: None,
             commit: None,
+            review: None,
         })
         .collect())
 }

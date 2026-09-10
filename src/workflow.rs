@@ -61,6 +61,43 @@ pub fn milestone_prompt(
     )
 }
 
+/// The authoritative instruction for ONE fix iteration (task 0011).
+///
+/// The critic reviewed what was actually built and asked for specific
+/// corrections. This prompt scopes the worker to exactly those findings: it is
+/// not a second chance to implement the milestone differently, and it must not
+/// reach into a later milestone any more than the original instruction did.
+pub fn fix_prompt(
+    kind: TaskKind,
+    profile: &ProjectProfile,
+    milestone: &Milestone,
+    total: usize,
+    findings: &str,
+    iteration: u32,
+    max_iterations: u32,
+) -> String {
+    format!(
+        "Correct the implementation-review findings for milestone {order} of {total} ({id}) \
+         of the approved {kind} workflow. This is fix iteration {iteration} of {max_iterations}.\n\
+         Title: {title}\n\
+         Objective: {objective}\n\
+         Verification for this milestone: {checks}\n\n\
+         Fix ONLY the findings listed below. Do not implement anything from a later \
+         milestone, do not refactor unrelated code, and do not change behavior no \
+         finding asks about. If a finding is wrong, leave the code as it is and say why \
+         in your summary.\n\n\
+         Findings to correct:\n{findings}\n\n\
+         {conventions} Summarize how each finding was addressed.",
+        order = milestone.order,
+        id = milestone.id,
+        kind = kind.label(),
+        title = milestone.title,
+        objective = milestone.objective,
+        checks = milestone.verification_instructions.join("; "),
+        conventions = worker_conventions(profile),
+    )
+}
+
 fn kind_instruction(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::NewProject => {
@@ -92,6 +129,7 @@ mod tests {
             completed_at: None,
             worker_result_summary: None,
             commit: None,
+            review: None,
         }
     }
 
@@ -154,5 +192,32 @@ mod tests {
         assert!(bug.contains("root cause"));
         assert_ne!(new, feature);
         assert_ne!(feature, bug);
+    }
+
+    /// Task 0011: a fix run is scoped to the critic findings, not to a rewrite.
+    #[test]
+    fn a_fix_prompt_scopes_the_worker_to_the_reported_findings() {
+        let profile = ProjectProfile::selected(TechStack::Rust);
+        let second = milestone(2, "Persistence layer");
+
+        let prompt = fix_prompt(
+            TaskKind::Feature,
+            &profile,
+            &second,
+            5,
+            "1. [blocker] Requirement: Spec step 2\n   Required correction: add the repository",
+            1,
+            2,
+        );
+
+        assert!(prompt.contains("milestone 2 of 5 (m2)"), "{prompt}");
+        assert!(prompt.contains("fix iteration 1 of 2"), "{prompt}");
+        assert!(prompt.contains("Fix ONLY the findings"), "{prompt}");
+        assert!(prompt.contains("add the repository"), "{prompt}");
+        assert!(
+            prompt.contains("Do not implement anything from a later"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("cargo test"), "{prompt}");
     }
 }

@@ -31,6 +31,7 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
+        max_fix_iterations: 2,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
         implementer_model: "test-worker-model".into(),
@@ -1060,6 +1061,7 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
+        max_fix_iterations: 2,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
         implementer_model: "test-worker-model".into(),
@@ -1435,6 +1437,7 @@ fn state_with_credentials(
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
+        max_fix_iterations: 2,
         gemini_model: "test-model".into(),
         critic_model: "test-critic-model".into(),
         implementer_model: "test-worker-model".into(),
@@ -1682,6 +1685,7 @@ fn milestone_plan() -> Vec<crate::milestone::Milestone> {
             completed_at: None,
             worker_result_summary: None,
             commit: None,
+            review: None,
         })
         .collect()
 }

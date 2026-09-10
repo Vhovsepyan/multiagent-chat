@@ -2,17 +2,20 @@
 
 use anyhow::{Result, bail};
 
-use crate::agent::{CodingAgent, CodingAgentConfig, CodingTaskRequest};
+use crate::agent::{ChatAgent, ChatAgentConfig, CodingAgent, CodingAgentConfig, CodingTaskRequest};
 use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
 use crate::inspection::{InspectionRequest, inspect};
+use crate::milestone::Milestone;
 use crate::milestone::plan_from_spec;
 use crate::persistence::PersistentDestination;
 use crate::project::Project;
+use crate::review::{MilestoneReview, Review, ReviewRequest};
 use crate::spec;
 use crate::task::{
-    Emitter, Task, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus,
+    AgentStage, Emitter, Task, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus,
 };
 use crate::technology::ProjectProfile;
+use crate::verification::{VerificationCommand, VerificationResult};
 use crate::web::AppState;
 use crate::workspace::{TaskWorkspace, WorkspaceRequest, task_result_diff};
 
@@ -390,7 +393,7 @@ async fn run(
             });
             return Ok(());
         }
-        let verification = match execute_verification(
+        let mut verification = match execute_verification(
             &commands,
             &workspace_ref.path,
             &state.config.execution,
@@ -423,32 +426,54 @@ async fn run(
             return Ok(());
         }
         all_verification.extend(verification.clone());
-        let failed = verification.iter().any(|result| !result.success);
-        if failed {
-            emitter.emit(TaskEvent::MilestoneFailed {
-                id: milestone.id,
-                order: milestone.order,
-                title: milestone.title,
+        if verification.iter().any(|result| !result.success) {
+            return MilestoneFailure {
+                state,
+                emitter,
+                workspace: workspace_ref,
+                milestone: &milestone,
                 verification,
-                worker_result_summary: Some("Worker completed; verification failed.".into()),
+                all_verification,
+                summary: "Worker completed; verification failed.",
                 error: "one or more verification commands failed".into(),
-            });
-            let diff_path = workspace_ref.path.clone();
-            let limits = state.config.execution.clone();
-            let baseline = workspace_ref.revision.clone();
-            let diff = tokio::task::spawn_blocking(move || {
-                task_result_diff(&diff_path, baseline.as_deref(), &limits)
-            })
-            .await??;
-            emitter.emit(TaskEvent::Result {
-                result: TaskResult {
-                    source_revision: workspace_ref.revision.clone(),
-                    verification: all_verification,
-                    diff,
-                },
-            });
-            bail!("one or more verification commands failed");
+            }
+            .fail()
+            .await;
         }
+
+        // Task 0011: the critic now reviews what was actually built, and its
+        // findings go back to the worker for a bounded fix cycle. A milestone
+        // is only finalized once that review passes.
+        let review = ReviewLoop {
+            state,
+            id,
+            emitter,
+            critic: agents.critic.as_ref(),
+            critic_selection: &task.agents.critic,
+            worker: agents.worker.as_ref(),
+            worker_selection: &task.agents.worker,
+            kind: task.kind,
+            profile: &profile,
+            approved_spec: &approved_spec,
+            spec_path: &spec_path,
+            workspace: workspace_ref,
+            commands: &commands,
+            total,
+        }
+        .run(&milestone, &mut verification, &mut all_verification)
+        .await?;
+        let Some(review) = review else {
+            // The loop already recorded why the milestone stopped.
+            return Ok(());
+        };
+        let worker_summary = if review.iterations_used == 0 {
+            "Worker completed successfully.".to_string()
+        } else {
+            format!(
+                "Worker completed successfully; {} review fix iteration(s) applied and re-verified.",
+                review.iterations_used
+            )
+        };
         // A milestone is finalized only once its commit (when requested)
         // exists: a failure here fails the milestone rather than passing it.
         let commit = {
@@ -499,7 +524,7 @@ async fn run(
             order: milestone.order,
             title: milestone.title,
             verification,
-            worker_result_summary: "Worker completed successfully.".into(),
+            worker_result_summary: worker_summary,
         });
     }
     let diff_path = workspace_ref.path.clone();
@@ -644,17 +669,57 @@ async fn execute_worker_for_milestone(
     emitter: &Emitter,
     milestone: Option<(&str, &str)>,
 ) -> Result<()> {
+    execute_worker_stage(worker, selection, request, emitter, milestone, None).await
+}
+
+/// Which correction run this is, when the worker is fixing review findings
+/// rather than implementing a milestone (task 0011).
+#[derive(Debug, Clone, Copy)]
+struct FixRun {
+    order: u32,
+    iteration: u32,
+    of: u32,
+}
+
+/// One worker run, whether it implements a milestone or corrects a review.
+///
+/// The two differ only in which lifecycle events the audit gets and how the
+/// evidence record is staged; the execution, bounding and redaction path is
+/// deliberately the same one.
+async fn execute_worker_stage(
+    worker: &dyn CodingAgent,
+    selection: &CodingAgentConfig,
+    request: CodingTaskRequest<'_>,
+    emitter: &Emitter,
+    milestone: Option<(&str, &str)>,
+    fix: Option<FixRun>,
+) -> Result<()> {
     let instruction = crate::evidence::worker_instruction(request.instructions);
-    emitter.emit(TaskEvent::WorkerStarted {
-        tool: selection.tool,
-        model: selection.model.clone(),
-    });
+    let milestone_id = || milestone.map(|(id, _)| id.to_string()).unwrap_or_default();
+    let stage = match fix {
+        Some(_) => WorkerStage::Fix,
+        None => WorkerStage::Implementation,
+    };
+    match fix {
+        Some(fix) => emitter.emit(TaskEvent::FixStarted {
+            milestone_id: milestone_id(),
+            order: fix.order,
+            iteration: fix.iteration,
+            of: fix.of,
+            tool: selection.tool,
+            model: selection.model.clone(),
+        }),
+        None => emitter.emit(TaskEvent::WorkerStarted {
+            tool: selection.tool,
+            model: selection.model.clone(),
+        }),
+    }
     let started = std::time::Instant::now();
     if let Err(error) = worker.execute(request, emitter).await {
         let message = format!("{error:#}");
         emitter.record_evidence(EvidencePayload::WorkerExecution {
             role: WorkerRole::Worker,
-            stage: WorkerStage::Implementation,
+            stage,
             milestone_id: milestone.map(|(id, _)| id.to_string()),
             milestone_title: milestone.map(|(_, title)| title.to_string()),
             tool: selection.tool,
@@ -665,31 +730,453 @@ async fn execute_worker_for_milestone(
             duration_ms: crate::evidence::elapsed_ms(started),
             truncated: false,
         });
-        emitter.emit(TaskEvent::WorkerFailed {
-            tool: selection.tool,
-            model: selection.model.clone(),
-            error: message,
-        });
+        match fix {
+            Some(fix) => emitter.emit(TaskEvent::FixFailed {
+                milestone_id: milestone_id(),
+                order: fix.order,
+                iteration: fix.iteration,
+                of: fix.of,
+                tool: selection.tool,
+                model: selection.model.clone(),
+                error: message,
+            }),
+            None => emitter.emit(TaskEvent::WorkerFailed {
+                tool: selection.tool,
+                model: selection.model.clone(),
+                error: message,
+            }),
+        }
         return Err(error);
     }
     emitter.record_evidence(EvidencePayload::WorkerExecution {
         role: WorkerRole::Worker,
-        stage: WorkerStage::Implementation,
+        stage,
         milestone_id: milestone.map(|(id, _)| id.to_string()),
         milestone_title: milestone.map(|(_, title)| title.to_string()),
         tool: selection.tool,
         model: selection.model.clone(),
         instruction,
-        summary: "Worker completed successfully.".into(),
+        summary: match fix {
+            Some(fix) => format!("Worker completed review fix iteration {}.", fix.iteration),
+            None => "Worker completed successfully.".into(),
+        },
         status: EvidenceStatus::Completed,
         duration_ms: crate::evidence::elapsed_ms(started),
         truncated: false,
     });
-    emitter.emit(TaskEvent::WorkerCompleted {
-        tool: selection.tool,
-        model: selection.model.clone(),
-    });
+    match fix {
+        Some(fix) => emitter.emit(TaskEvent::FixCompleted {
+            milestone_id: milestone_id(),
+            order: fix.order,
+            iteration: fix.iteration,
+            of: fix.of,
+            tool: selection.tool,
+            model: selection.model.clone(),
+        }),
+        None => emitter.emit(TaskEvent::WorkerCompleted {
+            tool: selection.tool,
+            model: selection.model.clone(),
+        }),
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Task 0011: implementation review and the bounded fix loop
+// ---------------------------------------------------------------------------
+
+/// Ending one milestone in failure while still publishing what it produced.
+///
+/// The task result is recorded before the run stops, so a failed milestone is
+/// still reviewable — the behavior verification failures already had.
+struct MilestoneFailure<'a> {
+    state: &'a AppState,
+    emitter: &'a Emitter,
+    workspace: &'a TaskWorkspace,
+    milestone: &'a Milestone,
+    verification: Vec<VerificationResult>,
+    all_verification: Vec<VerificationResult>,
+    summary: &'a str,
+    error: String,
+}
+
+impl MilestoneFailure<'_> {
+    /// Always returns `Err`: the caller ends the milestone with it.
+    async fn fail(self) -> Result<()> {
+        self.emitter.emit(TaskEvent::MilestoneFailed {
+            id: self.milestone.id.clone(),
+            order: self.milestone.order,
+            title: self.milestone.title.clone(),
+            verification: self.verification,
+            worker_result_summary: Some(self.summary.to_string()),
+            error: self.error.clone(),
+        });
+        let diff_path = self.workspace.path.clone();
+        let limits = self.state.config.execution.clone();
+        let baseline = self.workspace.revision.clone();
+        let diff = tokio::task::spawn_blocking(move || {
+            task_result_diff(&diff_path, baseline.as_deref(), &limits)
+        })
+        .await??;
+        self.emitter.emit(TaskEvent::Result {
+            result: TaskResult {
+                source_revision: self.workspace.revision.clone(),
+                verification: self.all_verification,
+                diff,
+            },
+        });
+        bail!("{}", self.error)
+    }
+}
+
+/// The critic reviewing an implemented milestone, and the worker correcting
+/// what it finds, for at most the configured number of iterations (task 0011).
+struct ReviewLoop<'a> {
+    state: &'a AppState,
+    id: TaskId,
+    emitter: &'a Emitter,
+    /// The critic and worker frozen on the task (task 0005), so a review and a
+    /// fix use exactly the agents the run was created with.
+    critic: &'a dyn ChatAgent,
+    critic_selection: &'a ChatAgentConfig,
+    worker: &'a dyn CodingAgent,
+    worker_selection: &'a CodingAgentConfig,
+    kind: TaskKind,
+    profile: &'a ProjectProfile,
+    approved_spec: &'a str,
+    spec_path: &'a std::path::Path,
+    workspace: &'a TaskWorkspace,
+    commands: &'a [VerificationCommand],
+    total: usize,
+}
+
+impl ReviewLoop<'_> {
+    /// Review, fix, re-verify, review again — until the critic passes, the
+    /// iterations run out, or something fails.
+    ///
+    /// `verification` carries this milestone's current results in and the
+    /// latest ones out; `all_verification` accumulates every run for the task
+    /// result. `Ok(None)` means the task was cancelled and the reason is
+    /// already recorded.
+    async fn run(
+        &self,
+        milestone: &Milestone,
+        verification: &mut Vec<VerificationResult>,
+        all_verification: &mut Vec<VerificationResult>,
+    ) -> Result<Option<MilestoneReview>> {
+        let of = self.state.config.max_fix_iterations;
+        let mut iteration = 0;
+        let mut worker_summary = "Worker completed successfully.".to_string();
+        loop {
+            if self.cancelled(milestone, "task cancelled before implementation review") {
+                return Ok(None);
+            }
+            let diff = match self.change_so_far().await {
+                Ok(diff) => diff,
+                Err(error) => {
+                    return self
+                        .fail(
+                            milestone,
+                            verification,
+                            all_verification,
+                            "Worker completed and verification passed; the change could not be read for review.",
+                            format!("implementation review could not read the change: {error:#}"),
+                        )
+                        .await;
+                }
+            };
+            let review = match self
+                .review(
+                    milestone,
+                    &diff,
+                    verification,
+                    &worker_summary,
+                    iteration,
+                    of,
+                )
+                .await
+            {
+                Ok(review) => review,
+                Err(error) => {
+                    return self
+                        .fail(
+                            milestone,
+                            verification,
+                            all_verification,
+                            "Worker completed and verification passed; the implementation review failed.",
+                            format!("implementation review failed: {error:#}"),
+                        )
+                        .await;
+                }
+            };
+            if review.status.is_pass() {
+                return Ok(Some(MilestoneReview {
+                    status: review.status,
+                    iterations_used: iteration,
+                    max_iterations: of,
+                    findings: review.findings,
+                }));
+            }
+            if iteration >= of {
+                // Unresolved findings never become a successful milestone.
+                return self
+                    .fail(
+                        milestone,
+                        verification,
+                        all_verification,
+                        "Worker completed, but the implementation review still requires fixes.",
+                        format!(
+                            "implementation review still requires fixes after {of} fix iteration(s); human review is required"
+                        ),
+                    )
+                    .await;
+            }
+            iteration += 1;
+            if self.cancelled(milestone, "task cancelled before a review fix") {
+                return Ok(None);
+            }
+            if let Err(error) = self.fix(milestone, &review, iteration, of).await {
+                return self
+                    .fail(
+                        milestone,
+                        verification,
+                        all_verification,
+                        "Worker failed while correcting the implementation review findings.",
+                        format!("review fix iteration {iteration} failed: {error:#}"),
+                    )
+                    .await;
+            }
+            worker_summary = format!("Worker applied review fix iteration {iteration} of {of}.");
+            if self.cancelled(milestone, "task cancelled after a review fix") {
+                return Ok(None);
+            }
+            // Every fix is re-verified before it is reviewed again.
+            *verification = match execute_verification(
+                self.commands,
+                &self.workspace.path,
+                &self.state.config.execution,
+                self.emitter,
+            )
+            .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    return self
+                        .fail(
+                            milestone,
+                            &mut Vec::new(),
+                            all_verification,
+                            "Worker fixed the findings; verification could not finish.",
+                            format!(
+                                "verification could not finish after review fix iteration {iteration}: {error:#}"
+                            ),
+                        )
+                        .await;
+                }
+            };
+            all_verification.extend(verification.clone());
+            if verification.iter().any(|result| !result.success) {
+                return self
+                    .fail(
+                        milestone,
+                        verification,
+                        all_verification,
+                        "Worker fixed the findings; verification then failed.",
+                        format!(
+                            "one or more verification commands failed after review fix iteration {iteration}"
+                        ),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// One critic pass over the implemented milestone.
+    async fn review(
+        &self,
+        milestone: &Milestone,
+        diff: &str,
+        verification: &[VerificationResult],
+        worker_summary: &str,
+        iteration: u32,
+        of: u32,
+    ) -> Result<Review> {
+        self.emitter.emit(TaskEvent::ImplementationReviewStarted {
+            milestone_id: milestone.id.clone(),
+            order: milestone.order,
+            iteration,
+            of,
+            provider: self.critic_selection.provider,
+            model: self.critic_selection.model.clone(),
+        });
+        let message = ReviewRequest {
+            kind: self.kind,
+            milestone,
+            total: self.total,
+            approved_spec: self.approved_spec,
+            diff,
+            verification,
+            worker_summary,
+            iteration,
+            max_iterations: of,
+        }
+        .message();
+        let messages = vec![crate::api::Message::user(message)];
+        let prompt = crate::evidence::chat_prompt(Some(crate::review::REVIEW_SYSTEM), &messages);
+        let started = std::time::Instant::now();
+        let outcome = self
+            .critic
+            .complete_text(Some(crate::review::REVIEW_SYSTEM), &messages)
+            .await
+            .map_err(|error| format!("{error:#}"))
+            .and_then(|reply| {
+                // The reply is kept as evidence even when it is unusable.
+                crate::review::parse(&reply)
+                    .map(|review| (reply.clone(), review))
+                    .map_err(|error| format!("{error}; reply was: {reply}"))
+            });
+        match outcome {
+            Ok((reply, review)) => {
+                self.emitter
+                    .record_evidence(EvidencePayload::AgentInteraction {
+                        stage: AgentStage::ImplementationReview,
+                        role: crate::evidence::EvidenceRole::Critic,
+                        round: Some(iteration + 1),
+                        provider: self.critic_selection.provider,
+                        model: self.critic_selection.model.clone(),
+                        prompt,
+                        response: Some(reply),
+                        status: EvidenceStatus::Completed,
+                        error: None,
+                        duration_ms: crate::evidence::elapsed_ms(started),
+                        truncated: false,
+                    });
+                self.emitter.emit(TaskEvent::ImplementationReviewCompleted {
+                    milestone_id: milestone.id.clone(),
+                    order: milestone.order,
+                    iteration,
+                    of,
+                    status: review.status,
+                    findings: review.findings.clone(),
+                });
+                Ok(review)
+            }
+            Err(message) => {
+                self.emitter
+                    .record_evidence(EvidencePayload::AgentInteraction {
+                        stage: AgentStage::ImplementationReview,
+                        role: crate::evidence::EvidenceRole::Critic,
+                        round: Some(iteration + 1),
+                        provider: self.critic_selection.provider,
+                        model: self.critic_selection.model.clone(),
+                        prompt,
+                        response: None,
+                        status: EvidenceStatus::Failed,
+                        error: Some(message.clone()),
+                        duration_ms: crate::evidence::elapsed_ms(started),
+                        truncated: false,
+                    });
+                self.emitter.emit(TaskEvent::ImplementationReviewFailed {
+                    milestone_id: milestone.id.clone(),
+                    order: milestone.order,
+                    iteration,
+                    of,
+                    provider: self.critic_selection.provider,
+                    model: self.critic_selection.model.clone(),
+                    error: message.clone(),
+                });
+                bail!("{message}")
+            }
+        }
+    }
+
+    /// Hand the findings back to the worker, and nothing else.
+    async fn fix(
+        &self,
+        milestone: &Milestone,
+        review: &Review,
+        iteration: u32,
+        of: u32,
+    ) -> Result<()> {
+        let instructions = crate::workflow::fix_prompt(
+            self.kind,
+            self.profile,
+            milestone,
+            self.total,
+            &review.findings_text(),
+            iteration,
+            of,
+        );
+        execute_worker_stage(
+            self.worker,
+            self.worker_selection,
+            CodingTaskRequest {
+                workspace: &self.workspace.path,
+                spec_path: self.spec_path,
+                instructions: &instructions,
+            },
+            self.emitter,
+            Some((&milestone.id, &milestone.title)),
+            Some(FixRun {
+                order: milestone.order,
+                iteration,
+                of,
+            }),
+        )
+        .await
+    }
+
+    /// What the run has produced so far, bounded for a prompt.
+    async fn change_so_far(&self) -> Result<String> {
+        let path = self.workspace.path.clone();
+        let limits = self.state.config.execution.clone();
+        let baseline = self.workspace.revision.clone();
+        let diff = tokio::task::spawn_blocking(move || {
+            task_result_diff(&path, baseline.as_deref(), &limits)
+        })
+        .await??;
+        Ok(crate::execution_limits::bounded_text(
+            &diff,
+            crate::review::REVIEW_DIFF_BYTES,
+        ))
+    }
+
+    fn cancelled(&self, milestone: &Milestone, reason: &str) -> bool {
+        if !self.state.manager.is_cancelled(self.id) {
+            return false;
+        }
+        self.emitter.emit(TaskEvent::MilestoneCancelled {
+            id: milestone.id.clone(),
+            order: milestone.order,
+            title: milestone.title.clone(),
+            reason: reason.into(),
+        });
+        true
+    }
+
+    /// End the milestone in failure, preserving the work and the evidence.
+    async fn fail(
+        &self,
+        milestone: &Milestone,
+        verification: &mut Vec<VerificationResult>,
+        all_verification: &mut [VerificationResult],
+        summary: &str,
+        error: String,
+    ) -> Result<Option<MilestoneReview>> {
+        MilestoneFailure {
+            state: self.state,
+            emitter: self.emitter,
+            workspace: self.workspace,
+            milestone,
+            verification: std::mem::take(verification),
+            all_verification: all_verification.to_vec(),
+            summary,
+            error,
+        }
+        .fail()
+        .await
+        .map(|()| None)
+    }
 }
 
 async fn prepare_existing(
@@ -1527,5 +2014,588 @@ mod persistent_output_tests {
             "the destination WAS published: {report}"
         );
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Task 0011: the critic reviewing what was actually built, and the bounded
+/// fix cycle its findings drive.
+#[cfg(test)]
+mod review_loop_tests {
+    use super::*;
+    use crate::agent::chat::ScriptedAgent;
+    use crate::agent::{AgentSelection, ChatProvider, CodingTaskResult, CodingTool};
+    use crate::milestone::{Milestone, MilestoneStatus};
+    use crate::review::{ReviewStatus, Severity};
+    use crate::task::{TaskKind, TaskRequest};
+    use crate::technology::TechStack;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    const PASS: &str = r#"{"status":"PASS","findings":[]}"#;
+    const FIX: &str = r#"{"status":"FIX_REQUIRED","findings":[{"requirement":"Spec step 1",
+        "severity":"blocker","evidence":"the module is missing","correction":"add the invoice module"}]}"#;
+
+    /// A `CodingAgent` that replays canned outcomes and records its prompts.
+    struct ScriptedWorker {
+        model: String,
+        outcomes: Mutex<VecDeque<std::result::Result<(), String>>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedWorker {
+        fn new(outcomes: Vec<std::result::Result<(), String>>) -> Self {
+            Self {
+                model: "scripted-worker".into(),
+                outcomes: Mutex::new(outcomes.into()),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn instruction(&self, index: usize) -> String {
+            self.seen.lock().unwrap()[index].clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CodingAgent for ScriptedWorker {
+        fn tool(&self) -> CodingTool {
+            CodingTool::ClaudeCode
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        async fn execute(
+            &self,
+            request: CodingTaskRequest<'_>,
+            _emitter: &Emitter,
+        ) -> Result<CodingTaskResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.instructions.to_string());
+            match self.outcomes.lock().unwrap().pop_front() {
+                Some(Ok(())) => Ok(CodingTaskResult {
+                    tool: CodingTool::ClaudeCode,
+                    model: self.model.clone(),
+                }),
+                Some(Err(error)) => bail!("{error}"),
+                None => bail!("the scripted worker ran out of outcomes"),
+            }
+        }
+    }
+
+    /// One task, one prepared workspace, one running milestone.
+    struct Harness {
+        state: AppState,
+        root: std::path::PathBuf,
+        task: Task,
+        emitter: Emitter,
+        workspace: TaskWorkspace,
+        spec_path: std::path::PathBuf,
+        profile: ProjectProfile,
+        milestone: Milestone,
+    }
+
+    impl Harness {
+        fn new(tag: &str) -> Self {
+            let (state, root) = crate::web::tests::test_state(tag);
+            let task = state
+                .manager
+                .create_from_request(
+                    TaskRequest {
+                        kind: TaskKind::Feature,
+                        title: "Invoice module".into(),
+                        description: "Add invoices".into(),
+                        project_id: Some(uuid::Uuid::new_v4()),
+                        technology: None,
+                        output: None,
+                        destination: None,
+                        agents: None,
+                        git_mode: None,
+                    },
+                    AgentSelection {
+                        proposer: crate::agent::ChatAgentConfig::new(
+                            ChatProvider::Gemini,
+                            "configured-proposer-model",
+                        ),
+                        critic: crate::agent::ChatAgentConfig::new(
+                            ChatProvider::Anthropic,
+                            "configured-critic-model",
+                        ),
+                        worker: CodingAgentConfig::new(
+                            CodingTool::ClaudeCode,
+                            "configured-worker-model",
+                        ),
+                    },
+                )
+                .unwrap();
+            let emitter = state.manager.emitter(task.id);
+            let workspace = state
+                .workspaces
+                .prepare(WorkspaceRequest {
+                    task_id: task.id,
+                    source: None,
+                    revision: None,
+                })
+                .unwrap();
+            std::fs::write(workspace.path.join("invoice.rs"), "fn invoice() {}\n").unwrap();
+            let milestone = Milestone {
+                id: "m1".into(),
+                order: 1,
+                title: "Invoice module".into(),
+                objective: "Add the invoice module".into(),
+                verification_instructions: vec!["cargo test".into()],
+                status: MilestoneStatus::Running,
+                started_at: None,
+                completed_at: None,
+                worker_result_summary: None,
+                commit: None,
+                review: None,
+            };
+            // The plan has to exist in task state for the milestone to carry
+            // its review disposition.
+            emitter.emit(TaskEvent::MilestonePlanCreated {
+                milestones: vec![milestone.clone()],
+            });
+            let spec_path = workspace.artifacts().join("approved-spec.md");
+            Harness {
+                state,
+                root,
+                task,
+                emitter,
+                workspace,
+                spec_path,
+                profile: ProjectProfile::selected(TechStack::Rust),
+                milestone,
+            }
+        }
+
+        fn review_loop<'a>(
+            &'a self,
+            critic: &'a dyn ChatAgent,
+            worker: &'a dyn CodingAgent,
+            commands: &'a [VerificationCommand],
+        ) -> ReviewLoop<'a> {
+            ReviewLoop {
+                state: &self.state,
+                id: self.task.id,
+                emitter: &self.emitter,
+                critic,
+                critic_selection: &self.task.agents.critic,
+                worker,
+                worker_selection: &self.task.agents.worker,
+                kind: self.task.kind,
+                profile: &self.profile,
+                approved_spec: "## Steps\n1. Add the invoice module",
+                spec_path: &self.spec_path,
+                workspace: &self.workspace,
+                commands,
+                total: 1,
+            }
+        }
+
+        fn passing_verification(&self) -> Vec<VerificationResult> {
+            vec![VerificationResult {
+                command: "cargo test".into(),
+                success: true,
+                output: "ok".into(),
+            }]
+        }
+
+        fn stored(&self) -> Task {
+            self.state.manager.get(self.task.id).unwrap()
+        }
+
+        fn event_kinds(&self) -> Vec<String> {
+            self.stored()
+                .history
+                .iter()
+                .map(|recorded| {
+                    serde_json::to_value(&recorded.event).unwrap()["type"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// Required test 1: a passing review finishes the milestone as before.
+    #[tokio::test]
+    async fn a_passing_review_needs_no_fix() {
+        let harness = Harness::new("review-pass");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[PASS]);
+        let worker = ScriptedWorker::new(vec![]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let review = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap()
+            .expect("a completed review");
+
+        assert_eq!(review.status, ReviewStatus::Pass);
+        assert_eq!(review.iterations_used, 0);
+        assert_eq!(review.max_iterations, 2);
+        assert_eq!(worker.calls(), 0, "a passing review never runs a fix");
+        let kinds = harness.event_kinds();
+        assert!(kinds.contains(&"implementation_review_started".to_string()));
+        assert!(kinds.contains(&"implementation_review_completed".to_string()));
+        assert!(!kinds.iter().any(|kind| kind.starts_with("fix_")));
+        // The critic reviewed the real change, not only the design.
+        let (system, messages) = critic.call(0);
+        let sent = format!("{}{}", system.unwrap_or_default(), messages[0].content);
+        assert!(sent.contains("reviewing an IMPLEMENTATION"), "{sent}");
+        assert!(sent.contains("fn invoice() {}"), "{sent}");
+        assert!(sent.contains("Add the invoice module"), "{sent}");
+        assert!(sent.contains("`cargo test` — passed"), "{sent}");
+        let stored = harness.stored();
+        assert_eq!(
+            stored.milestones[0].review.as_ref().unwrap().status,
+            ReviewStatus::Pass
+        );
+    }
+
+    /// Required test 2: findings go back to the worker, and the re-review passes.
+    #[tokio::test]
+    async fn findings_are_fixed_and_then_pass() {
+        let harness = Harness::new("review-fix-pass");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+        let worker = ScriptedWorker::new(vec![Ok(())]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let review = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap()
+            .expect("a completed review");
+
+        assert_eq!(review.status, ReviewStatus::Pass);
+        assert_eq!(review.iterations_used, 1);
+        assert_eq!(worker.calls(), 1);
+        // The worker was asked for exactly the reported correction.
+        let instruction = worker.instruction(0);
+        assert!(
+            instruction.contains("Fix ONLY the findings"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("add the invoice module"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("fix iteration 1 of 2"),
+            "{instruction}"
+        );
+        let kinds = harness.event_kinds();
+        let order = |name: &str| kinds.iter().position(|kind| kind == name).unwrap();
+        assert!(order("implementation_review_completed") < order("fix_started"));
+        assert!(order("fix_started") < order("fix_completed"));
+        // Verification reran after the fix, before the second review.
+        assert!(order("fix_completed") < order("verification_started"));
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| *kind == "implementation_review_completed")
+                .count(),
+            2,
+            "the critic re-reviews after a fix"
+        );
+        let stored = harness.stored();
+        let recorded = stored.milestones[0].review.as_ref().unwrap();
+        assert_eq!(recorded.status, ReviewStatus::Pass);
+        assert_eq!(recorded.iterations_used, 1);
+    }
+
+    /// Required test 3: the loop is bounded, and unresolved findings never pass.
+    #[tokio::test]
+    async fn unresolved_findings_fail_the_milestone_after_the_last_iteration() {
+        let harness = Harness::new("review-exhausted");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, FIX, FIX]);
+        let worker = ScriptedWorker::new(vec![Ok(()), Ok(())]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let error = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("still requires fixes after 2 fix iteration(s)"),
+            "{error}"
+        );
+        assert!(error.contains("human review is required"), "{error}");
+        assert_eq!(
+            worker.calls(),
+            2,
+            "no more fixes than the configured maximum"
+        );
+        assert_eq!(critic.calls(), 3);
+        let kinds = harness.event_kinds();
+        assert!(kinds.contains(&"milestone_failed".to_string()));
+        assert!(!kinds.contains(&"milestone_completed".to_string()));
+        // The work is still published for review.
+        assert!(kinds.contains(&"result".to_string()));
+        let stored = harness.stored();
+        let recorded = stored.milestones[0].review.as_ref().unwrap();
+        assert_eq!(recorded.status, ReviewStatus::FixRequired);
+        assert_eq!(recorded.findings[0].severity, Severity::Blocker);
+    }
+
+    /// Required test 4: a worker that cannot apply the fix fails the milestone.
+    #[tokio::test]
+    async fn a_failing_fix_fails_the_milestone() {
+        let harness = Harness::new("review-fix-failure");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX]);
+        let worker = ScriptedWorker::new(vec![Err("worker crashed".into())]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let error = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("review fix iteration 1 failed"), "{error}");
+        assert!(error.contains("worker crashed"), "{error}");
+        let kinds = harness.event_kinds();
+        assert!(kinds.contains(&"fix_started".to_string()));
+        assert!(kinds.contains(&"fix_failed".to_string()));
+        assert!(!kinds.contains(&"fix_completed".to_string()));
+        assert!(kinds.contains(&"milestone_failed".to_string()));
+        assert!(!kinds.contains(&"milestone_completed".to_string()));
+    }
+
+    /// Required test 5: a critic that fails, or that answers with prose instead
+    /// of a structured result, stops the milestone rather than passing it.
+    #[tokio::test]
+    async fn a_critic_failure_fails_the_milestone() {
+        for (tag, replies) in [
+            ("review-critic-prose", vec!["Looks fine to me, ship it."]),
+            ("review-critic-error", Vec::new()),
+        ] {
+            let harness = Harness::new(tag);
+            let critic = ScriptedAgent::new(ChatProvider::Anthropic, &replies);
+            let worker = ScriptedWorker::new(vec![]);
+            let mut verification = harness.passing_verification();
+            let mut all = verification.clone();
+
+            let error = harness
+                .review_loop(&critic, &worker, &[])
+                .run(&harness.milestone, &mut verification, &mut all)
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("implementation review failed"), "{error}");
+            let kinds = harness.event_kinds();
+            assert!(kinds.contains(&"implementation_review_failed".to_string()));
+            assert!(!kinds.contains(&"implementation_review_completed".to_string()));
+            assert!(kinds.contains(&"milestone_failed".to_string()));
+            assert!(!kinds.contains(&"milestone_completed".to_string()));
+            assert_eq!(worker.calls(), 0);
+        }
+    }
+
+    /// Required test 6: verification that fails after a fix fails the milestone.
+    #[tokio::test]
+    async fn verification_failure_after_a_fix_fails_the_milestone() {
+        let harness = Harness::new("review-verify-after-fix");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+        let worker = ScriptedWorker::new(vec![Ok(())]);
+        let commands = [VerificationCommand {
+            program: harness
+                .root
+                .join("missing-verifier-executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+        }];
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let error = harness
+            .review_loop(&critic, &worker, &commands)
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failed after review fix iteration 1"),
+            "{error}"
+        );
+        assert_eq!(
+            critic.calls(),
+            1,
+            "a failed re-verification is not reviewed"
+        );
+        let kinds = harness.event_kinds();
+        assert!(kinds.contains(&"verification_failed".to_string()));
+        assert!(kinds.contains(&"milestone_failed".to_string()));
+        assert!(!kinds.contains(&"milestone_completed".to_string()));
+        // Every verification run is part of the published task result.
+        let stored = harness.stored();
+        assert!(stored.result.unwrap().verification.len() >= 2);
+    }
+
+    /// Required test 7: every iteration reaches the audit and the export.
+    #[tokio::test]
+    async fn every_iteration_appears_in_the_audit_and_the_evidence_export() {
+        let harness = Harness::new("review-evidence");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+        let worker = ScriptedWorker::new(vec![Ok(())]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let snapshot = harness
+            .state
+            .manager
+            .evidence_snapshot(harness.task.id)
+            .unwrap();
+        let files = crate::evidence::export(&snapshot).unwrap().files;
+        let file = |name: &str| {
+            files
+                .iter()
+                .find(|(entry, _)| entry == name)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let jsonl = file(crate::evidence::JSONL_FILENAME);
+        for kind in [
+            "implementation_review_started",
+            "implementation_review_completed",
+            "fix_started",
+            "fix_completed",
+        ] {
+            assert!(jsonl.contains(kind), "{kind} missing from the JSONL export");
+        }
+        assert_eq!(
+            jsonl.matches("implementation_review_completed").count(),
+            2,
+            "both review rounds must be exported"
+        );
+        assert!(
+            jsonl.contains("add the invoice module"),
+            "findings exported"
+        );
+        let log = file(crate::evidence::DEVELOPMENT_LOG_FILENAME);
+        assert!(log.contains("Implementation review completed for milestone 1"));
+        assert!(log.contains("Review fix iteration 1 completed for milestone 1"));
+        assert!(log.contains("Stage: fix"), "the fix run is staged as a fix");
+        assert!(log.contains("Stage: implementation review"));
+        let report = file(crate::evidence::FINAL_REPORT_FILENAME);
+        assert!(
+            report.contains("Implementation review: PASS after 1 of 2 fix iteration(s)"),
+            "{report}"
+        );
+    }
+
+    /// Required test 8: the review and the fix use the models the task was
+    /// created with, not the current defaults.
+    #[tokio::test]
+    async fn the_configured_critic_and_worker_are_used() {
+        let harness = Harness::new("review-models");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+        let worker = ScriptedWorker::new(vec![Ok(())]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stored = harness.stored();
+        let review_models = stored
+            .history
+            .iter()
+            .filter_map(|recorded| match &recorded.event {
+                TaskEvent::ImplementationReviewStarted {
+                    provider, model, ..
+                } => Some((*provider, model.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(review_models.len(), 2);
+        for (provider, model) in review_models {
+            assert_eq!(provider, ChatProvider::Anthropic);
+            assert_eq!(model, "configured-critic-model");
+        }
+        let fix_models = stored
+            .history
+            .iter()
+            .filter_map(|recorded| match &recorded.event {
+                TaskEvent::FixStarted { tool, model, .. }
+                | TaskEvent::FixCompleted { tool, model, .. } => Some((*tool, model.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fix_models.len(), 2);
+        for (tool, model) in fix_models {
+            assert_eq!(tool, CodingTool::ClaudeCode);
+            assert_eq!(model, "configured-worker-model");
+        }
+        // The retained evidence names the same agents.
+        let evidence = serde_json::to_string(&stored.evidence).unwrap();
+        assert!(evidence.contains("configured-critic-model"), "{evidence}");
+        assert!(evidence.contains("configured-worker-model"), "{evidence}");
+        assert!(evidence.contains("implementation_review"), "{evidence}");
+        assert!(evidence.contains("\"stage\":\"fix\""), "{evidence}");
+    }
+
+    /// Cancellation during the fix loop stops without failing or completing.
+    #[tokio::test]
+    async fn cancellation_stops_the_loop_without_claiming_either_outcome() {
+        let harness = Harness::new("review-cancelled");
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[PASS]);
+        let worker = ScriptedWorker::new(vec![]);
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+        assert!(harness.state.manager.cancel(harness.task.id));
+
+        let review = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap();
+
+        assert!(review.is_none());
+        assert_eq!(critic.calls(), 0);
+        let kinds = harness.event_kinds();
+        assert!(kinds.contains(&"milestone_cancelled".to_string()));
+        assert!(!kinds.contains(&"milestone_failed".to_string()));
+        assert!(!kinds.contains(&"milestone_completed".to_string()));
     }
 }

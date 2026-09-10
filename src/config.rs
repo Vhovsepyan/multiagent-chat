@@ -31,6 +31,10 @@ pub struct Config {
     /// this user's projects". `None` means persistent output is refused.
     pub persistent_output_root: Option<PathBuf>,
     pub max_rounds: u32,
+    /// How many worker fix iterations one milestone may use after the critic
+    /// reviews the implementation (task 0011). Zero means the review still
+    /// runs, but findings fail the milestone instead of being fixed.
+    pub max_fix_iterations: u32,
     /// Default model for the Gemini provider.
     pub gemini_model: String,
     /// Default model for the Anthropic provider.
@@ -51,6 +55,9 @@ pub struct Config {
 
 /// Defaults used when the variable is missing from `.env`.
 const DEFAULT_MAX_ROUNDS: u32 = 5;
+const DEFAULT_MAX_FIX_ITERATIONS: u32 = 2;
+/// The fix loop is meant to be short; a large value is a configuration mistake.
+const MAX_FIX_ITERATION_LIMIT: u32 = 5;
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 pub const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
@@ -127,6 +134,18 @@ impl Config {
             bail!("MAX_ROUNDS must be at least 1");
         }
 
+        // Task 0011: bounded by construction, so a critic that keeps asking
+        // for changes can never hold a milestone open indefinitely.
+        let max_fix_iterations = match env::var("MAX_FIX_ITERATIONS") {
+            Ok(raw) => raw.trim().parse::<u32>().with_context(|| {
+                format!("MAX_FIX_ITERATIONS must be a whole number, got {raw:?}")
+            })?,
+            Err(_) => DEFAULT_MAX_FIX_ITERATIONS,
+        };
+        if max_fix_iterations > MAX_FIX_ITERATION_LIMIT {
+            bail!("MAX_FIX_ITERATIONS must be at most {MAX_FIX_ITERATION_LIMIT}");
+        }
+
         let port = match env::var("PORT") {
             Ok(raw) => raw
                 .trim()
@@ -142,6 +161,7 @@ impl Config {
             workspace_root,
             persistent_output_root,
             max_rounds,
+            max_fix_iterations,
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
             implementer_model: optional("IMPLEMENTER_MODEL", DEFAULT_IMPLEMENTER_MODEL),
@@ -213,6 +233,7 @@ impl fmt::Debug for Config {
             .field("workspace_root", &self.workspace_root)
             .field("persistent_output_root", &self.persistent_output_root)
             .field("max_rounds", &self.max_rounds)
+            .field("max_fix_iterations", &self.max_fix_iterations)
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)
             .field("implementer_model", &self.implementer_model)

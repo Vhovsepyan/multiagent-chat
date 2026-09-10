@@ -118,6 +118,10 @@ manual cleanup and are not durable storage.
 
 ## Execution limits
 
+`MAX_FIX_ITERATIONS` bounds the post-implementation fix loop per milestone
+(default 2, maximum 5). Zero still runs the review, but findings then fail the
+milestone instead of being corrected.
+
 Child execution has configurable time and diagnostic-output limits. Set these
 environment variables when starting the server (all must be positive integers):
 
@@ -257,8 +261,8 @@ After approval, the server derives a non-empty ordered milestone plan from the
 specification's `## Steps` section. It executes one milestone at a time: the
 frozen worker receives the approved specification plus only the current
 milestone and repository context, then the configured verification commands
-run before the milestone can pass. A failed milestone stops later work; there
-is no automatic retry or fix loop. The task snapshot and audit/evidence stream
+run before the milestone can pass, followed by the critic's implementation
+review described below. A failed milestone stops later work. The task snapshot and audit/evidence stream
 record milestone planning, start, pass, failure, and cancellation events with
 bounded, redacted details. The task page shows each milestone's status while
 the existing UI log remains separately bounded.
@@ -266,6 +270,45 @@ the existing UI log remains separately bounded.
 Cancellation preserves completed milestones and prevents future milestones
 from starting. Durable task cancellation controls and acceptance tracking are
 outside this milestone-execution task.
+
+### Implementation review and fix loop
+
+After a milestone verifies, the task's own critic reviews what was actually
+built — the approved specification and the milestone scope against the real
+diff, the verification output and the worker's reported limitations. The critic
+must answer with one JSON object:
+
+```json
+{"status": "PASS" | "FIX_REQUIRED",
+ "findings": [{"requirement": "...", "severity": "blocker|major|minor",
+               "evidence": "...", "correction": "..."}]}
+```
+
+Prose is not a result: an unparseable answer, an unknown status, or
+`FIX_REQUIRED` with no actionable finding fails the review rather than being
+interpreted. `PASS` finishes the milestone normally. `FIX_REQUIRED` sends the
+findings — and only those findings — back to the same worker, then verification
+reruns and the critic reviews again:
+
+```text
+critic findings → worker fixes only those findings → verification → review again
+```
+
+The loop is bounded by `MAX_FIX_ITERATIONS` (default 2, maximum 5). Findings
+still outstanding after the last iteration fail the milestone and ask for human
+review; so do a failed critic call, a failed worker fix, and verification that
+fails after a fix. **None of these are reported as success**, and each failure
+still publishes the work produced so far as a task result. The milestone is
+committed (when `git_mode` asks for commits) only after the review passes, so a
+milestone commit contains the reviewed and corrected work.
+
+Review rounds, findings, fix iterations, the verification after each fix, and
+the final disposition are recorded as `implementation_review_started` /
+`implementation_review_completed` / `implementation_review_failed` and
+`fix_started` / `fix_completed` / `fix_failed` audit events, with the critic
+prompt/response retained as evidence at the `implementation review` stage and
+each correction run staged as `fix`. The task page shows the disposition on the
+milestone, for example `Implementation review: PASS · fix iteration 1/2`.
 
 ### Milestone commits
 
@@ -477,6 +520,8 @@ Specification + user approval
         ↓
 Implementation + profile-aware verification
         ↓
+Critic implementation review + bounded fix loop
+        ↓
 Task result/diff + workspace cleanup
 ```
 
@@ -497,6 +542,7 @@ src/
   spec.rs          specification drafting and checking
   implementer.rs   Claude Code coding-agent adapter, process and streamed output
   persistence.rs   persistent New Project output: safe destination and finalization
+  review.rs        structured post-implementation critic review and its findings
   process_environment.rs explicit child-process environment policy
   execution_limits.rs centralized timeout, output, history, recovery settings
   process_runner.rs bounded process execution and output streaming
