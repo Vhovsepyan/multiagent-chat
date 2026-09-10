@@ -311,15 +311,13 @@ async fn run(
     let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
 
     emitter.status(TaskStatus::Implementing);
-    let commands = crate::verification::plan(&profile, &workspace_ref.path);
-    if commands.is_empty() {
-        emitter.warn("no automatic verification commands were detected");
-    }
+    let planned_commands = crate::verification::plan(&profile, &workspace_ref.path);
     let approved_spec = state
         .manager
         .approved_spec(id)
         .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
-    let milestones = plan_from_spec(&approved_spec, &commands).map_err(anyhow::Error::msg)?;
+    let milestones =
+        plan_from_spec(&approved_spec, &planned_commands).map_err(anyhow::Error::msg)?;
     // Task 0009: when the run commits, the workspace repository must be in a
     // state where an isolated commit is obviously safe. Checking once, before
     // any worker starts, means a problem is reported instead of repaired.
@@ -442,6 +440,22 @@ async fn run(
             });
             return Ok(());
         }
+        let (verification_profile, commands) = tokio::task::spawn_blocking({
+            let root = workspace_ref.path.clone();
+            let profile = profile.clone();
+            let kind = task.kind;
+            move || verification_plan_after_implementation(kind, &profile, &root)
+        })
+        .await??;
+        if task.kind == TaskKind::NewProject && verification_profile != profile {
+            emitter.emit(TaskEvent::Inspection {
+                profile: verification_profile.clone(),
+                source_revision: None,
+            });
+        }
+        if commands.is_empty() {
+            emitter.warn("no automatic verification commands were detected");
+        }
         let mut verification = match execute_verification(
             &commands,
             &workspace_ref.path,
@@ -519,10 +533,11 @@ async fn run(
             // The loop already recorded why the milestone stopped.
             return Ok(());
         };
-        // Only a milestone that verified AND passed review can satisfy what
-        // it owns, and only where no finding is still open against it.
+        // Only a milestone that passed review and has automatic verification
+        // evidence (or an explicit critic PASS where no command exists) can
+        // satisfy what it owns, and only where no finding is still open.
         acceptance.findings_cleared(&milestone.id);
-        acceptance.verified(&milestone.id, &verification);
+        acceptance.passed_after_review(&milestone.id, &review, &verification);
         let worker_summary = if review.iterations_used == 0 {
             "Worker completed successfully.".to_string()
         } else {
@@ -584,6 +599,18 @@ async fn run(
             worker_result_summary: worker_summary,
         });
     }
+    // Task 0013: documentation is written BEFORE the result is captured, so it
+    // is part of the diff the user reviews and of any persisted project.
+    generate_documentation(
+        state,
+        id,
+        emitter,
+        &profile,
+        &all_verification,
+        workspace_ref,
+    )
+    .await;
+
     let diff_path = workspace_ref.path.clone();
     let limits = state.config.execution.clone();
     let baseline = workspace_ref.revision.clone();
@@ -838,6 +865,55 @@ async fn execute_worker_stage(
     Ok(())
 }
 
+/// Task 0013: write the submission documentation into the finished project.
+///
+/// It runs after implementation, verification and review, so every statement it
+/// makes is backed by recorded state, and before the result is captured, so the
+/// documents are part of the diff and of any persisted project. A failure here
+/// is reported but does not fail a run whose code and verification succeeded.
+async fn generate_documentation(
+    state: &AppState,
+    id: TaskId,
+    emitter: &Emitter,
+    profile: &ProjectProfile,
+    verification: &[VerificationResult],
+    workspace: &TaskWorkspace,
+) {
+    // The REDACTED snapshot: generated documentation inherits the established
+    // secret redaction rather than inventing its own.
+    let Some(task) = state.manager.evidence_snapshot(id) else {
+        return;
+    };
+    let profile = profile.clone();
+    let verification = verification.to_vec();
+    let project = workspace.path.clone();
+    let generated = tokio::task::spawn_blocking(move || {
+        let documents = crate::submission::documents(&crate::submission::SubmissionInputs {
+            task: &task,
+            profile: &profile,
+            verification: &verification,
+            project: &project,
+        });
+        crate::submission::write_into(&project, &documents)
+    })
+    .await;
+    match generated {
+        Ok(Ok(submission)) => {
+            if !submission.preserved.is_empty() {
+                emitter.notice(format!(
+                    "existing documentation preserved: {}",
+                    submission.preserved.join(", ")
+                ));
+            }
+            emitter.emit(crate::submission::generated_event(&submission));
+        }
+        Ok(Err(error)) => emitter.warn(format!(
+            "submission documentation could not be generated: {error:#}"
+        )),
+        Err(error) => emitter.warn(format!("submission documentation task failed: {error}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task 0012: acceptance-criteria tracking
 // ---------------------------------------------------------------------------
@@ -866,7 +942,7 @@ impl Acceptance<'_> {
         &self,
         criterion: &AcceptanceCriterion,
         status: CriterionStatus,
-        evidence: Option<String>,
+        evidence: Option<crate::acceptance::CriterionEvidence>,
         blocking_finding: Option<String>,
         findings_cleared: bool,
     ) {
@@ -891,7 +967,7 @@ impl Acceptance<'_> {
 
     /// Verification failed: the criteria this milestone owns are not satisfied.
     fn verification_failed(&self, milestone_id: &str, verification: &[VerificationResult]) {
-        let evidence = crate::acceptance::evidence_line(&format!(
+        let evidence = crate::acceptance::CriterionEvidence::automatic_verification(&format!(
             "milestone {milestone_id}: {}",
             summarize(verification)
         ));
@@ -906,13 +982,32 @@ impl Acceptance<'_> {
         }
     }
 
-    /// A reviewed, verified milestone. Only now may its criteria pass, and only
-    /// those with nothing open against them.
-    fn verified(&self, milestone_id: &str, verification: &[VerificationResult]) {
-        let evidence = crate::acceptance::evidence_line(&format!(
-            "milestone {milestone_id}: {}",
-            summarize(verification)
-        ));
+    /// A critic-PASS milestone may pass its criteria. Successful automatic
+    /// verification is retained as its own evidence kind; without an automatic
+    /// command, the explicit implementation-critic PASS is the equivalent
+    /// evidence. An empty list never becomes PASSED on its own.
+    fn passed_after_review(
+        &self,
+        milestone_id: &str,
+        review: &MilestoneReview,
+        verification: &[VerificationResult],
+    ) {
+        if !review.status.is_pass() {
+            return;
+        }
+        let evidence = if verification.is_empty() {
+            crate::acceptance::CriterionEvidence::implementation_review(&format!(
+                "milestone {milestone_id}: implementation critic PASS; no automatic verification commands were available"
+            ))
+        } else if verification.iter().all(|result| result.success) {
+            crate::acceptance::CriterionEvidence::automatic_verification(&format!(
+                "milestone {milestone_id}: {}",
+                summarize(verification)
+            ))
+        } else {
+            self.verification_failed(milestone_id, verification);
+            return;
+        };
         for criterion in crate::acceptance::owned_by(&self.criteria(), milestone_id) {
             let status = if criterion.may_pass() {
                 CriterionStatus::Passed
@@ -962,6 +1057,28 @@ impl Acceptance<'_> {
             }
         }
     }
+}
+
+/// New projects begin empty, so stack-specific files may not exist when the
+/// milestone plan is created. Re-detect after worker output exists, while
+/// preserving the requested stack if no concrete project metadata appears.
+fn verification_plan_after_implementation(
+    kind: TaskKind,
+    selected_profile: &ProjectProfile,
+    root: &std::path::Path,
+) -> Result<(ProjectProfile, Vec<VerificationCommand>)> {
+    let profile = if kind == TaskKind::NewProject {
+        let detected = crate::technology::detect(root)?;
+        if detected.build_tool == crate::technology::BuildTool::Custom {
+            selected_profile.clone()
+        } else {
+            detected
+        }
+    } else {
+        selected_profile.clone()
+    };
+    let commands = crate::verification::plan(&profile, root);
+    Ok((profile, commands))
 }
 
 /// A concise, log-free description of what verification did.
@@ -3016,9 +3133,10 @@ mod review_loop_tests {
     #[cfg(test)]
     mod acceptance_tests {
         use super::*;
-        use crate::acceptance::CriterionStatus;
+        use crate::acceptance::{CriterionEvidenceKind, CriterionStatus};
         use crate::agent::ChatProvider;
         use crate::agent::chat::ScriptedAgent;
+        use crate::review::ReviewStatus;
 
         fn passing() -> Vec<VerificationResult> {
             vec![VerificationResult {
@@ -3036,6 +3154,15 @@ mod review_loop_tests {
             }]
         }
 
+        fn critic_pass() -> MilestoneReview {
+            MilestoneReview {
+                status: ReviewStatus::Pass,
+                iterations_used: 0,
+                max_iterations: 2,
+                findings: Vec::new(),
+            }
+        }
+
         /// Required test 4: real verification is what promotes a criterion, and the
         /// evidence it records names the command rather than copying its log.
         #[tokio::test]
@@ -3046,15 +3173,24 @@ mod review_loop_tests {
             acceptance.implemented("m1");
             assert_eq!(harness.criterion().status, CriterionStatus::Implemented);
 
-            acceptance.verified("m1", &passing());
+            acceptance.passed_after_review("m1", &critic_pass(), &passing());
 
             let criterion = harness.criterion();
             assert_eq!(criterion.status, CriterionStatus::Passed);
             assert_eq!(criterion.milestones, vec!["m1".to_string()]);
-            let evidence = criterion.evidence.join(" ");
+            let evidence = criterion
+                .evidence
+                .iter()
+                .map(crate::acceptance::CriterionEvidence::display)
+                .collect::<Vec<_>>()
+                .join(" ");
             assert!(evidence.contains("cargo test"), "{evidence}");
             assert!(evidence.contains("passed"), "{evidence}");
             assert!(!evidence.contains("1 test failed"), "no logs: {evidence}");
+            assert_eq!(
+                criterion.evidence[0].kind,
+                CriterionEvidenceKind::AutomaticVerification
+            );
         }
 
         /// Required test 5: a worker claim never passes a criterion, and failed
@@ -3070,7 +3206,13 @@ mod review_loop_tests {
             let criterion = harness.criterion();
             assert_eq!(criterion.status, CriterionStatus::Failed);
             assert!(
-                criterion.evidence.join(" ").contains("verification failed"),
+                criterion
+                    .evidence
+                    .iter()
+                    .map(crate::acceptance::CriterionEvidence::display)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains("verification failed"),
                 "{criterion:?}"
             );
             assert!(
@@ -3104,12 +3246,12 @@ mod review_loop_tests {
             assert!(!blocked.may_pass(), "an open finding blocks the pass");
 
             // Verification passing while the finding is open is not enough.
-            acceptance.verified("m1", &passing());
+            acceptance.passed_after_review("m1", &critic_pass(), &passing());
             assert_eq!(harness.criterion().status, CriterionStatus::Failed);
 
             // The next review passes, so the finding no longer blocks it.
             acceptance.findings_cleared("m1");
-            acceptance.verified("m1", &passing());
+            acceptance.passed_after_review("m1", &critic_pass(), &passing());
             let resolved = harness.criterion();
             assert_eq!(resolved.status, CriterionStatus::Passed);
             assert!(resolved.blocking_findings.is_empty());
@@ -3156,7 +3298,9 @@ mod review_loop_tests {
             );
             // Mirror what the pipeline does once the review passes.
             harness.acceptance().findings_cleared("m1");
-            harness.acceptance().verified("m1", &passing());
+            harness
+                .acceptance()
+                .passed_after_review("m1", &critic_pass(), &passing());
             assert_eq!(harness.criterion().status, CriterionStatus::Passed);
         }
 
@@ -3180,7 +3324,7 @@ mod review_loop_tests {
                 .emitter
                 .emit(TaskEvent::AcceptanceCriteriaGenerated { criteria });
             acceptance.implemented("m1");
-            acceptance.verified("m1", &passing());
+            acceptance.passed_after_review("m1", &critic_pass(), &passing());
 
             let snapshot = harness
                 .state
@@ -3204,7 +3348,10 @@ mod review_loop_tests {
             assert!(report.contains("**PASSED**"), "{report}");
             assert!(report.contains("**DEFERRED**"), "{report}");
             assert!(report.contains("Outstanding: AC-002"), "{report}");
-            assert!(report.contains("Evidence: milestone m1"), "{report}");
+            assert!(
+                report.contains("Evidence: Automatic verification: milestone m1"),
+                "{report}"
+            );
 
             let jsonl = file(crate::evidence::JSONL_FILENAME);
             assert!(jsonl.contains("acceptance_criteria_generated"), "{jsonl}");
@@ -3214,6 +3361,180 @@ mod review_loop_tests {
             assert!(log.contains("Acceptance criterion AC-001 updated"), "{log}");
             // Deferred work is never quietly dropped from the record.
             assert!(log.contains("Published dashboards refresh"), "{log}");
+        }
+
+        #[tokio::test]
+        async fn critic_pass_is_explicit_evidence_when_no_automatic_verification_exists() {
+            let harness = Harness::new("acceptance-critic-pass-no-verification");
+            let acceptance = harness.acceptance();
+            acceptance.implemented("m1");
+
+            acceptance.passed_after_review("m1", &critic_pass(), &[]);
+
+            let criterion = harness.criterion();
+            assert_eq!(criterion.status, CriterionStatus::Passed);
+            assert_eq!(criterion.evidence.len(), 1);
+            assert_eq!(
+                criterion.evidence[0].kind,
+                CriterionEvidenceKind::ImplementationReview
+            );
+            let evidence = criterion.evidence[0].display();
+            assert!(
+                evidence.contains("implementation critic PASS"),
+                "{evidence}"
+            );
+            assert!(
+                evidence.contains("no automatic verification commands"),
+                "{evidence}"
+            );
+            assert_ne!(
+                evidence, "no automatic verification commands were available",
+                "absence of verification cannot itself be passing evidence"
+            );
+        }
+
+        #[test]
+        fn new_project_verification_is_redetected_after_worker_files_exist() {
+            let root = std::env::temp_dir()
+                .join(format!("mac-new-project-verify-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let requested = ProjectProfile::selected(crate::technology::TechStack::TypeScriptNode);
+            let (_, before) =
+                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
+                    .unwrap();
+            assert!(before.is_empty());
+
+            // This metadata is created by the worker, after the task's initial
+            // empty-workspace verification plan was made.
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"scripts":{"test":"node --test","build":"tsc"}}"#,
+            )
+            .unwrap();
+            let (profile, commands) =
+                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
+                    .unwrap();
+            assert_eq!(profile.build_tool, crate::technology::BuildTool::Npm);
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(VerificationCommand::display)
+                    .collect::<Vec<_>>(),
+                ["npm run test", "npm run build"]
+            );
+
+            std::fs::remove_file(root.join("package.json")).unwrap();
+            std::fs::write(
+                root.join("pyproject.toml"),
+                "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+            )
+            .unwrap();
+            std::fs::create_dir(root.join("tests")).unwrap();
+            let (profile, commands) =
+                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
+                    .unwrap();
+            assert_eq!(profile.build_tool, crate::technology::BuildTool::Python);
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(VerificationCommand::display)
+                    .collect::<Vec<_>>(),
+                ["pytest"]
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Task 0013: the run writes its submission documentation into the finished
+    /// project, before the result is captured, and audits what it wrote.
+    mod submission_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn documentation_reaches_the_project_and_the_audit() {
+            let harness = Harness::new("submission-pipeline");
+            // Documentation the run did not write must survive it.
+            std::fs::write(harness.workspace.path.join("README.md"), "# Hand-written\n").unwrap();
+
+            generate_documentation(
+                &harness.state,
+                harness.task.id,
+                &harness.emitter,
+                &harness.profile,
+                &harness.passing_verification(),
+                &harness.workspace,
+            )
+            .await;
+
+            let project = &harness.workspace.path;
+            assert_eq!(
+                std::fs::read_to_string(project.join("README.md")).unwrap(),
+                "# Hand-written\n",
+                "existing documentation is preserved"
+            );
+            for document in [
+                "README.generated.md",
+                "docs/ARCHITECTURE.md",
+                "docs/DEVELOPMENT_LOG.md",
+                "docs/DECISIONS.md",
+                "docs/AI_USAGE.md",
+                "docs/NEXT_STEPS.md",
+            ] {
+                assert!(
+                    project.join(document).is_file(),
+                    "{document} was not written"
+                );
+            }
+
+            let stored = harness.stored();
+            let (written, preserved) = stored
+                .history
+                .iter()
+                .find_map(|recorded| match &recorded.event {
+                    TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
+                        Some((written.clone(), preserved.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("the generation is audited");
+            assert!(written.contains(&"docs/AI_USAGE.md".to_string()));
+            assert_eq!(preserved, vec!["README.md".to_string()]);
+            // No absolute workspace path may reach the audit.
+            assert!(
+                !written
+                    .iter()
+                    .any(|file| file.contains(':') || file.starts_with('/')),
+                "{written:?}"
+            );
+
+            // The documents are part of what the user reviews as the result.
+            let diff = task_result_diff(
+                project,
+                harness.workspace.revision.as_deref(),
+                &harness.state.config.execution,
+            )
+            .unwrap();
+            assert!(diff.contains("docs/AI_USAGE.md"), "{diff}");
+
+            // And the final report names them.
+            let snapshot = harness
+                .state
+                .manager
+                .evidence_snapshot(harness.task.id)
+                .unwrap();
+            let report = crate::evidence::export(&snapshot)
+                .unwrap()
+                .files
+                .into_iter()
+                .find(|(name, _)| name == crate::evidence::FINAL_REPORT_FILENAME)
+                .unwrap()
+                .1;
+            assert!(report.contains("## Generated documentation"), "{report}");
+            assert!(report.contains("`docs/NEXT_STEPS.md`"), "{report}");
+            assert!(
+                report.contains("Existing documentation left untouched: `README.md`"),
+                "{report}"
+            );
         }
     }
 }

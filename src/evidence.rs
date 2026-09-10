@@ -352,7 +352,7 @@ fn jsonl(task: &Task) -> Result<String> {
     Ok(jsonl)
 }
 
-fn development_log(task: &Task) -> String {
+pub(crate) fn development_log(task: &Task) -> String {
     let mut entries = Vec::<(u64, DateTime<Utc>, String, Vec<String>)>::new();
     for event in &task.history {
         if let Some((title, details)) = describe_event(event) {
@@ -757,7 +757,10 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
         } => {
             let mut details = vec![format!("Status: {}", status.label())];
             if let Some(evidence) = evidence {
-                details.push(format!("Evidence: {}", markdown_inline(evidence)));
+                details.push(format!(
+                    "Evidence: {}",
+                    markdown_inline(&evidence.display())
+                ));
             }
             if let Some(finding) = blocking_finding {
                 details.push(format!("Blocking finding: {}", markdown_inline(finding)));
@@ -769,6 +772,19 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Acceptance criterion {} updated", markdown_inline(id)),
                 details,
             )
+        }
+        TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
+            let mut details = vec![format!("Documents written: {}", written.len())];
+            for file in written {
+                details.push(format!("Written: `{}`", markdown_inline(file)));
+            }
+            for file in preserved {
+                details.push(format!(
+                    "Preserved existing documentation: `{}`",
+                    markdown_inline(file)
+                ));
+            }
+            ("Submission documentation generated".into(), details)
         }
         TaskEvent::ProjectPersistenceStarted { destination } => (
             "Project persistence started".into(),
@@ -924,7 +940,7 @@ fn describe_evidence(record: &EvidenceRecord) -> (String, Vec<String>) {
     }
 }
 
-fn agent_usage(task: &Task) -> String {
+pub(crate) fn agent_usage(task: &Task) -> String {
     format!(
         "# Agent Usage\n\n## Proposer\n\nProvider: {}\n\nModel: `{}`\n\nPurpose: Generate implementation and architecture proposals and draft the specification.\n\n## Critic\n\nProvider: {}\n\nModel: `{}`\n\nPurpose: Review proposals, identify risks, and check the generated specification.\n\n## Worker\n\nTool: {}\n\nModel: `{}`\n\nPurpose: Implement the user-approved specification in the isolated task workspace.\n",
         task.agents.proposer.provider.label(),
@@ -936,7 +952,7 @@ fn agent_usage(task: &Task) -> String {
     )
 }
 
-fn decisions(task: &Task) -> String {
+pub(crate) fn decisions(task: &Task) -> String {
     let mut markdown = String::from("# Decisions\n\n");
     let source = task.spec.as_deref();
     let mut recorded = false;
@@ -1155,7 +1171,10 @@ fn final_report(task: &Task) -> String {
                 }
             ));
             for evidence in &criterion.evidence {
-                markdown.push_str(&format!("  Evidence: {}\n", markdown_inline(evidence)));
+                markdown.push_str(&format!(
+                    "  Evidence: {}\n",
+                    markdown_inline(&evidence.display())
+                ));
             }
             for finding in &criterion.blocking_findings {
                 markdown.push_str(&format!(
@@ -1178,6 +1197,38 @@ fn final_report(task: &Task) -> String {
                 outstanding.join(", ")
             }
         ));
+    }
+
+    // Task 0013: the generated submission documentation is part of the result.
+    markdown.push_str("## Generated documentation\n\n");
+    let documentation = task
+        .history
+        .iter()
+        .rev()
+        .find_map(|recorded| match &recorded.event {
+            TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
+                Some((written.clone(), preserved.clone()))
+            }
+            _ => None,
+        });
+    match documentation {
+        Some((written, preserved)) => {
+            for file in written {
+                markdown.push_str(&format!("- `{}`\n", markdown_inline(&file)));
+            }
+            if !preserved.is_empty() {
+                markdown.push_str(&format!(
+                    "\nExisting documentation left untouched: {}\n",
+                    preserved
+                        .iter()
+                        .map(|file| format!("`{}`", markdown_inline(file)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            markdown.push('\n');
+        }
+        None => markdown.push_str("No submission documentation was generated for this task.\n\n"),
     }
 
     markdown.push_str("## Known errors/failures\n\n");
@@ -1360,7 +1411,7 @@ fn markdown_quote(value: &str) -> String {
         .join("\n")
 }
 
-fn markdown_section(markdown: &str, name: &str) -> Option<String> {
+pub(crate) fn markdown_section(markdown: &str, name: &str) -> Option<String> {
     let heading = format!("## {name}");
     let start = markdown
         .lines()

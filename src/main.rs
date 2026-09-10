@@ -29,6 +29,7 @@ mod review_baseline;
 #[cfg(test)]
 mod safety_tests;
 mod spec;
+mod submission;
 mod target;
 mod task;
 mod technology;

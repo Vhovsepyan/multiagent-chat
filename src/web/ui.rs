@@ -230,8 +230,13 @@ fn acceptance_list_html(criteria: &[crate::acceptance::AcceptanceCriterion]) -> 
             let evidence = criterion
                 .evidence
                 .iter()
-                .chain(criterion.blocking_findings.iter())
-                .map(|line| format!(r#"<div class="hint">{}</div>"#, esc(line)))
+                .map(|line| format!(r#"<div class="hint">{}</div>"#, esc(&line.display())))
+                .chain(
+                    criterion
+                        .blocking_findings
+                        .iter()
+                        .map(|line| format!(r#"<div class="hint">{}</div>"#, esc(line))),
+                )
                 .collect::<String>();
             format!(
                 r#"<li><span class="milestone-status {class}">{}</span> <code>{}</code> {}<div class="hint">Milestones: {}</div>{evidence}</li>"#,
@@ -764,6 +769,25 @@ fn event_html(
                 r#"<div class="notice">{} · {}</div>"#,
                 esc(id),
                 esc(status.label())
+            ),
+        )),
+        TaskEvent::SubmissionDocumentationGenerated { written, preserved } => Some((
+            "build",
+            format!(
+                r#"<div class="notice ok">Documentation generated · {}</div>{}"#,
+                written
+                    .iter()
+                    .map(|file| format!("<code>{}</code>", esc(file)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if preserved.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<div class="hint">Existing documentation preserved: {}</div>"#,
+                        esc(&preserved.join(", "))
+                    )
+                }
             ),
         )),
         TaskEvent::ProjectPersistenceStarted { destination } => Some((

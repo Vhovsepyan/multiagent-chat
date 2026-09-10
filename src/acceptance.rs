@@ -32,6 +32,53 @@ const CRITERIA_HEADING: &str = "acceptance criteria";
 /// The section every approved specification has, used when it states none.
 const STEPS_HEADING: &str = "steps";
 
+/// The independent source that supports a criterion's state. Keeping this
+/// explicit prevents a review result from being mistaken for an automatic test,
+/// and vice versa, in the task UI and exported evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionEvidenceKind {
+    AutomaticVerification,
+    ImplementationReview,
+}
+
+impl CriterionEvidenceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutomaticVerification => "Automatic verification",
+            Self::ImplementationReview => "Implementation review",
+        }
+    }
+}
+
+/// A concise, typed reference to evidence. Its text is bounded; detailed
+/// command output remains only in the task result/evidence export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CriterionEvidence {
+    pub kind: CriterionEvidenceKind,
+    pub summary: String,
+}
+
+impl CriterionEvidence {
+    pub fn automatic_verification(summary: &str) -> Self {
+        Self {
+            kind: CriterionEvidenceKind::AutomaticVerification,
+            summary: evidence_line(summary),
+        }
+    }
+
+    pub fn implementation_review(summary: &str) -> Self {
+        Self {
+            kind: CriterionEvidenceKind::ImplementationReview,
+            summary: evidence_line(summary),
+        }
+    }
+
+    pub fn display(&self) -> String {
+        format!("{}: {}", self.kind.label(), self.summary)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CriterionStatus {
@@ -74,7 +121,7 @@ pub struct AcceptanceCriterion {
     /// covers it, which is why such a criterion is `Deferred` rather than lost.
     pub milestones: Vec<String>,
     /// Concise references to what supports its current state.
-    pub evidence: Vec<String>,
+    pub evidence: Vec<CriterionEvidence>,
     /// Critic findings that must be resolved before it can pass (task 0011).
     pub blocking_findings: Vec<String>,
 }

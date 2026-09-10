@@ -2334,7 +2334,11 @@ async fn the_task_page_shows_acceptance_criteria_progress() {
             description: "Event creation".into(),
             status: crate::acceptance::CriterionStatus::Passed,
             milestones: vec!["m1".into()],
-            evidence: vec!["milestone m1: 1 verification command(s) passed: cargo test".into()],
+            evidence: vec![
+                crate::acceptance::CriterionEvidence::automatic_verification(
+                    "milestone m1: 1 verification command(s) passed: cargo test",
+                ),
+            ],
             blocking_findings: Vec::new(),
         },
         crate::acceptance::AcceptanceCriterion {

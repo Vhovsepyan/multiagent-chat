@@ -429,12 +429,12 @@ pub enum TaskEvent {
     AcceptanceCriteriaGenerated {
         criteria: Vec<crate::acceptance::AcceptanceCriterion>,
     },
-    /// One criterion changed state. `evidence` is a concise reference to what
+    /// One criterion changed state. `evidence` retains which independent source
     /// supports it, never a copy of a verification log.
     AcceptanceCriterionUpdated {
         id: String,
         status: crate::acceptance::CriterionStatus,
-        evidence: Option<String>,
+        evidence: Option<crate::acceptance::CriterionEvidence>,
         /// A critic finding that now blocks this criterion from passing.
         blocking_finding: Option<String>,
         /// Set when a passing review cleared the findings against it.
@@ -493,6 +493,14 @@ pub enum TaskEvent {
         tool: crate::agent::CodingTool,
         model: String,
         error: String,
+    },
+
+    /// Task 0013: submission documentation written into the finished project.
+    /// Paths are project-relative; `preserved` names documentation that already
+    /// existed and was therefore left exactly as it was.
+    SubmissionDocumentationGenerated {
+        written: Vec<String>,
+        preserved: Vec<String>,
     },
 
     /// Persistent New Project output (task 0010). `destination` is always the
@@ -733,7 +741,7 @@ impl TaskEvent {
                     clean(&mut criterion.id);
                     clean(&mut criterion.description);
                     for evidence in &mut criterion.evidence {
-                        clean(evidence);
+                        clean(&mut evidence.summary);
                     }
                     for finding in &mut criterion.blocking_findings {
                         clean(finding);
@@ -748,7 +756,7 @@ impl TaskEvent {
             } => {
                 clean(id);
                 if let Some(evidence) = evidence {
-                    clean(evidence);
+                    clean(&mut evidence.summary);
                 }
                 if let Some(finding) = blocking_finding {
                     clean(finding);
@@ -806,6 +814,11 @@ impl TaskEvent {
                 clean(milestone_id);
                 clean(model);
                 clean(error);
+            }
+            Self::SubmissionDocumentationGenerated { written, preserved } => {
+                for file in written.iter_mut().chain(preserved.iter_mut()) {
+                    clean(file);
+                }
             }
             Self::ProjectPersistenceStarted { destination } => clean(destination),
             Self::ProjectPersisted {
@@ -1416,7 +1429,7 @@ impl Task {
             clean(&mut criterion.id);
             clean(&mut criterion.description);
             for evidence in &mut criterion.evidence {
-                clean(evidence);
+                clean(&mut evidence.summary);
             }
             for finding in &mut criterion.blocking_findings {
                 clean(finding);
