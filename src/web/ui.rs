@@ -112,9 +112,42 @@ fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode) -> String
     )
 }
 
-fn actions_html(id: TaskId) -> String {
+fn actions_html(task: &Task) -> String {
     format!(
-        r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{id}/evidence" download>Export Evidence</a><div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#
+        r#"<div id="task-actions">{}</div>"#,
+        action_controls_html(
+            task.id,
+            task.persistence.as_ref(),
+            task.github_publication.as_ref()
+        )
+    )
+}
+
+fn action_controls_html(
+    id: TaskId,
+    persistence: Option<&ProjectPersistence>,
+    publication: Option<&crate::task::GitHubPublication>,
+) -> String {
+    let publish = if persistence.is_some_and(|item| item.status == PersistenceStatus::Persisted)
+        && publication.is_none()
+    {
+        format!(
+            r#"<a class="button-link" href="/api/tasks/{0}/publish">Review GitHub preflight</a><form hx-post="/ui/tasks/{0}/publish" hx-confirm="Publish the completed project to GitHub?" hx-swap="none"><button type="submit">Publish to GitHub</button><div class="hint">Review the remote, branch, HEAD, working tree, and verification summary before this explicit action.</div></form>"#,
+            id
+        )
+    } else if let Some(publication) = publication {
+        format!(
+            r#"<div class="notice ok">Published to <code>{}</code> on <code>{}</code> at commit <code>{}</code>.</div>"#,
+            esc(&publication.repository),
+            esc(&publication.branch),
+            esc(&publication.commit_sha)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{}/evidence" download>Export Evidence</a>{publish}<div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#,
+        id
     )
 }
 
@@ -870,6 +903,32 @@ fn event_html(
                 esc(error)
             ),
         )),
+        TaskEvent::GitHubPublishStarted {
+            repository, branch, ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Publishing to <code>{}</code> on <code>{}</code>…</div>"#,
+                esc(repository),
+                esc(branch)
+            ),
+        )),
+        TaskEvent::GitHubPublishCompleted { publication } => Some((
+            "done",
+            format!(
+                r#"<div class="done-banner ok">Published to <code>{}</code> on <code>{}</code> at <code>{}</code>.</div>"#,
+                esc(&publication.repository),
+                esc(&publication.branch),
+                esc(&publication.commit_sha)
+            ),
+        )),
+        TaskEvent::GitHubPublishFailed { error, .. } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">GitHub publication failed · {}</div>"#,
+                esc(error)
+            ),
+        )),
         TaskEvent::Result { result } => {
             Some(("build", format!("<pre>{}</pre>", esc(&result.diff))))
         }
@@ -938,6 +997,7 @@ struct RenderState<'a> {
     acceptance: &'a [crate::acceptance::AcceptanceCriterion],
     output: Option<OutputTarget>,
     persistence: Option<&'a ProjectPersistence>,
+    github_publication: Option<&'a crate::task::GitHubPublication>,
     completion_checklist: Option<&'a CompletionChecklist>,
 }
 
@@ -950,6 +1010,7 @@ impl<'a> RenderState<'a> {
             acceptance: &task.acceptance,
             output: task.output,
             persistence: task.persistence.as_ref(),
+            github_publication: task.github_publication.as_ref(),
             completion_checklist: task.completion_checklist.as_ref(),
         }
     }
@@ -982,6 +1043,24 @@ fn event_updates(
             (
                 "completion-checklist",
                 completion_list_html(state.completion_checklist),
+            ),
+            (
+                "task-actions",
+                action_controls_html(id, state.persistence, state.github_publication),
+            ),
+        ];
+    }
+    if matches!(
+        recorded.event,
+        TaskEvent::GitHubPublishStarted { .. }
+            | TaskEvent::GitHubPublishCompleted { .. }
+            | TaskEvent::GitHubPublishFailed { .. }
+    ) {
+        return vec![
+            (name, html),
+            (
+                "task-actions",
+                action_controls_html(id, state.persistence, state.github_publication),
             ),
         ];
     }
@@ -1306,7 +1385,7 @@ fn page_html(
     build: &str,
     done: &str,
 ) -> String {
-    let actions = actions_html(task.id);
+    let actions = actions_html(task);
     let milestones = milestones_html(task);
     format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{output}{actions}{milestones}{acceptance}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,
@@ -1339,6 +1418,7 @@ pub async fn stream(
                         acceptance: &[],
                         output: None,
                         persistence: None,
+                        github_publication: None,
                         completion_checklist: None,
                     },
                 };
@@ -1384,4 +1464,65 @@ pub async fn approve(
         .map(|task| spec_readonly(&task))
         .unwrap_or_default();
     Html(body).into_response()
+}
+
+/// The browser's publish button is itself the explicit confirmation. A second
+/// read-only preflight is performed immediately before the push.
+pub async fn publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> Response {
+    let Some(task) = state.manager.get(id) else {
+        return (StatusCode::NOT_FOUND, Html::<String>("No such task".into())).into_response();
+    };
+    let limits = state.config.execution.clone();
+    let emitter = state.manager.emitter(id);
+    let preview = match tokio::task::spawn_blocking({
+        let task = task.clone();
+        let limits = limits.clone();
+        move || crate::github_publish::preview(&task, &limits)
+    })
+    .await
+    {
+        Ok(Ok(preview)) => preview,
+        Ok(Err(error)) => {
+            return (StatusCode::CONFLICT, Html(esc(&error.to_string()))).into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(esc(&error.to_string())),
+            )
+                .into_response();
+        }
+    };
+    let repository = preview.repository.clone();
+    let branch = preview.branch.clone();
+    emitter.emit(TaskEvent::GitHubPublishStarted {
+        repository: preview.repository,
+        branch: preview.branch,
+        commit_sha: preview.head_sha,
+    });
+    match tokio::task::spawn_blocking(move || crate::github_publish::publish(&task, &limits)).await
+    {
+        Ok(Ok(publication)) => {
+            emitter.emit(TaskEvent::GitHubPublishCompleted { publication });
+            state
+                .manager
+                .get(id)
+                .map(|task| actions_html(&task))
+                .unwrap_or_default()
+                .into_response()
+        }
+        Ok(Err(error)) => {
+            emitter.emit(TaskEvent::GitHubPublishFailed {
+                repository: Some(repository),
+                branch: Some(branch),
+                error: format!("{error:#}"),
+            });
+            (StatusCode::CONFLICT, Html(esc(&error.to_string()))).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(esc(&error.to_string())),
+        )
+            .into_response(),
+    }
 }

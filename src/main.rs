@@ -15,6 +15,7 @@ mod debate;
 mod evidence;
 mod execution_limits;
 mod git;
+mod github_publish;
 mod implementer;
 mod inspection;
 mod milestone;

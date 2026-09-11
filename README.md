@@ -686,7 +686,7 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - Evidence retention is in memory and is lost on restart. Raw worker
   stdout/stderr is intentionally not retained in the evidence transcript; the
   existing bounded UI log and process capture remain separate.
-- A persistent New Project is written to a local folder only. Downloadable archives, created GitHub repositories, and pushes are not implemented.
+- A persistent New Project can be explicitly published to an existing GitHub remote after completion, using the local Git credential helper/SSH agent. OAuth/App authentication, automatic repository creation, and unattended pushes are not implemented.
 - Persistent output requires a configured `PERSISTENT_OUTPUT_ROOT` (or `WORKSPACE_ROOT`); it cannot write anywhere else, and the generated project must contain no symlinks or junctions.
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
 - Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.

@@ -381,3 +381,86 @@ pub async fn approve_task(
         .ok_or_else(|| ApiError::internal("task vanished while approving"))?;
     Ok(Json(updated))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct GithubPublishRequest {
+    pub confirm: bool,
+}
+
+/// `GET /api/tasks/{id}/publish` — read-only publication preflight.
+pub async fn github_publish_preview(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> ApiResult<Json<crate::github_publish::PublishPreview>> {
+    let task = state
+        .manager
+        .get(id)
+        .ok_or_else(|| ApiError::not_found(format!("no task {id}")))?;
+    let limits = state.config.execution.clone();
+    let preview =
+        tokio::task::spawn_blocking(move || crate::github_publish::preview(&task, &limits))
+            .await
+            .map_err(|error| ApiError::internal(format!("publish preflight task failed: {error}")))?
+            .map_err(|error| {
+                ApiError::conflict(format!("publishing is not available: {error:#}"))
+            })?;
+    Ok(Json(preview))
+}
+
+/// `POST /api/tasks/{id}/publish` — publish only after an explicit confirmation.
+pub async fn github_publish(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    ValidJson(request): ValidJson<GithubPublishRequest>,
+) -> ApiResult<Json<Task>> {
+    if !request.confirm {
+        return Err(ApiError::bad_request(
+            "publishing requires explicit confirmation",
+        ));
+    }
+    let task = state
+        .manager
+        .get(id)
+        .ok_or_else(|| ApiError::not_found(format!("no task {id}")))?;
+    let limits = state.config.execution.clone();
+    let emitter = state.manager.emitter(id);
+    let preview = tokio::task::spawn_blocking({
+        let task = task.clone();
+        let limits = limits.clone();
+        move || crate::github_publish::preview(&task, &limits)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("publish preflight task failed: {error}")))?
+    .map_err(|error| ApiError::conflict(format!("publishing is not available: {error:#}")))?;
+    let repository = preview.repository.clone();
+    let branch = preview.branch.clone();
+    emitter.emit(crate::task::TaskEvent::GitHubPublishStarted {
+        repository: preview.repository,
+        branch: preview.branch,
+        commit_sha: preview.head_sha,
+    });
+    let result =
+        tokio::task::spawn_blocking(move || crate::github_publish::publish(&task, &limits))
+            .await
+            .map_err(|error| ApiError::internal(format!("publish task failed: {error}")))?;
+    match result {
+        Ok(publication) => {
+            emitter.emit(crate::task::TaskEvent::GitHubPublishCompleted { publication });
+        }
+        Err(error) => {
+            emitter.emit(crate::task::TaskEvent::GitHubPublishFailed {
+                repository: Some(repository),
+                branch: Some(branch),
+                error: format!("{error:#}"),
+            });
+            return Err(ApiError::conflict(format!(
+                "GitHub publication failed: {error:#}"
+            )));
+        }
+    }
+    state
+        .manager
+        .get(id)
+        .map(Json)
+        .ok_or_else(|| ApiError::internal("task vanished while publishing"))
+}

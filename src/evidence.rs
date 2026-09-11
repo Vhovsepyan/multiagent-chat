@@ -835,6 +835,42 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Error: {}", markdown_inline(error)),
             ],
         ),
+        TaskEvent::GitHubPublishStarted {
+            repository,
+            branch,
+            commit_sha,
+        } => (
+            "GitHub publication started".into(),
+            vec![
+                format!("Repository: `{}`", markdown_inline(repository)),
+                format!("Branch: `{}`", markdown_inline(branch)),
+                format!("Commit: `{}`", markdown_inline(commit_sha)),
+            ],
+        ),
+        TaskEvent::GitHubPublishCompleted { publication } => (
+            "GitHub publication completed".into(),
+            vec![
+                format!("Repository: `{}`", markdown_inline(&publication.repository)),
+                format!("Branch: `{}`", markdown_inline(&publication.branch)),
+                format!("Commit: `{}`", markdown_inline(&publication.commit_sha)),
+                format!("Published at: {}", publication.published_at.to_rfc3339()),
+            ],
+        ),
+        TaskEvent::GitHubPublishFailed {
+            repository,
+            branch,
+            error,
+        } => {
+            let mut details = Vec::new();
+            if let Some(repository) = repository {
+                details.push(format!("Repository: `{}`", markdown_inline(repository)));
+            }
+            if let Some(branch) = branch {
+                details.push(format!("Branch: `{}`", markdown_inline(branch)));
+            }
+            details.push(format!("Error: {}", markdown_inline(error)));
+            ("GitHub publication failed".into(), details)
+        }
         TaskEvent::Result { .. } => ("Task result captured".into(), vec![]),
         TaskEvent::Finished { status, error } => {
             let mut details = vec![format!("Status: {}", status_label(*status))];
@@ -1134,6 +1170,15 @@ fn final_report(task: &Task) -> String {
             task.git_mode.label(),
         ));
     }
+    if let Some(publication) = &task.github_publication {
+        markdown.push_str(&format!(
+            "## GitHub publication\n\nPublished to `{}` on branch `{}` at commit `{}` at {}.\n\n",
+            markdown_inline(&publication.repository),
+            markdown_inline(&publication.branch),
+            markdown_inline(&publication.commit_sha),
+            publication.published_at.to_rfc3339(),
+        ));
+    }
     if !task.milestones.is_empty() {
         markdown.push_str("## Milestones\n\n");
         for milestone in &task.milestones {
@@ -1332,6 +1377,7 @@ fn known_errors(task: &Task) -> Vec<String> {
             | TaskEvent::WorkerFailed { error, .. }
             | TaskEvent::VerificationFailed { error, .. }
             | TaskEvent::ProjectPersistenceFailed { error, .. }
+            | TaskEvent::GitHubPublishFailed { error, .. }
             | TaskEvent::TaskFailed { error } => Some(error),
             TaskEvent::Finished {
                 error: Some(error), ..

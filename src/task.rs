@@ -264,6 +264,15 @@ pub struct ProjectPersistence {
     pub error: Option<String>,
 }
 
+/// Safe metadata recorded after an explicit GitHub publication succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubPublication {
+    pub repository: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub published_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub source_revision: Option<String>,
@@ -586,6 +595,23 @@ pub enum TaskEvent {
         error: String,
     },
 
+    /// Explicit, user-confirmed publication lifecycle. These events contain
+    /// repository identity and commit metadata only; never credentials or
+    /// local filesystem paths.
+    GitHubPublishStarted {
+        repository: String,
+        branch: String,
+        commit_sha: String,
+    },
+    GitHubPublishCompleted {
+        publication: GitHubPublication,
+    },
+    GitHubPublishFailed {
+        repository: Option<String>,
+        branch: Option<String>,
+        error: String,
+    },
+
     Inspection {
         profile: ProjectProfile,
         source_revision: Option<String>,
@@ -692,6 +718,8 @@ impl TaskEvent {
                 clean(path);
             }
             Self::SpecApproved { markdown } => clean(markdown),
+            Self::GitHubPublishFailed { error, .. } => clean(error),
+            Self::GitHubPublishStarted { .. } | Self::GitHubPublishCompleted { .. } => {}
             Self::ProposerStarted { model, .. }
             | Self::ProposerCompleted { model, .. }
             | Self::CriticStarted { model, .. }
@@ -1089,6 +1117,10 @@ pub struct Task {
     pub destination: Option<String>,
     /// How persistent output went, once it has been attempted (task 0010).
     pub persistence: Option<ProjectPersistence>,
+    /// Publication metadata appears only after the explicit GitHub action
+    /// succeeds. It is safe to expose in API/UI snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_publication: Option<GitHubPublication>,
     /// The agents this run uses, resolved once at creation and never re-read
     /// from the environment afterwards (task 0005).
     pub agents: AgentSelection,
@@ -1146,6 +1178,7 @@ impl Task {
             output: Some(OutputTarget::ReviewableResult),
             destination: None,
             persistence: None,
+            github_publication: None,
             agents: AgentSelection::compiled_defaults(),
             profile: None,
             result: None,
@@ -1199,6 +1232,7 @@ impl Task {
                 .destination
                 .map(|destination| destination.trim().to_string()),
             persistence: None,
+            github_publication: None,
             agents,
             git_mode,
             profile: None,
@@ -1453,6 +1487,9 @@ impl Task {
                     git_warning: None,
                     error: Some(error.clone()),
                 });
+            }
+            TaskEvent::GitHubPublishCompleted { ref publication } => {
+                self.github_publication = Some(publication.clone());
             }
             TaskEvent::MilestoneCommitCreated {
                 ref id, ref commit, ..
