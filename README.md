@@ -4,9 +4,10 @@ A Rust web application for repository-backed, multi-agent software engineering. 
 
 The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (currently Gemini or Anthropic); the worker uses a configured coding tool and model (currently Claude Code). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
 
-Multiagent Chat supports three task kinds:
+Multiagent Chat supports four task kinds:
 
 - New Project for a selected technology stack.
+- Take-home Assignment for a persistent, evidence-backed evaluation project.
 - Feature for a registered repository.
 - Bug Fix for a registered repository.
 
@@ -53,14 +54,14 @@ cargo run -- --help
 In the web UI:
 
 1. Register a public GitHub repository using `owner/repository` or its HTTPS URL when working on existing code.
-2. Create a New Project, Feature, or Bug Fix task.
+2. Create a New Project, Take-home Assignment, Feature, or Bug Fix task.
 3. Watch repository inspection and the proposer/critic debate through SSE.
 4. Review or edit the generated specification.
 5. Approve implementation.
 6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
 7. Select **Export Evidence** at any point to download the run's redacted evidence package.
 
-Feature and Bug Fix tasks require a registered Project. New Project tasks instead require a selected technology and an output mode.
+Feature and Bug Fix tasks require a registered Project. New Project and Take-home Assignment tasks instead require a selected technology and an output mode.
 
 ### New Project output
 
@@ -72,6 +73,20 @@ A New Project chooses between two outputs; the default is unchanged from before 
 The destination is a plain folder name (letters, digits, dot, dash, underscore), never a path: the server joins it to the configured output root, so separators, `..` and absolute paths are rejected. An existing non-empty destination is never overwritten, and links are refused rather than followed. The project is staged and then moved into place, so a failed persistence leaves the destination exactly as it was, fails the task, and is recorded as `project_persistence_failed`. When milestone commits are enabled, the repository is copied verbatim, so commit history and SHAs are preserved; no remote is ever configured or pushed. Once the project has been moved into place it counts as persisted: if its repository metadata cannot then be read, the run stays successful and reports the metadata as unavailable with a warning, rather than claiming the destination was left unchanged.
 
 This option does not apply to Feature and Bug Fix tasks, which inherit the registered project's output.
+
+### Take-home Assignment
+
+A **Take-home Assignment** reuses the New Project pipeline: task-level agent
+selection, specification approval, milestone verification, post-implementation
+critic/fix review, acceptance tracking, evidence export, and submission
+documentation all remain active. It defaults to **Persistent local project**
+output and **Commit after each successful milestone**. A valid safe destination
+folder name is required; temporary-only output is refused. Nothing is pushed.
+
+Its task page includes a completion checklist derived from recorded task state:
+implementation, verification, acceptance review, final critic review,
+documentation, evidence-export availability, and retained Git history are each
+shown independently rather than assumed successful.
 
 Approval is accepted only once, while the task is waiting for review. Early,
 duplicate, and terminal-task approval requests are rejected. An approved

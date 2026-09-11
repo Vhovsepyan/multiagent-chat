@@ -2003,6 +2003,94 @@ async fn task_creation_stores_the_requested_git_mode() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Task 0014: Take-home work uses the existing task endpoint, but its stored
+/// defaults are durable output and one verified commit per milestone.
+#[tokio::test]
+async fn take_home_task_creation_uses_delivery_defaults() {
+    let (state, root) = test_state("take-home-defaults");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "take_home_assignment",
+                "title": "Candidate portal",
+                "description": "Build the requested assignment",
+                "technology": "python",
+                "destination": "candidate-portal"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["kind"], "take_home_assignment");
+    assert_eq!(task["output"], "persistent_local_project");
+    assert_eq!(task["git_mode"], "commit_per_milestone");
+    assert_eq!(
+        task["completion_checklist"]["documentation_generated"],
+        false
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// The special checklist is visible only for Take-home Assignment work and
+/// begins honestly incomplete rather than mirroring its enabled defaults.
+#[tokio::test]
+async fn take_home_task_page_shows_an_evidence_based_completion_checklist() {
+    let (state, root) = test_state("take-home-checklist");
+    let task = state
+        .manager
+        .create_from_request(
+            crate::task::TaskRequest {
+                kind: crate::task::TaskKind::TakeHomeAssignment,
+                title: "Candidate portal".into(),
+                description: "Build the requested assignment".into(),
+                project_id: None,
+                technology: Some(crate::technology::TechStack::Rust),
+                output: None,
+                destination: Some("candidate-portal".into()),
+                agents: None,
+                git_mode: None,
+            },
+            state.catalogue.resolve(None).unwrap(),
+        )
+        .unwrap();
+
+    let response = router(state)
+        .oneshot(get(&format!("/task/{}", task.id)))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    for label in [
+        "Take-home completion",
+        "Implementation complete",
+        "Verification complete",
+        "Acceptance criteria reviewed",
+        "Final critic review complete",
+        "Documentation generated",
+        "Evidence export available",
+        "Git history available",
+    ] {
+        assert!(html.contains(label), "missing {label:?}: {html}");
+    }
+    assert!(html.contains("not complete"), "{html}");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn task_creation_form_exposes_take_home_configuration() {
+    let form = include_str!("static/index.html");
+    assert!(
+        form.contains("value=\"take_home_assignment\""),
+        "take-home type is not selectable"
+    );
+    assert!(
+        form.contains("persistent_local_project") && form.contains("commit_per_milestone"),
+        "take-home defaults are not visible in the form"
+    );
+}
+
 /// The form carries the same choice, and an unknown value is refused.
 #[tokio::test]
 async fn the_form_submits_the_git_mode() {

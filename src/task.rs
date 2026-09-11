@@ -43,6 +43,7 @@ pub type TaskId = Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     NewProject,
+    TakeHomeAssignment,
     Feature,
     BugFix,
 }
@@ -51,9 +52,20 @@ impl TaskKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::NewProject => "new project",
+            Self::TakeHomeAssignment => "take-home assignment",
             Self::Feature => "feature",
             Self::BugFix => "bug fix",
         }
+    }
+
+    /// Both of these kinds create an application in a fresh task workspace.
+    /// Take-home work deliberately reuses the New Project execution path.
+    pub fn creates_new_project(self) -> bool {
+        matches!(self, Self::NewProject | Self::TakeHomeAssignment)
+    }
+
+    pub fn is_take_home_assignment(self) -> bool {
+        matches!(self, Self::TakeHomeAssignment)
     }
 }
 
@@ -127,6 +139,27 @@ pub struct TaskRequest {
 }
 
 impl TaskRequest {
+    /// Take-home work always has a durable deliverable. The client may omit the
+    /// output value because the UI supplies this default, but the stored task
+    /// never does.
+    pub fn effective_output(&self) -> Option<OutputTarget> {
+        match self.kind {
+            TaskKind::TakeHomeAssignment => {
+                self.output.or(Some(OutputTarget::PersistentLocalProject))
+            }
+            _ => self.output,
+        }
+    }
+
+    /// A take-home repository should show its gradual, verified development
+    /// history by default. Other task kinds retain their established default.
+    pub fn effective_git_mode(&self) -> GitMode {
+        match self.kind {
+            TaskKind::TakeHomeAssignment => self.git_mode.unwrap_or(GitMode::CommitPerMilestone),
+            _ => self.git_mode.unwrap_or_default(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.title.trim().is_empty() {
             return Err("title cannot be empty".into());
@@ -135,15 +168,23 @@ impl TaskRequest {
             return Err("description cannot be empty".into());
         }
         match self.kind {
-            TaskKind::NewProject => {
+            TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
                 if self.project_id.is_some() {
-                    return Err("new_project must not reference an existing project".into());
+                    return Err(format!(
+                        "{} must not reference an existing project",
+                        self.kind.label()
+                    ));
                 }
                 if self.technology.is_none() {
-                    return Err("new_project requires a technology".into());
+                    return Err(format!("{} requires a technology", self.kind.label()));
                 }
-                match self.output {
-                    None => return Err("new_project requires output configuration".into()),
+                match self.effective_output() {
+                    None => {
+                        return Err(format!(
+                            "{} requires output configuration",
+                            self.kind.label()
+                        ));
+                    }
                     // Task 0010: the destination is part of choosing persistent
                     // output, so its syntax is checked with the rest of the
                     // request rather than half-way through the run.
@@ -159,6 +200,11 @@ impl TaskRequest {
                             );
                         }
                     }
+                }
+                if self.kind.is_take_home_assignment()
+                    && self.effective_output() != Some(OutputTarget::PersistentLocalProject)
+                {
+                    return Err("take-home assignment requires persistent output".into());
                 }
             }
             TaskKind::Feature | TaskKind::BugFix => {
@@ -223,6 +269,20 @@ pub struct TaskResult {
     pub source_revision: Option<String>,
     pub verification: Vec<VerificationResult>,
     pub diff: String,
+}
+
+/// A take-home delivery checklist derived from recorded task state. It is
+/// intentionally evidence-facing: an item is never marked complete merely
+/// because this task kind selected the corresponding feature by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletionChecklist {
+    pub implementation_complete: bool,
+    pub verification_complete: bool,
+    pub acceptance_criteria_reviewed: bool,
+    pub final_critic_review_complete: bool,
+    pub documentation_generated: bool,
+    pub evidence_export_available: bool,
+    pub git_history_available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +352,12 @@ pub enum AgentStage {
 pub enum TaskEvent {
     TaskCreated {
         kind: TaskKind,
+        /// Frozen at task creation so the audit states whether a newly created
+        /// project is review-only or must be retained after the run.
+        output: Option<OutputTarget>,
+        /// Frozen task-level Git behavior. It describes local milestone
+        /// commits only; no event or mode can initiate a push.
+        git_mode: GitMode,
     },
     TaskStarted,
 
@@ -1054,6 +1120,11 @@ pub struct Task {
     pub acceptance: Vec<crate::acceptance::AcceptanceCriterion>,
     /// The Git behavior chosen for this run, frozen at creation (task 0009).
     pub git_mode: GitMode,
+    /// Present only for Take-home Assignment tasks. It is recomputed from the
+    /// same task state shown elsewhere, so UI, API snapshots and evidence do
+    /// not drift into a hard-coded success summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_checklist: Option<CompletionChecklist>,
     #[serde(skip)]
     cancelled: bool,
 }
@@ -1092,6 +1163,7 @@ impl Task {
             milestones: Vec::new(),
             acceptance: Vec::new(),
             git_mode: GitMode::None,
+            completion_checklist: None,
             cancelled: false,
         }
     }
@@ -1100,6 +1172,21 @@ impl Task {
     /// domain never has to reach for the environment (task 0005).
     pub fn from_request(request: TaskRequest, agents: AgentSelection) -> Result<Self, String> {
         request.validate()?;
+        let output = request.effective_output();
+        let git_mode = request.effective_git_mode();
+        let completion_checklist =
+            request
+                .kind
+                .is_take_home_assignment()
+                .then_some(CompletionChecklist {
+                    implementation_complete: false,
+                    verification_complete: false,
+                    acceptance_criteria_reviewed: false,
+                    final_critic_review_complete: false,
+                    documentation_generated: false,
+                    evidence_export_available: false,
+                    git_history_available: false,
+                });
         Ok(Task {
             id: Uuid::new_v4(),
             title: request.title.trim().to_string(),
@@ -1107,13 +1194,13 @@ impl Task {
             kind: request.kind,
             project_id: request.project_id,
             technology: request.technology,
-            output: request.output,
+            output,
             destination: request
                 .destination
                 .map(|destination| destination.trim().to_string()),
             persistence: None,
             agents,
-            git_mode: request.git_mode.unwrap_or_default(),
+            git_mode,
             profile: None,
             result: None,
             status: TaskStatus::Created,
@@ -1129,7 +1216,64 @@ impl Task {
             decision: None,
             milestones: Vec::new(),
             acceptance: Vec::new(),
+            completion_checklist,
             cancelled: false,
+        })
+    }
+
+    /// The public take-home checklist for this task. Non-take-home tasks have
+    /// no implied delivery checklist and therefore return `None`.
+    pub fn take_home_completion_checklist(&self) -> Option<CompletionChecklist> {
+        self.kind.is_take_home_assignment().then(|| {
+            let implementation_complete = !self.milestones.is_empty()
+                && self
+                    .milestones
+                    .iter()
+                    .all(|milestone| milestone.status == MilestoneStatus::Passed);
+            let verification_complete = implementation_complete
+                && self.history.iter().any(|recorded| {
+                    matches!(recorded.event, TaskEvent::VerificationCompleted { .. })
+                })
+                && !self
+                    .history
+                    .iter()
+                    .any(|recorded| matches!(recorded.event, TaskEvent::VerificationFailed { .. }));
+            let acceptance_criteria_reviewed = !self.acceptance.is_empty()
+                && self.acceptance.iter().all(|criterion| {
+                    !matches!(
+                        criterion.status,
+                        crate::acceptance::CriterionStatus::Pending
+                            | crate::acceptance::CriterionStatus::Implemented
+                    )
+                });
+            let final_critic_review_complete = implementation_complete
+                && self.milestones.iter().all(|milestone| {
+                    milestone
+                        .review
+                        .as_ref()
+                        .is_some_and(|review| review.status.is_pass())
+                });
+            let documentation_generated = self.history.iter().any(|recorded| {
+                matches!(
+                    recorded.event,
+                    TaskEvent::SubmissionDocumentationGenerated { .. }
+                )
+            });
+            let evidence_export_available =
+                self.status == TaskStatus::Completed && self.result.is_some();
+            let git_history_available = self.persistence.as_ref().is_some_and(|persistence| {
+                persistence.status == PersistenceStatus::Persisted
+                    && persistence.git.as_ref().is_some_and(|git| git.commits > 0)
+            });
+            CompletionChecklist {
+                implementation_complete,
+                verification_complete,
+                acceptance_criteria_reviewed,
+                final_critic_review_complete,
+                documentation_generated,
+                evidence_export_available,
+                git_history_available,
+            }
         })
     }
 
@@ -1319,6 +1463,7 @@ impl Task {
             }
             _ => {}
         }
+        self.completion_checklist = self.take_home_completion_checklist();
         if matches!(&event, TaskEvent::Build { chunk } if chunk.contains(crate::execution_limits::TRUNCATED))
         {
             self.worker_output_truncated = true;
@@ -1670,9 +1815,13 @@ impl TaskManager {
 
     fn insert(&self, mut task: Task) -> Task {
         task.history_limits = self.inner.history_limits;
-        let created = TaskEvent::TaskCreated { kind: task.kind }
-            .sanitized(&self.inner.redactor)
-            .bounded(self.inner.history_limits);
+        let created = TaskEvent::TaskCreated {
+            kind: task.kind,
+            output: task.output,
+            git_mode: task.git_mode,
+        }
+        .sanitized(&self.inner.redactor)
+        .bounded(self.inner.history_limits);
         task.record_event(created);
         let mut tasks = self
             .inner
@@ -2666,6 +2815,10 @@ mod tests {
             git_mode: None,
         };
         assert!(valid.validate().is_ok());
+        let ordinary =
+            Task::from_request(valid.clone(), AgentSelection::compiled_defaults()).unwrap();
+        assert_eq!(ordinary.output, Some(OutputTarget::ReviewableResult));
+        assert_eq!(ordinary.git_mode, GitMode::None);
 
         let mut missing_stack = valid.clone();
         missing_stack.technology = None;
@@ -2673,6 +2826,160 @@ mod tests {
         let mut with_project = valid;
         with_project.project_id = Some(Uuid::new_v4());
         assert!(with_project.validate().is_err());
+    }
+
+    #[test]
+    fn take_home_assignment_defaults_to_persistence_and_milestone_commits() {
+        let request = TaskRequest {
+            kind: TaskKind::TakeHomeAssignment,
+            title: "Candidate portal".into(),
+            description: "Build the requested assignment".into(),
+            project_id: None,
+            technology: Some(TechStack::TypeScriptNode),
+            // The browser may omit these defaults; the domain is authoritative.
+            output: None,
+            destination: Some("candidate-portal".into()),
+            agents: None,
+            git_mode: None,
+        };
+
+        let task = Task::from_request(request, AgentSelection::compiled_defaults()).unwrap();
+
+        assert_eq!(task.kind, TaskKind::TakeHomeAssignment);
+        assert_eq!(task.output, Some(OutputTarget::PersistentLocalProject));
+        assert_eq!(task.destination.as_deref(), Some("candidate-portal"));
+        assert_eq!(task.git_mode, GitMode::CommitPerMilestone);
+        assert!(task.completion_checklist.is_some());
+    }
+
+    #[test]
+    fn take_home_assignment_requires_a_safe_persistent_destination() {
+        let base = TaskRequest {
+            kind: TaskKind::TakeHomeAssignment,
+            title: "Candidate portal".into(),
+            description: "Build the requested assignment".into(),
+            project_id: None,
+            technology: Some(TechStack::Python),
+            output: None,
+            destination: None,
+            agents: None,
+            git_mode: None,
+        };
+        assert!(base.validate().unwrap_err().contains("destination"));
+
+        let temporary = TaskRequest {
+            output: Some(OutputTarget::ReviewableResult),
+            ..base
+        };
+        assert!(
+            temporary
+                .validate()
+                .unwrap_err()
+                .contains("persistent output")
+        );
+    }
+
+    #[test]
+    fn take_home_completion_checklist_reflects_real_events() {
+        let task = Task::from_request(
+            TaskRequest {
+                kind: TaskKind::TakeHomeAssignment,
+                title: "Candidate portal".into(),
+                description: "Build the requested assignment".into(),
+                project_id: None,
+                technology: Some(TechStack::Rust),
+                output: None,
+                destination: Some("candidate-portal".into()),
+                agents: None,
+                git_mode: None,
+            },
+            AgentSelection::compiled_defaults(),
+        )
+        .unwrap();
+        let manager = TaskManager::new();
+        let task = manager.insert(task);
+        let emitter = manager.emitter(task.id);
+        let milestone = Milestone {
+            id: "m1".into(),
+            order: 1,
+            title: "Build portal".into(),
+            objective: "Build portal".into(),
+            verification_instructions: vec!["cargo test".into()],
+            status: MilestoneStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            worker_result_summary: None,
+            commit: None,
+            review: None,
+            criteria: vec!["AC-001".into()],
+        };
+        emitter.emit(TaskEvent::MilestonePlanCreated {
+            milestones: vec![milestone],
+        });
+        emitter.emit(TaskEvent::MilestoneCompleted {
+            id: "m1".into(),
+            order: 1,
+            title: "Build portal".into(),
+            verification: vec![],
+            worker_result_summary: "implemented".into(),
+        });
+        emitter.emit(TaskEvent::VerificationCompleted { commands: 1 });
+        emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
+            criteria: vec![crate::acceptance::AcceptanceCriterion {
+                id: "AC-001".into(),
+                description: "Portal works".into(),
+                status: crate::acceptance::CriterionStatus::Passed,
+                milestones: vec!["m1".into()],
+                evidence: vec![],
+                blocking_findings: vec![],
+            }],
+        });
+        emitter.emit(TaskEvent::ImplementationReviewCompleted {
+            milestone_id: "m1".into(),
+            order: 1,
+            iteration: 0,
+            of: 1,
+            status: crate::review::ReviewStatus::Pass,
+            findings: vec![],
+        });
+        emitter.emit(TaskEvent::SubmissionDocumentationGenerated {
+            written: vec!["README.md".into()],
+            preserved: vec![],
+        });
+        emitter.emit(TaskEvent::Result {
+            result: TaskResult {
+                source_revision: None,
+                verification: vec![],
+                diff: "diff".into(),
+            },
+        });
+        emitter.emit(TaskEvent::ProjectPersisted {
+            destination: "candidate-portal".into(),
+            git: Some(crate::git::RepositoryStatus {
+                branch: Some("main".into()),
+                head_sha: Some("abc".into()),
+                commits: 1,
+                has_remote: false,
+            }),
+            git_warning: None,
+        });
+        emitter.emit(TaskEvent::Finished {
+            status: TaskStatus::Completed,
+            error: None,
+        });
+
+        let checklist = manager
+            .get(task.id)
+            .unwrap()
+            .completion_checklist
+            .expect("take-home checklist");
+        assert!(checklist.implementation_complete);
+        assert!(checklist.verification_complete);
+        assert!(checklist.acceptance_criteria_reviewed);
+        assert!(checklist.final_critic_review_complete);
+        assert!(checklist.documentation_generated);
+        assert!(checklist.evidence_export_available);
+        assert!(checklist.git_history_available);
     }
 
     #[test]

@@ -384,9 +384,22 @@ pub(crate) fn development_log(task: &Task) -> String {
 fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
     let event = &recorded.event;
     let (title, details) = match event {
-        TaskEvent::TaskCreated { kind } => (
+        TaskEvent::TaskCreated {
+            kind,
+            output,
+            git_mode,
+        } => (
             "Task created".into(),
-            vec![format!("Task type: {}", kind.label())],
+            vec![
+                format!("Task type: {}", kind.label()),
+                format!(
+                    "Output mode: {}",
+                    output
+                        .map(|output| output.label())
+                        .unwrap_or("not applicable")
+                ),
+                format!("Git mode: {}", git_mode.label()),
+            ],
         ),
         TaskEvent::TaskStarted => ("Task started".into(), vec![]),
         TaskEvent::Status { status } => (
@@ -1112,6 +1125,15 @@ fn final_report(task: &Task) -> String {
             .unwrap_or("Not applicable"),
         persistent_result(task),
     );
+    if task.kind.is_take_home_assignment() {
+        markdown.push_str(&format!(
+            "## Take-home Assignment configuration\n\nPersistent output: required (`{}`).\n\nGit mode: {}.\n\n",
+            task.output
+                .map(|output| output.label())
+                .unwrap_or("missing"),
+            task.git_mode.label(),
+        ));
+    }
     if !task.milestones.is_empty() {
         markdown.push_str("## Milestones\n\n");
         for milestone in &task.milestones {
@@ -1566,6 +1588,61 @@ mod tests {
         emitter.emit(TaskEvent::VerificationCompleted { commands: 1 });
         emitter.emit(TaskEvent::TaskCompleted);
         (manager, task.id)
+    }
+
+    #[test]
+    fn final_report_identifies_take_home_assignment_configuration() {
+        let manager = TaskManager::new();
+        let task = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::TakeHomeAssignment,
+                    title: "Candidate portal".into(),
+                    description: "Build the requested assignment".into(),
+                    project_id: None,
+                    technology: Some(TechStack::Python),
+                    output: None,
+                    destination: Some("candidate-portal".into()),
+                    agents: None,
+                    git_mode: None,
+                },
+                selection(),
+            )
+            .unwrap();
+
+        let package = export(&manager.evidence_snapshot(task.id).unwrap()).unwrap();
+        let report = file(&package, FINAL_REPORT_FILENAME);
+
+        assert!(
+            report.contains("Task type: take-home assignment"),
+            "{report}"
+        );
+        assert!(
+            report.contains("## Take-home Assignment configuration"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Persistent output: required (`Persistent local project`)."),
+            "{report}"
+        );
+        assert!(
+            report.contains("Git mode: Commit after each successful milestone."),
+            "{report}"
+        );
+        let audit = file(&package, JSONL_FILENAME);
+        assert!(audit.contains("\"type\":\"task_created\""), "{audit}");
+        assert!(
+            audit.contains("\"kind\":\"take_home_assignment\""),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"output\":\"persistent_local_project\""),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"git_mode\":\"commit_per_milestone\""),
+            "{audit}"
+        );
     }
 
     fn file<'a>(package: &'a EvidencePackage, name: &str) -> &'a str {

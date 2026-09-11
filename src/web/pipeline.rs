@@ -205,11 +205,11 @@ async fn run(
     };
 
     let (profile, repository_context) = match task.kind {
-        TaskKind::NewProject => {
+        TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
             let technology = task
                 .technology
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("new project has no selected technology"))?;
+                .ok_or_else(|| anyhow::anyhow!("new project task has no selected technology"))?;
             (
                 ProjectProfile::selected(technology),
                 "New empty project".into(),
@@ -247,7 +247,7 @@ async fn run(
         }
     };
 
-    if task.kind == TaskKind::NewProject {
+    if task.kind.creates_new_project() {
         emitter.emit(TaskEvent::Inspection {
             profile: profile.clone(),
             source_revision: None,
@@ -447,7 +447,7 @@ async fn run(
             move || verification_plan_after_implementation(kind, &profile, &root)
         })
         .await??;
-        if task.kind == TaskKind::NewProject && verification_profile != profile {
+        if task.kind.creates_new_project() && verification_profile != profile {
             emitter.emit(TaskEvent::Inspection {
                 profile: verification_profile.clone(),
                 source_revision: None,
@@ -1074,7 +1074,7 @@ fn verification_plan_after_implementation(
     selected_profile: &ProjectProfile,
     root: &std::path::Path,
 ) -> Result<(ProjectProfile, Vec<VerificationCommand>)> {
-    let profile = if kind == TaskKind::NewProject {
+    let profile = if kind.creates_new_project() {
         let detected = crate::technology::detect(root)?;
         if detected.build_tool == crate::technology::BuildTool::Custom {
             selected_profile.clone()

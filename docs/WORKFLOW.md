@@ -12,7 +12,7 @@ Register/connect project source
 Create task
   ↓
 Task type
-  New Project / Feature / Bug Fix
+  New Project / Take-home Assignment / Feature / Bug Fix
   ↓
 Prepare isolated task workspace
   ↓
@@ -115,6 +115,23 @@ Rules:
 - The implementation may initialize a new application structure inside the isolated workspace.
 - Build and verification commands must depend on the selected stack.
 - Do not create unrelated infrastructure unless required by the specification.
+
+---
+
+# 1a. Take-home Assignment
+
+Use this workflow for an evaluation project that must be delivered as a
+reviewable persistent repository. It reuses the New Project execution flow;
+there is no separate orchestration engine.
+
+- Use the assignment title and description as the proposal/specification input.
+- Keep task-level agent selection, human specification approval, acceptance
+  tracking, audit/evidence capture, milestone verification, critic/fix review,
+  and submission documentation enabled.
+- Require a safe destination under the configured persistent-output root.
+- Default to a commit after each successfully verified milestone; never push.
+- Present the actual selected agents, output mode, Git mode, and an
+  evidence-derived completion checklist to the user.
 
 ---
 

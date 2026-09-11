@@ -103,6 +103,9 @@ fn kind_instruction(kind: TaskKind) -> &'static str {
         TaskKind::NewProject => {
             "Design a new application from the stated requirements and selected stack. Do not assume Rust or add unrelated infrastructure."
         }
+        TaskKind::TakeHomeAssignment => {
+            "Design a complete take-home assignment from the stated requirements and selected stack. Make the implementation demonstrable, testable, and ready for the required persistent handoff; do not assume Rust or add unrelated infrastructure."
+        }
         TaskKind::Feature => {
             "Inspect the existing architecture and task-relevant code. Propose the smallest compatible feature change and regression coverage; do not recreate the application."
         }
@@ -186,12 +189,16 @@ mod tests {
     fn task_kinds_receive_meaningfully_different_instructions() {
         let profile = ProjectProfile::selected(TechStack::Rust);
         let new = design_context(TaskKind::NewProject, &profile, "none");
+        let take_home = design_context(TaskKind::TakeHomeAssignment, &profile, "none");
         let feature = design_context(TaskKind::Feature, &profile, "src/");
         let bug = design_context(TaskKind::BugFix, &profile, "tests/");
         assert!(new.contains("new application"));
+        assert!(take_home.contains("take-home assignment"));
+        assert!(take_home.contains("persistent handoff"));
         assert!(feature.contains("existing architecture"));
         assert!(bug.contains("root cause"));
         assert_ne!(new, feature);
+        assert_ne!(new, take_home);
         assert_ne!(feature, bug);
     }
 

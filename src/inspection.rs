@@ -115,7 +115,7 @@ pub fn requires_repository_inspection(kind: TaskKind) -> bool {
 
 pub fn inspect(root: &Path, request: InspectionRequest<'_>) -> Result<RepositoryInspection> {
     if !requires_repository_inspection(request.kind) {
-        bail!("new-project tasks do not inspect an existing repository");
+        bail!("new-project and take-home tasks do not inspect an existing repository");
     }
 
     let profile = detect(root)?;
@@ -507,6 +507,9 @@ mod tests {
     #[test]
     fn new_projects_do_not_require_repository_inspection() {
         assert!(!requires_repository_inspection(TaskKind::NewProject));
+        assert!(!requires_repository_inspection(
+            TaskKind::TakeHomeAssignment
+        ));
         assert!(requires_repository_inspection(TaskKind::Feature));
         assert!(requires_repository_inspection(TaskKind::BugFix));
     }

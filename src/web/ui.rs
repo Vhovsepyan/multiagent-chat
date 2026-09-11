@@ -19,8 +19,8 @@ use crate::agent::{
 use crate::milestone::MilestoneStatus;
 use crate::project::{Project, ProjectSource};
 use crate::task::{
-    Decision, OutputTarget, PersistenceStatus, ProjectPersistence, RecordedEvent, Task, TaskEvent,
-    TaskId, TaskKind, TaskRequest, TaskStatus,
+    CompletionChecklist, Decision, OutputTarget, PersistenceStatus, ProjectPersistence,
+    RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRequest, TaskStatus,
 };
 use crate::technology::TechStack;
 use crate::web::{AppState, pipeline};
@@ -207,6 +207,55 @@ fn acceptance_html(task: &Task) -> String {
     )
 }
 
+/// The delivery checklist is shown only for Take-home Assignment tasks. Its
+/// values are derived from recorded task state rather than task-kind defaults.
+fn completion_html(task: &Task) -> String {
+    let Some(checklist) = task.completion_checklist.as_ref() else {
+        return String::new();
+    };
+    format!(
+        r#"<div class="card"><h2 class="section">Take-home completion</h2><div id="completion-checklist" hx-swap="innerHTML">{}</div></div>"#,
+        completion_list_html(Some(checklist))
+    )
+}
+
+fn completion_list_html(checklist: Option<&CompletionChecklist>) -> String {
+    let Some(checklist) = checklist else {
+        return String::new();
+    };
+    let items = [
+        ("Implementation complete", checklist.implementation_complete),
+        ("Verification complete", checklist.verification_complete),
+        (
+            "Acceptance criteria reviewed",
+            checklist.acceptance_criteria_reviewed,
+        ),
+        (
+            "Final critic review complete",
+            checklist.final_critic_review_complete,
+        ),
+        ("Documentation generated", checklist.documentation_generated),
+        (
+            "Evidence export available",
+            checklist.evidence_export_available,
+        ),
+        ("Git history available", checklist.git_history_available),
+    ];
+    items
+        .into_iter()
+        .map(|(label, complete)| {
+            let (class, state) = if complete {
+                ("ok", "complete")
+            } else {
+                ("pending", "not complete")
+            };
+            format!(
+                r#"<div class="agent"><span class="milestone-status {class}">{state}</span><span class="who">{label}</span></div>"#
+            )
+        })
+        .collect()
+}
+
 /// Rendered from current task state, never from one event in isolation.
 fn acceptance_list_html(criteria: &[crate::acceptance::AcceptanceCriterion]) -> String {
     use crate::acceptance::CriterionStatus;
@@ -344,7 +393,7 @@ fn event_html(
     agents: &AgentSelection,
 ) -> Option<(&'static str, String)> {
     let result = match &recorded.event {
-        TaskEvent::TaskCreated { kind } => Some((
+        TaskEvent::TaskCreated { kind, .. } => Some((
             "debate",
             format!(
                 r#"<div class="notice">Task created · {}</div>"#,
@@ -889,6 +938,7 @@ struct RenderState<'a> {
     acceptance: &'a [crate::acceptance::AcceptanceCriterion],
     output: Option<OutputTarget>,
     persistence: Option<&'a ProjectPersistence>,
+    completion_checklist: Option<&'a CompletionChecklist>,
 }
 
 impl<'a> RenderState<'a> {
@@ -900,6 +950,7 @@ impl<'a> RenderState<'a> {
             acceptance: &task.acceptance,
             output: task.output,
             persistence: task.persistence.as_ref(),
+            completion_checklist: task.completion_checklist.as_ref(),
         }
     }
 }
@@ -928,6 +979,10 @@ fn event_updates(
             ("milestones", milestone_list_html(state.milestones)),
             ("acceptance", acceptance_list_html(state.acceptance)),
             ("output-summary", output()),
+            (
+                "completion-checklist",
+                completion_list_html(state.completion_checklist),
+            ),
         ];
     }
     if matches!(
@@ -1211,7 +1266,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
     let agents = agents_html(&task.agents, task.git_mode);
-    let acceptance = acceptance_html(&task);
+    let acceptance = format!("{}{}", acceptance_html(&task), completion_html(&task));
     let output = if task.output.is_some() {
         output_html(&task)
     } else {
@@ -1284,6 +1339,7 @@ pub async fn stream(
                         acceptance: &[],
                         output: None,
                         persistence: None,
+                        completion_checklist: None,
                     },
                 };
                 event_updates(id, &event, &render)
