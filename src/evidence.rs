@@ -786,7 +786,9 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 details,
             )
         }
-        TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
+        TaskEvent::SubmissionDocumentationGenerated {
+            written, preserved, ..
+        } => {
             let mut details = vec![format!("Documents written: {}", written.len())];
             for file in written {
                 details.push(format!("Written: `{}`", markdown_inline(file)));
@@ -1273,9 +1275,9 @@ fn final_report(task: &Task) -> String {
         .iter()
         .rev()
         .find_map(|recorded| match &recorded.event {
-            TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
-                Some((written.clone(), preserved.clone()))
-            }
+            TaskEvent::SubmissionDocumentationGenerated {
+                written, preserved, ..
+            } => Some((written.clone(), preserved.clone())),
             _ => None,
         });
     match documentation {

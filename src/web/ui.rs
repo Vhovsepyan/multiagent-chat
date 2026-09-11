@@ -132,7 +132,7 @@ fn action_controls_html(
         && publication.is_none()
     {
         format!(
-            r#"<a class="button-link" href="/api/tasks/{0}/publish">Review GitHub preflight</a><form hx-post="/ui/tasks/{0}/publish" hx-confirm="Publish the completed project to GitHub?" hx-swap="none"><button type="submit">Publish to GitHub</button><div class="hint">Review the remote, branch, HEAD, working tree, and verification summary before this explicit action.</div></form>"#,
+            r##"<form hx-post="/ui/tasks/{0}/publish/prepare" hx-target="#task-actions" hx-swap="innerHTML"><button type="submit">Prepare GitHub publication</button><div class="hint">Finalizes unchanged generated documentation, then shows the exact snapshot for confirmation.</div></form>"##,
             id
         )
     } else if let Some(publication) = publication {
@@ -148,6 +148,26 @@ fn action_controls_html(
     format!(
         r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{}/evidence" download>Export Evidence</a>{publish}<div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#,
         id
+    )
+}
+
+fn publish_confirmation_html(
+    id: TaskId,
+    preview: &crate::github_publish::PublishPreview,
+) -> String {
+    let verification = preview
+        .verification_summary
+        .iter()
+        .map(|line| format!("<li>{}</li>", esc(line)))
+        .collect::<String>();
+    format!(
+        r##"<div class="card task-actions"><h2 class="section">Confirm GitHub publication</h2><div class="agent"><span class="role">Repository</span><span class="who"><code>{repository}</code></span></div><div class="agent"><span class="role">Remote</span><span class="who"><code>{remote}</code></span></div><div class="agent"><span class="role">Branch</span><span class="who"><code>{branch}</code></span></div><div class="agent"><span class="role">HEAD</span><span class="who"><code>{head}</code></span></div><div class="agent"><span class="role">Working tree</span><span class="who">{working_tree}</span></div><div class="hint">Verification</div><ul class="hint">{verification}</ul><form hx-post="/ui/tasks/{id}/publish" hx-target="#task-actions" hx-swap="innerHTML"><input type="hidden" name="confirm" value="true"><input type="hidden" name="expected_fingerprint" value="{fingerprint}"><button type="submit">Publish to GitHub</button></form><button type="button" onclick="location.reload()">Cancel</button></div>"##,
+        repository = esc(&preview.repository),
+        remote = esc(&preview.remote_url),
+        branch = esc(&preview.branch),
+        head = esc(&preview.head_sha),
+        working_tree = esc(&preview.working_tree),
+        fingerprint = esc(&preview.fingerprint),
     )
 }
 
@@ -853,7 +873,9 @@ fn event_html(
                 esc(status.label())
             ),
         )),
-        TaskEvent::SubmissionDocumentationGenerated { written, preserved } => Some((
+        TaskEvent::SubmissionDocumentationGenerated {
+            written, preserved, ..
+        } => Some((
             "build",
             format!(
                 r#"<div class="notice ok">Documentation generated · {}</div>{}"#,
@@ -1466,18 +1488,62 @@ pub async fn approve(
     Html(body).into_response()
 }
 
-/// The browser's publish button is itself the explicit confirmation. A second
-/// read-only preflight is performed immediately before the push.
-pub async fn publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> Response {
+pub async fn prepare_publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> Response {
+    let Some(task) = state.manager.get(id) else {
+        return (StatusCode::NOT_FOUND, Html::<String>("No such task".into())).into_response();
+    };
+    let limits = state.config.execution.clone();
+    let preview = match tokio::task::spawn_blocking({
+        move || crate::github_publish::prepare(&task, &limits)
+    })
+    .await
+    {
+        Ok(Ok(preview)) => preview,
+        Ok(Err(error)) => {
+            return (StatusCode::CONFLICT, Html(esc(&error.to_string()))).into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(esc(&error.to_string())),
+            )
+                .into_response();
+        }
+    };
+    Html(publish_confirmation_html(id, &preview)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PublishForm {
+    pub confirm: String,
+    pub expected_fingerprint: String,
+}
+
+/// The confirmation carries the fingerprint of the exact clean snapshot shown
+/// above. Both the handler and publisher revalidate it before any push.
+pub async fn publish(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Form(form): Form<PublishForm>,
+) -> Response {
+    if form.confirm != "true" || form.expected_fingerprint.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html::<String>("Publishing requires confirmation of a prepared snapshot".into()),
+        )
+            .into_response();
+    }
     let Some(task) = state.manager.get(id) else {
         return (StatusCode::NOT_FOUND, Html::<String>("No such task".into())).into_response();
     };
     let limits = state.config.execution.clone();
     let emitter = state.manager.emitter(id);
+    let expected_fingerprint = form.expected_fingerprint;
     let preview = match tokio::task::spawn_blocking({
         let task = task.clone();
         let limits = limits.clone();
-        move || crate::github_publish::preview(&task, &limits)
+        let expected_fingerprint = expected_fingerprint.clone();
+        move || crate::github_publish::validate_confirmation(&task, &expected_fingerprint, &limits)
     })
     .await
     {
@@ -1500,7 +1566,10 @@ pub async fn publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> R
         branch: preview.branch,
         commit_sha: preview.head_sha,
     });
-    match tokio::task::spawn_blocking(move || crate::github_publish::publish(&task, &limits)).await
+    match tokio::task::spawn_blocking(move || {
+        crate::github_publish::publish(&task, &expected_fingerprint, &limits)
+    })
+    .await
     {
         Ok(Ok(publication)) => {
             emitter.emit(TaskEvent::GitHubPublishCompleted { publication });
@@ -1524,5 +1593,39 @@ pub async fn publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> R
             Html(esc(&error.to_string())),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod publish_ui_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_renders_the_exact_snapshot_and_carries_its_fingerprint() {
+        let id = uuid::Uuid::new_v4();
+        let preview = crate::github_publish::PublishPreview {
+            repository: "acme/payment-service".into(),
+            remote_url: "https://github.com/acme/payment-service.git".into(),
+            branch: "main".into(),
+            head_sha: "0123456789abcdef".into(),
+            dirty_files: Vec::new(),
+            working_tree: "clean".into(),
+            verification_summary: vec!["cargo test: passed".into()],
+            fingerprint: "fingerprint-123".into(),
+        };
+
+        let html = publish_confirmation_html(id, &preview);
+
+        for expected in [
+            "acme/payment-service",
+            "https://github.com/acme/payment-service.git",
+            "main",
+            "0123456789abcdef",
+            "clean",
+            "cargo test: passed",
+            "name=\"expected_fingerprint\" value=\"fingerprint-123\"",
+        ] {
+            assert!(html.contains(expected), "missing {expected:?}: {html}");
+        }
     }
 }

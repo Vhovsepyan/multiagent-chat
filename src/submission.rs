@@ -17,9 +17,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::acceptance::CriterionStatus;
-use crate::task::{Task, TaskEvent, TaskStatus};
+use crate::task::{GeneratedArtifact, Task, TaskEvent, TaskStatus};
 use crate::technology::{BuildTool, ProjectProfile, TechStack};
 use crate::verification::VerificationResult;
 
@@ -44,6 +45,9 @@ pub struct Submission {
     pub written: Vec<String>,
     /// Existing documents left exactly as they were.
     pub preserved: Vec<String>,
+    /// Exact identities of the files this run wrote, including fallback
+    /// `*.generated.md` destinations selected to preserve hand-written docs.
+    pub artifacts: Vec<GeneratedArtifact>,
 }
 
 /// Everything the documents are rendered from.
@@ -132,7 +136,7 @@ where
             .with_context(|| format!("could not stage generated documentation {document}"))?;
         staged.push(path);
     }
-    finalize_documents(project, &planned, &staged)
+    finalize_documents(project, &planned, &staged, documents)
 }
 
 fn plan_documents(
@@ -174,6 +178,7 @@ fn finalize_documents(
     project: &Path,
     planned: &[PlannedDocument],
     staged: &[PathBuf],
+    documents: &[(&'static str, String)],
 ) -> Result<Submission> {
     let mut finalized: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(planned.len());
     for (index, (plan, staged)) in planned.iter().zip(staged).enumerate() {
@@ -223,7 +228,19 @@ fn finalize_documents(
             .iter()
             .filter_map(|plan| plan.preserved.clone())
             .collect(),
+        artifacts: planned
+            .iter()
+            .zip(documents)
+            .map(|(plan, (_, contents))| GeneratedArtifact {
+                path: relative(project, &plan.destination),
+                content_sha256: sha256(contents.as_bytes()),
+            })
+            .collect(),
     })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn rollback_documents(finalized: &[(PathBuf, Option<PathBuf>)]) {
@@ -850,6 +867,7 @@ pub fn generated_event(submission: &Submission) -> TaskEvent {
     TaskEvent::SubmissionDocumentationGenerated {
         written: submission.written.clone(),
         preserved: submission.preserved.clone(),
+        artifacts: submission.artifacts.clone(),
     }
 }
 
@@ -1159,6 +1177,16 @@ mod tests {
             submission
                 .written
                 .contains(&"docs/ARCHITECTURE.generated.md".to_string())
+        );
+        let generated = submission
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "docs/ARCHITECTURE.generated.md")
+            .expect("the actual generated variant is identified");
+        assert_eq!(generated.content_sha256.len(), 64);
+        assert_eq!(
+            generated.content_sha256,
+            sha256(&fs::read(root.join(&generated.path)).unwrap())
         );
         assert!(read(&root, "README.generated.md").contains("# Event service"));
 

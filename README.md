@@ -60,6 +60,7 @@ In the web UI:
 5. Approve implementation.
 6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
 7. Select **Export Evidence** at any point to download the run's redacted evidence package.
+8. For a completed persistent project, select **Prepare GitHub publication**, review the exact repository/branch/HEAD/working-tree/verification snapshot, then explicitly confirm **Publish to GitHub**.
 
 Feature and Bug Fix tasks require a registered Project. New Project and Take-home Assignment tasks instead require a selected technology and an output mode.
 
@@ -70,7 +71,7 @@ A New Project chooses between two outputs; the default is unchanged from before 
 - **Temporary review result** — the project is built in the isolated task workspace and reviewed from the task result. The workspace is then removed.
 - **Persistent local project** — after implementation and verification succeed, the finished project is copied into `PERSISTENT_OUTPUT_ROOT/<destination>` and survives workspace cleanup.
 
-The destination is a plain folder name (letters, digits, dot, dash, underscore), never a path: the server joins it to the configured output root, so separators, `..` and absolute paths are rejected. An existing non-empty destination is never overwritten, and links are refused rather than followed. The project is staged and then moved into place, so a failed persistence leaves the destination exactly as it was, fails the task, and is recorded as `project_persistence_failed`. When milestone commits are enabled, the repository is copied verbatim, so commit history and SHAs are preserved; no remote is ever configured or pushed. Once the project has been moved into place it counts as persisted: if its repository metadata cannot then be read, the run stays successful and reports the metadata as unavailable with a warning, rather than claiming the destination was left unchanged.
+The destination is a plain folder name (letters, digits, dot, dash, underscore), never a path: the server joins it to the configured output root, so separators, `..` and absolute paths are rejected. An existing non-empty destination is never overwritten, and links are refused rather than followed. The project is staged and then moved into place, so a failed persistence leaves the destination exactly as it was, fails the task, and is recorded as `project_persistence_failed`. When milestone commits are enabled, the repository is copied verbatim, so commit history and SHAs are preserved. No remote is configured or pushed during task execution. Once the project has been moved into place it counts as persisted: if its repository metadata cannot then be read, the run stays successful and reports the metadata as unavailable with a warning, rather than claiming the destination was left unchanged.
 
 This option does not apply to Feature and Bug Fix tasks, which inherit the registered project's output.
 
@@ -81,7 +82,8 @@ selection, specification approval, milestone verification, post-implementation
 critic/fix review, acceptance tracking, evidence export, and submission
 documentation all remain active. It defaults to **Persistent local project**
 output and **Commit after each successful milestone**. A valid safe destination
-folder name is required; temporary-only output is refused. Nothing is pushed.
+folder name is required; temporary-only output is refused. Nothing is pushed
+automatically; publication is a separate, explicitly confirmed action.
 
 Its task page includes a completion checklist derived from recorded task state:
 implementation, verification, acceptance review, final critic review,
@@ -578,6 +580,9 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
 - `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
 - `GET /api/tasks/{id}/evidence` — download the redacted five-file evidence ZIP.
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
+- `POST /api/tasks/{id}/publish/prepare` — finalize unchanged generated documentation and return the exact clean publication snapshot and fingerprint.
+- `GET /api/tasks/{id}/publish` — read an already prepared clean publication snapshot.
+- `POST /api/tasks/{id}/publish` — explicitly publish the exact confirmed fingerprint to the existing GitHub `origin`.
 
 Example Project registration:
 
@@ -689,7 +694,7 @@ Project/task stores remain in memory in this phase. The boundaries are designed 
 - A persistent New Project can be explicitly published to an existing GitHub remote after completion, using the local Git credential helper/SSH agent. OAuth/App authentication, automatic repository creation, and unattended pushes are not implemented.
 - Persistent output requires a configured `PERSISTENT_OUTPUT_ROOT` (or `WORKSPACE_ROOT`); it cannot write anywhere else, and the generated project must contain no symlinks or junctions.
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.
-- Pull requests, pushes, user authentication, and Google Cloud deployment are not implemented.
+- Pull requests, user authentication, and Google Cloud deployment are not implemented. GitHub pushes are limited to the explicit, fingerprint-confirmed persistent-project action described above.
 - The legacy CLI still uses `WORKSPACE_ROOT` and its original local-folder behavior.
 - There is no user-facing task-cancellation endpoint yet. Cancellation event
   types exist for supported execution paths, while current worker/process

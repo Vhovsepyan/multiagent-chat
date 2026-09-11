@@ -273,6 +273,14 @@ pub struct GitHubPublication {
     pub published_at: DateTime<Utc>,
 }
 
+/// Identity of one file task 0013 actually generated. The path is
+/// project-relative and the digest is SHA-256 over the exact written bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedArtifact {
+    pub path: String,
+    pub content_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub source_revision: Option<String>,
@@ -576,6 +584,8 @@ pub enum TaskEvent {
     SubmissionDocumentationGenerated {
         written: Vec<String>,
         preserved: Vec<String>,
+        #[serde(default)]
+        artifacts: Vec<GeneratedArtifact>,
     },
 
     /// Persistent New Project output (task 0010). `destination` is always the
@@ -909,9 +919,16 @@ impl TaskEvent {
                 clean(model);
                 clean(error);
             }
-            Self::SubmissionDocumentationGenerated { written, preserved } => {
+            Self::SubmissionDocumentationGenerated {
+                written,
+                preserved,
+                artifacts,
+            } => {
                 for file in written.iter_mut().chain(preserved.iter_mut()) {
                     clean(file);
+                }
+                for artifact in artifacts {
+                    clean(&mut artifact.path);
                 }
             }
             Self::ProjectPersistenceStarted { destination } => clean(destination),
@@ -2982,6 +2999,7 @@ mod tests {
         emitter.emit(TaskEvent::SubmissionDocumentationGenerated {
             written: vec!["README.md".into()],
             preserved: vec![],
+            artifacts: vec![],
         });
         emitter.emit(TaskEvent::Result {
             result: TaskResult {

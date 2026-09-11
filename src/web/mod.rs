@@ -107,6 +107,10 @@ pub fn router(state: AppState) -> Router {
             "/api/tasks/{id}/publish",
             get(handlers::github_publish_preview).post(handlers::github_publish),
         )
+        .route(
+            "/api/tasks/{id}/publish/prepare",
+            post(handlers::github_publish_prepare),
+        )
         .route("/api/tasks/{id}/events", get(handlers::task_events))
         .route("/api/tasks/{id}/evidence", get(handlers::export_evidence))
         // --- the browser UI (DP-14: HTMX swaps HTML, so these render HTML) ---
@@ -117,6 +121,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/tasks/{id}/stream", get(ui::stream))
         .route("/ui/tasks/{id}/approve", post(ui::approve))
         .route("/ui/tasks/{id}/publish", post(ui::publish))
+        .route("/ui/tasks/{id}/publish/prepare", post(ui::prepare_publish))
         // DP-13: assets come off disk, so editing style.css needs only a
         // browser refresh. The path is relative to the working directory.
         .nest_service("/static", ServeDir::new(static_dir()))

@@ -385,6 +385,7 @@ pub async fn approve_task(
 #[derive(Debug, Deserialize)]
 pub struct GithubPublishRequest {
     pub confirm: bool,
+    pub expected_fingerprint: String,
 }
 
 /// `GET /api/tasks/{id}/publish` — read-only publication preflight.
@@ -401,6 +402,29 @@ pub async fn github_publish_preview(
         tokio::task::spawn_blocking(move || crate::github_publish::preview(&task, &limits))
             .await
             .map_err(|error| ApiError::internal(format!("publish preflight task failed: {error}")))?
+            .map_err(|error| {
+                ApiError::conflict(format!("publishing is not available: {error:#}"))
+            })?;
+    Ok(Json(preview))
+}
+
+/// `POST /api/tasks/{id}/publish/prepare` — finalize unchanged generated
+/// artifacts and return the exact clean snapshot that must be confirmed.
+pub async fn github_publish_prepare(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> ApiResult<Json<crate::github_publish::PublishPreview>> {
+    let task = state
+        .manager
+        .get(id)
+        .ok_or_else(|| ApiError::not_found(format!("no task {id}")))?;
+    let limits = state.config.execution.clone();
+    let preview =
+        tokio::task::spawn_blocking(move || crate::github_publish::prepare(&task, &limits))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("publish preparation task failed: {error}"))
+            })?
             .map_err(|error| {
                 ApiError::conflict(format!("publishing is not available: {error:#}"))
             })?;
@@ -427,7 +451,8 @@ pub async fn github_publish(
     let preview = tokio::task::spawn_blocking({
         let task = task.clone();
         let limits = limits.clone();
-        move || crate::github_publish::preview(&task, &limits)
+        let fingerprint = request.expected_fingerprint.clone();
+        move || crate::github_publish::validate_confirmation(&task, &fingerprint, &limits)
     })
     .await
     .map_err(|error| ApiError::internal(format!("publish preflight task failed: {error}")))?
@@ -439,10 +464,12 @@ pub async fn github_publish(
         branch: preview.branch,
         commit_sha: preview.head_sha,
     });
-    let result =
-        tokio::task::spawn_blocking(move || crate::github_publish::publish(&task, &limits))
-            .await
-            .map_err(|error| ApiError::internal(format!("publish task failed: {error}")))?;
+    let expected_fingerprint = request.expected_fingerprint;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::github_publish::publish(&task, &expected_fingerprint, &limits)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("publish task failed: {error}")))?;
     match result {
         Ok(publication) => {
             emitter.emit(crate::task::TaskEvent::GitHubPublishCompleted { publication });

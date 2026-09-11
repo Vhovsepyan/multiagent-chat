@@ -3590,9 +3590,9 @@ mod review_loop_tests {
                 .history
                 .iter()
                 .find_map(|recorded| match &recorded.event {
-                    TaskEvent::SubmissionDocumentationGenerated { written, preserved } => {
-                        Some((written.clone(), preserved.clone()))
-                    }
+                    TaskEvent::SubmissionDocumentationGenerated {
+                        written, preserved, ..
+                    } => Some((written.clone(), preserved.clone())),
                     _ => None,
                 })
                 .expect("the generation is audited");

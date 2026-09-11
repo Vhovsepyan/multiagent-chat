@@ -29,6 +29,8 @@ tower = { version = "0.5", features = ["util"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 # deterministic, user-triggered evidence downloads (stored entries only)
 zip = { version = "4", default-features = false }
+# stable identities for generated submission artifacts and publish snapshots
+sha2 = "0.10"
 
 [dev-dependencies]
 http-body-util = "0.1.5"

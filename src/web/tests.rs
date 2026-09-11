@@ -88,6 +88,33 @@ async fn health_reports_ok() {
 }
 
 #[tokio::test]
+async fn github_publish_requires_explicit_confirmed_snapshot() {
+    let (state, root) = test_state("publish-confirmation");
+    let task = state.manager.create("publish", "description", "legacy");
+    let app = router(state);
+
+    let missing_snapshot = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/tasks/{}/publish", task.id),
+            json!({"confirm": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_snapshot.status(), StatusCode::BAD_REQUEST);
+
+    let not_confirmed = app
+        .oneshot(post(
+            &format!("/api/tasks/{}/publish", task.id),
+            json!({"confirm": false, "expected_fingerprint": "fingerprint"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(not_confirmed.status(), StatusCode::BAD_REQUEST);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn browser_origin_policy_rejects_foreign_requests_and_allows_local_ui() {
     let (state, root) = test_state("origin-policy");
     let app = router(state.clone());
