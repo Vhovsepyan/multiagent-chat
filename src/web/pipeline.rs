@@ -669,13 +669,17 @@ async fn persist_project(
         destination: destination.display(),
     });
     let source = workspace.path.clone();
+    let source_repository = workspace.source_repository.clone();
     let target = destination.clone();
     let limits = state.config.execution.clone();
-    let persisted =
-        match tokio::task::spawn_blocking(move || target.persist(&source, &limits)).await {
-            Ok(persisted) => persisted,
-            Err(error) => Err(anyhow::anyhow!("project persistence task failed: {error}")),
-        };
+    let persisted = match tokio::task::spawn_blocking(move || {
+        target.persist_with_source_repository(&source, source_repository.as_deref(), &limits)
+    })
+    .await
+    {
+        Ok(persisted) => persisted,
+        Err(error) => Err(anyhow::anyhow!("project persistence task failed: {error}")),
+    };
     match persisted {
         Ok(project) => {
             // The project is at its destination; only its metadata is missing.
@@ -686,6 +690,7 @@ async fn persist_project(
                 destination: project.destination,
                 git: project.git,
                 git_warning: project.git_warning,
+                source_repository: project.source_repository,
             });
             Ok(())
         }
@@ -1885,6 +1890,7 @@ mod tests {
                 .join(task.id.to_string())
                 .join("repo"),
             revision: None,
+            source_repository: None,
         };
         std::fs::create_dir_all(&workspace.path).unwrap();
         std::fs::write(workspace.path.join("recover.txt"), "preserve me").unwrap();
@@ -2038,6 +2044,7 @@ mod failure_limit_tests {
                 .join(task.id.to_string())
                 .join("repo"),
             revision: None,
+            source_repository: None,
         };
         std::fs::create_dir_all(&workspace.path).unwrap();
         std::fs::write(workspace.path.join("debug.txt"), "useful evidence").unwrap();

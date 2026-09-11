@@ -905,6 +905,7 @@ fn event_html(
             destination,
             git,
             git_warning,
+            ..
         } => Some((
             "build",
             format!(

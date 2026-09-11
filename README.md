@@ -124,8 +124,10 @@ alternate provider endpoints/tokens, and arbitrary tool options are not inherite
 Custom setups relying on other environment variables may need a reviewed policy
 change. Cloned task workspaces also have every inherited Git remote removed
 before a worker can run, so a source repository's `origin` cannot be used for
-an unattended push; explicit GitHub publication remains a separate persistent
-output action. This reduces environment exposure, but is **not a sandbox**: child
+an unattended push. The server retains only the credential-free
+`owner/repository` source identity for a later, explicit GitHub publication
+from persistent output; it never restores that identity as a worker remote.
+This reduces environment exposure, but is **not a sandbox**: child
 processes still have the server user's filesystem/network access, can read
 on-disk credentials or tool configuration, and Claude Code's own subprocesses
 may inherit its required Anthropic credential. Do not execute untrusted
@@ -586,7 +588,7 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.
 - `POST /api/tasks/{id}/publish/prepare` — finalize unchanged generated documentation and return the exact clean publication snapshot and fingerprint.
 - `GET /api/tasks/{id}/publish` — read an already prepared clean publication snapshot.
-- `POST /api/tasks/{id}/publish` — explicitly publish the exact confirmed fingerprint to the existing GitHub `origin`.
+- `POST /api/tasks/{id}/publish` — explicitly publish the exact confirmed fingerprint to the retained GitHub source identity, or to an existing GitHub `origin` for older persistent projects.
 
 Example Project registration:
 

@@ -260,6 +260,10 @@ pub struct ProjectPersistence {
     /// Why repository metadata is missing from a SUCCESSFUL persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_warning: Option<String>,
+    /// Credential-free source identity retained for explicit GitHub
+    /// publication after the disposable worker workspace is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repository: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -599,6 +603,9 @@ pub enum TaskEvent {
         /// Present when the project reached its destination but its repository
         /// could not be inspected. Persistence still succeeded.
         git_warning: Option<String>,
+        /// Normalized `owner/repository` source identity, never a remote URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_repository: Option<String>,
     },
     ProjectPersistenceFailed {
         destination: String,
@@ -935,11 +942,15 @@ impl TaskEvent {
             Self::ProjectPersisted {
                 destination,
                 git_warning,
+                source_repository,
                 ..
             } => {
                 clean(destination);
                 if let Some(git_warning) = git_warning {
                     clean(git_warning);
+                }
+                if let Some(source_repository) = source_repository {
+                    clean(source_repository);
                 }
             }
             Self::ProjectPersistenceFailed { destination, error } => {
@@ -1475,6 +1486,7 @@ impl Task {
                     destination: destination.clone(),
                     git: None,
                     git_warning: None,
+                    source_repository: None,
                     error: None,
                 });
             }
@@ -1482,6 +1494,7 @@ impl Task {
                 ref destination,
                 ref git,
                 ref git_warning,
+                ref source_repository,
             } => {
                 self.persistence = Some(ProjectPersistence {
                     mode: OutputTarget::PersistentLocalProject,
@@ -1489,6 +1502,7 @@ impl Task {
                     destination: destination.clone(),
                     git: git.clone(),
                     git_warning: git_warning.clone(),
+                    source_repository: source_repository.clone(),
                     error: None,
                 });
             }
@@ -1502,6 +1516,7 @@ impl Task {
                     destination: destination.clone(),
                     git: None,
                     git_warning: None,
+                    source_repository: None,
                     error: Some(error.clone()),
                 });
             }
@@ -3017,6 +3032,7 @@ mod tests {
                 has_remote: false,
             }),
             git_warning: None,
+            source_repository: None,
         });
         emitter.emit(TaskEvent::Finished {
             status: TaskStatus::Completed,

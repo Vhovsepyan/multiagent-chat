@@ -23,6 +23,9 @@ pub struct TaskWorkspace {
     /// Only this directory is inspected, implemented, verified, and diffed.
     pub path: PathBuf,
     pub revision: Option<String>,
+    /// Credential-free source identity retained by the server. This is never
+    /// written to the worker repository's Git configuration.
+    pub source_repository: Option<String>,
 }
 
 impl TaskWorkspace {
@@ -182,6 +185,9 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
                 root: root.clone(),
                 path,
                 revision,
+                source_repository: request
+                    .source
+                    .map(|source| source.repository_identity().to_owned()),
             })
         })();
         if prepared.is_err() {

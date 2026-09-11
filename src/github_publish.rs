@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::execution_limits::ExecutionLimits;
+use crate::project::ProjectSource;
 use crate::task::{GeneratedArtifact, GitHubPublication, Task};
 use crate::workspace::run_git;
 
@@ -244,21 +245,43 @@ fn inspect(task: &Task, limits: &ExecutionLimits) -> Result<RepositorySnapshot> 
     if changes.iter().any(|change| is_conflict(&change.code)) {
         bail!("publishing is blocked by unresolved merge conflicts");
     }
-    // Read the configured identity without applying Git's URL rewrite rules.
-    // Production still pushes through ordinary Git, while tests can redirect
-    // this exact GitHub URL to a local bare remote without weakening validation.
-    let remote = git(&root, &["config", "--get", "remote.origin.url"], limits)?
-        .ok_or_else(|| anyhow::anyhow!("no GitHub origin remote is configured"))?;
-    let repository = github_repository(&remote)
-        .ok_or_else(|| anyhow::anyhow!("origin is not a GitHub repository"))?;
+    let (repository, remote_url) = publication_remote(task, &root, limits)?;
     Ok(RepositorySnapshot {
         root,
         repository,
-        remote_url: remote,
+        remote_url,
         branch,
         head_sha,
         changes,
     })
+}
+
+/// Resolve a destination only at the explicit publishing boundary. A source
+/// identity is canonical `owner/repository` metadata captured before worker
+/// remotes were removed, so it can safely be converted to a GitHub URL without
+/// persisting credentials or adding a remote back to the workspace.
+fn publication_remote(
+    task: &Task,
+    root: &Path,
+    limits: &ExecutionLimits,
+) -> Result<(String, String)> {
+    if let Some(source_repository) = task
+        .persistence
+        .as_ref()
+        .and_then(|persistence| persistence.source_repository.as_deref())
+    {
+        let source = ProjectSource::github(source_repository)
+            .context("persisted source repository identity is invalid")?;
+        return Ok((source.repository_identity().to_owned(), source.clone_url()));
+    }
+
+    // Backward compatibility for persistent projects created before source
+    // identity was retained. Do not write, alter, or recreate this remote.
+    let remote = git(root, &["config", "--get", "remote.origin.url"], limits)?
+        .ok_or_else(|| anyhow::anyhow!("no GitHub origin remote is configured"))?;
+    let repository = github_repository(&remote)
+        .ok_or_else(|| anyhow::anyhow!("origin is not a GitHub repository"))?;
+    Ok((repository, remote))
 }
 
 fn repository_root(task: &Task) -> Result<PathBuf> {
@@ -500,6 +523,7 @@ fn stderr(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::PersistentDestination;
     use crate::task::{TaskEvent, TaskResult};
 
     #[test]
@@ -584,6 +608,55 @@ mod tests {
                 destination: self.repo.display().to_string(),
                 git: None,
                 git_warning: None,
+                source_repository: None,
+            });
+            emitter.emit(TaskEvent::Finished {
+                status: crate::task::TaskStatus::Completed,
+                error: None,
+            });
+            manager.get(task.id).unwrap()
+        }
+
+        fn persisted_task_with_stored_source_identity(&self) -> Task {
+            run(&self.repo, &["remote", "remove", "origin"]);
+            assert!(
+                git(&self.repo, &["remote"], &limits()).unwrap().is_none(),
+                "the pre-persistence worker repository retained a remote"
+            );
+
+            let output_root = self.root.join("persistent-output");
+            fs::create_dir(&output_root).unwrap();
+            let destination =
+                PersistentDestination::resolve(Some(&output_root), "published").unwrap();
+            let persisted = destination
+                .persist_with_source_repository(&self.repo, Some("acme/app"), &limits())
+                .unwrap();
+            assert!(
+                git(destination.path(), &["remote"], &limits())
+                    .unwrap()
+                    .is_none(),
+                "persistence restored a remote"
+            );
+
+            let manager = crate::task::TaskManager::new();
+            let task = manager.create("publish", "description", "legacy");
+            let emitter = manager.emitter(task.id);
+            emitter.emit(TaskEvent::Result {
+                result: TaskResult {
+                    source_revision: None,
+                    verification: vec![crate::verification::VerificationResult {
+                        command: "cargo test".into(),
+                        success: true,
+                        output: "ok".into(),
+                    }],
+                    diff: String::new(),
+                },
+            });
+            emitter.emit(TaskEvent::ProjectPersisted {
+                destination: persisted.destination,
+                git: persisted.git,
+                git_warning: persisted.git_warning,
+                source_repository: persisted.source_repository,
             });
             emitter.emit(TaskEvent::Finished {
                 status: crate::task::TaskStatus::Completed,
@@ -651,6 +724,24 @@ mod tests {
 
         let publication = publish(&task, &preview.fingerprint, &limits()).unwrap();
         assert_eq!(publication.commit_sha, preview.head_sha);
+        assert_eq!(
+            fixture.remote_head().as_deref(),
+            Some(preview.head_sha.as_str())
+        );
+    }
+
+    #[test]
+    fn persisted_source_identity_publishes_without_restoring_origin() {
+        let fixture = Fixture::new("stored-source");
+        let task = fixture.persisted_task_with_stored_source_identity();
+        let preview = prepare(&task, &limits()).unwrap();
+
+        assert_eq!(preview.repository, "acme/app");
+        assert_eq!(preview.remote_url, "https://github.com/acme/app.git");
+        assert!(fixture.remote_head().is_none());
+
+        let publication = publish(&task, &preview.fingerprint, &limits()).unwrap();
+        assert_eq!(publication.repository, "acme/app");
         assert_eq!(
             fixture.remote_head().as_deref(),
             Some(preview.head_sha.as_str())

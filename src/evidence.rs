@@ -809,6 +809,7 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             destination,
             git,
             git_warning,
+            source_repository,
         } => {
             let mut details = vec![format!("Destination: `{}`", markdown_inline(destination))];
             if let Some(warning) = git_warning {
@@ -827,6 +828,12 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 details.push(format!("Git remote configured: {}", git.has_remote));
             } else {
                 details.push("Git repository: none".into());
+            }
+            if let Some(source_repository) = source_repository {
+                details.push(format!(
+                    "Retained GitHub source: `{}`",
+                    markdown_inline(source_repository)
+                ));
             }
             ("Project persisted".into(), details)
         }

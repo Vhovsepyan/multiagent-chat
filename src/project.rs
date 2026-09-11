@@ -30,6 +30,14 @@ impl ProjectSource {
             Self::GitHub { repository } => format!("https://github.com/{repository}.git"),
         }
     }
+
+    /// A credential-free repository identity that can be retained outside a
+    /// worker's Git configuration.
+    pub fn repository_identity(&self) -> &str {
+        match self {
+            Self::GitHub { repository } => repository,
+        }
+    }
 }
 
 fn normalize_github_repository(raw: &str) -> Result<String> {

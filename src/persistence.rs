@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution_limits::ExecutionLimits;
 use crate::git::RepositoryStatus;
+use crate::project::ProjectSource;
 
 /// Longest destination folder name accepted from the browser.
 const MAX_NAME_BYTES: usize = 64;
@@ -168,7 +169,24 @@ impl PersistentDestination {
     /// and moved into place only once it is complete, so an interrupted or
     /// failed copy never leaves a half-written project behind and never
     /// disturbs whatever is already at the destination.
+    #[cfg(test)]
     pub fn persist(&self, source: &Path, limits: &ExecutionLimits) -> Result<PersistedProject> {
+        self.persist_with_source_repository(source, None, limits)
+    }
+
+    /// Persist a project while retaining its already-normalized source
+    /// repository identity. The identity is metadata for the later explicit
+    /// publication boundary; it is never restored as a worker Git remote.
+    pub fn persist_with_source_repository(
+        &self,
+        source: &Path,
+        source_repository: Option<&str>,
+        limits: &ExecutionLimits,
+    ) -> Result<PersistedProject> {
+        let source_repository = source_repository
+            .map(ProjectSource::github)
+            .transpose()?
+            .map(|source| source.repository_identity().to_owned());
         self.ensure_available()?;
         if !source.is_dir() {
             bail!("the generated project is no longer available in the task workspace");
@@ -204,6 +222,7 @@ impl PersistentDestination {
             destination: self.display(),
             git,
             git_warning,
+            source_repository,
         })
     }
 
@@ -239,6 +258,10 @@ pub struct PersistedProject {
     /// project, which is already at its destination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_warning: Option<String>,
+    /// Canonical `owner/repository` identity from a registered source project.
+    /// This deliberately stores no URL, credentials, or temporary path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repository: Option<String>,
 }
 
 /// Copy a directory tree, refusing anything that is not a plain file or folder.
@@ -365,6 +388,34 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(siblings, vec![std::ffi::OsString::from("invoice-tool")]);
+    }
+
+    #[test]
+    fn source_identity_is_normalized_and_credentials_are_never_persisted() {
+        let fixture = Fixture::new("source-identity");
+        let project = fixture.generated_project();
+        let destination = fixture.destination("safe-source");
+
+        let persisted = destination
+            .persist_with_source_repository(
+                &project,
+                Some("https://github.com/acme/app.git"),
+                &limits(),
+            )
+            .unwrap();
+        assert_eq!(persisted.source_repository.as_deref(), Some("acme/app"));
+
+        let rejected = fixture.destination("rejected-source");
+        assert!(
+            rejected
+                .persist_with_source_repository(
+                    &project,
+                    Some("https://token@github.com/acme/app.git"),
+                    &limits(),
+                )
+                .is_err()
+        );
+        assert!(!rejected.path().exists());
     }
 
     /// Required test 3: the persistent project is a real copy, so cleaning the
