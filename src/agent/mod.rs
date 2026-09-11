@@ -32,6 +32,7 @@ pub use selection::{
 
 use crate::api::claude::ClaudeClient;
 use crate::api::gemini::GeminiClient;
+use crate::codex::CodexAgent;
 use crate::config::Config;
 use crate::implementer::ClaudeCodeAgent;
 
@@ -74,6 +75,7 @@ pub fn coding_agent(
 ) -> Result<Box<dyn CodingAgent>> {
     match selection.tool {
         CodingTool::ClaudeCode => Ok(Box::new(ClaudeCodeAgent::new(config, &selection.model))),
+        CodingTool::Codex => Ok(Box::new(CodexAgent::new(config, &selection.model))),
     }
 }
 
@@ -93,6 +95,8 @@ pub(crate) fn test_config() -> Config {
         gemini_models: Vec::new(),
         anthropic_models: Vec::new(),
         claude_code_models: Vec::new(),
+        codex_models: Vec::new(),
+        codex_model: "codex-worker-model".into(),
         permission_mode: "acceptEdits".into(),
         port: 0,
     }
@@ -156,5 +160,17 @@ mod tests {
         assert_eq!(agents.proposer.model(), "gemini-fast");
         assert_eq!(agents.critic.provider(), ChatProvider::Gemini);
         assert_eq!(agents.critic.model(), "proposer-model");
+    }
+
+    #[test]
+    fn resolver_constructs_the_selected_codex_worker() {
+        let config = test_config();
+        let selection = AgentSelection {
+            worker: CodingAgentConfig::new(CodingTool::Codex, "codex-worker-model"),
+            ..AgentSelection::compiled_defaults()
+        };
+        let agents = resolve(&selection, &config).unwrap();
+        assert_eq!(agents.worker.tool(), CodingTool::Codex);
+        assert_eq!(agents.worker.model(), "codex-worker-model");
     }
 }

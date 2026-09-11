@@ -9,6 +9,7 @@ mod agent;
 mod api;
 mod approve;
 mod cli;
+mod codex;
 mod config;
 mod debate;
 mod evidence;

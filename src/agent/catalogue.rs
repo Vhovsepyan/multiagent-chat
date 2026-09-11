@@ -78,19 +78,20 @@ impl AgentCatalogue {
             }
         }
 
-        // The worker tool has its own authentication (Claude Code signs in on
-        // its own), so it does not depend on the Anthropic HTTP credential.
+        // Worker tools authenticate themselves, so they do not depend on a
+        // chat-provider HTTP credential. Their model allow-lists are separate.
         let coding = CodingTool::ALL
             .into_iter()
             .map(|tool| {
+                let (configured, default): (&Vec<String>, &str) = match tool {
+                    CodingTool::ClaudeCode => {
+                        (&config.claude_code_models, &config.implementer_model)
+                    }
+                    CodingTool::Codex => (&config.codex_models, &config.codex_model),
+                };
                 (
                     tool,
-                    ModelOptions::new(
-                        tool.id(),
-                        tool.label(),
-                        &config.claude_code_models,
-                        &config.implementer_model,
-                    ),
+                    ModelOptions::new(tool.id(), tool.label(), configured, default),
                 )
             })
             .collect();
@@ -278,6 +279,7 @@ mod tests {
         let mut config = crate::agent::test_config();
         config.gemini_models = vec!["gemini-fast".into()];
         config.anthropic_models = vec!["claude-extra".into()];
+        config.codex_models = vec!["codex-fast".into()];
         config
     }
 
@@ -397,6 +399,38 @@ mod tests {
         assert!(error.contains("Claude Code"), "unexpected: {error}");
     }
 
+    #[test]
+    fn codex_is_available_with_its_own_default_and_model_allow_list() {
+        let catalogue = catalogue();
+        let options = catalogue.coding_models(CodingTool::Codex).unwrap();
+        assert_eq!(options.default_model, "codex-worker-model");
+        assert_eq!(options.models, vec!["codex-worker-model", "codex-fast"]);
+
+        let request = AgentSelectionRequest {
+            worker: Some(CodingAgentRequest {
+                tool: Some(CodingTool::Codex),
+                model: Some("codex-fast".into()),
+            }),
+            ..Default::default()
+        };
+        let resolved = catalogue.resolve(Some(&request)).unwrap();
+        assert_eq!(resolved.worker.tool, CodingTool::Codex);
+        assert_eq!(resolved.worker.model, "codex-fast");
+    }
+
+    #[test]
+    fn an_unknown_codex_model_is_rejected() {
+        let request = AgentSelectionRequest {
+            worker: Some(CodingAgentRequest {
+                tool: Some(CodingTool::Codex),
+                model: Some("not-configured".into()),
+            }),
+            ..Default::default()
+        };
+        let error = catalogue().resolve(Some(&request)).unwrap_err();
+        assert!(error.contains("Codex"), "unexpected: {error}");
+    }
+
     // --- availability ------------------------------------------------------
 
     fn only(provider: Option<ChatProvider>) -> AgentCatalogue {
@@ -434,7 +468,7 @@ mod tests {
     fn the_worker_stays_available_without_any_chat_credential() {
         let neither = only(None);
 
-        assert_eq!(neither.available_coding_tools().len(), 1);
+        assert_eq!(neither.available_coding_tools().len(), 2);
         assert_eq!(neither.default_worker().unwrap().model, "worker-model");
     }
 

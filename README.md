@@ -506,12 +506,18 @@ is configured, it is passed to Claude Code as before. This is why the worker
 stays available — and `cargo run -- --cli --implement-only` keeps working — on
 an installation with no chat provider at all.
 
+Codex is also available as an alternative worker tool. It uses its own CLI
+authentication and the configured `CODEX_MODEL` default (plus models listed in
+`CODEX_MODELS`); Claude Code remains the default worker for compatibility.
+
 ### Models
 
 Each provider or tool offers its configured default model plus any extra models
-listed in `GEMINI_MODELS`, `ANTHROPIC_MODELS` and `CLAUDE_CODE_MODELS`
+listed in `GEMINI_MODELS`, `ANTHROPIC_MODELS`, `CLAUDE_CODE_MODELS` and
+`CODEX_MODELS`
 (comma-separated). The role defaults remain `GEMINI_MODEL`, `CRITIC_MODEL` and
-`IMPLEMENTER_MODEL`, and a default is always offered by its provider. Model
+`IMPLEMENTER_MODEL`/`CODEX_MODEL`, and a default is always offered by its
+provider/tool. Model
 names come from configuration; the application does not ask providers which
 models an account may use.
 

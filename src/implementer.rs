@@ -140,30 +140,53 @@ async fn run_with_prompt(
     emitter: &Emitter,
     task_prompt: &str,
 ) -> Result<()> {
-    ui::header("Implementer");
-    ui::system(&format!(
-        "claude -p --model {} --permission-mode {}",
-        model, config.permission_mode
-    ));
-    ui::system(&format!("working directory: {}", repo.display()));
-
     if config.permission_mode == "bypassPermissions" {
         ui::warn("Claude Code will edit files and run commands here unattended.");
     }
+    let anthropic_api_key = config.anthropic_api_key.clone();
+    let spec_path = spec_path.to_path_buf();
+    let task_prompt = task_prompt.to_string();
+    let model = model.to_string();
+    run_worker_command(
+        config,
+        "Claude Code",
+        CLAUDE_BIN,
+        repo,
+        emitter,
+        move |command| {
+            if let Some(key) = anthropic_api_key {
+                command.env("ANTHROPIC_API_KEY", key);
+            }
+            command
+                .arg("-p")
+                .arg(prompt(&spec_path, &task_prompt))
+                .arg("--model")
+                .arg(model)
+                .arg("--permission-mode")
+                .arg(config.permission_mode.clone());
+        },
+    )
+    .await
+}
+
+/// Shared bounded worker execution for coding-tool adapters. The adapter owns
+/// its command shape; this function owns the process safety guarantees.
+pub(crate) async fn run_worker_command(
+    config: &Config,
+    tool_label: &str,
+    binary: &str,
+    repo: &Path,
+    emitter: &Emitter,
+    command_args: impl FnOnce(&mut tokio::process::Command),
+) -> Result<()> {
+    ui::header("Implementer");
+    ui::system(&format!("{tool_label} ({binary})"));
+    ui::system(&format!("working directory: {}", repo.display()));
     println!();
 
-    let mut command = crate::process_environment::implementer_command(
-        CLAUDE_BIN,
-        config.anthropic_api_key.as_deref(),
-    );
-    command
-        .current_dir(repo)
-        .arg("-p")
-        .arg(prompt(spec_path, task_prompt))
-        .arg("--model")
-        .arg(model)
-        .arg("--permission-mode")
-        .arg(&config.permission_mode);
+    let mut command = crate::process_environment::worker_command(binary);
+    command.current_dir(repo);
+    command_args(&mut command);
     let output = crate::process_runner::run(
         command,
         config
@@ -173,18 +196,17 @@ async fn run_with_prompt(
     )
     .await
     .with_context(|| {
-        format!("could not start `{CLAUDE_BIN}` — is the Claude Code CLI installed and on PATH?")
+        format!("could not start `{binary}` — is the {tool_label} CLI installed and on PATH?")
     })?;
 
-    println!();
     if !output.success() {
         let reason = output
             .failure
-            .unwrap_or_else(|| format!("Claude Code exited with status {:?}", output.status));
+            .unwrap_or_else(|| format!("{tool_label} exited with status {:?}", output.status));
         emitter.warn(&reason);
         bail!("{reason}");
     }
-    ui::success("Claude Code finished.");
+    ui::success(&format!("{tool_label} finished."));
     Ok(())
 }
 

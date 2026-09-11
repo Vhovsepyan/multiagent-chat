@@ -65,23 +65,31 @@ pub fn async_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     command(program).into()
 }
 
-/// Claude Code gets the configured Anthropic key and nothing else: no other
-/// inherited provider configuration (endpoint overrides, alternate tokens) is
-/// allowed through.
+/// Coding workers get only the runtime environment and, when explicitly
+/// supplied, the credential belonging to that worker. No other inherited
+/// provider configuration (endpoint overrides, alternate tokens) is allowed
+/// through.
 ///
 /// `None` means this installation has no Anthropic HTTP credential. The child
 /// is then launched with no `ANTHROPIC_API_KEY` at all — the inherited one is
 /// already cleared — so Claude Code falls back to its own stored login. Worker
 /// authentication is deliberately independent of the chat provider key.
+#[allow(dead_code)]
 pub fn implementer_command(
     program: impl AsRef<OsStr>,
     anthropic_api_key: Option<&str>,
 ) -> tokio::process::Command {
-    let mut command = async_command(program);
+    let mut command = worker_command(program);
     if let Some(key) = anthropic_api_key {
         command.env("ANTHROPIC_API_KEY", key);
     }
     command
+}
+
+/// Build a worker command with the filtered environment and no provider
+/// credentials. Tools such as Codex authenticate through their own CLI login.
+pub fn worker_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
+    async_command(program)
 }
 
 #[cfg(test)]

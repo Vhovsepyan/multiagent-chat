@@ -1453,7 +1453,7 @@ pub(crate) fn markdown_section(markdown: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentSelection, ChatAgentConfig, CodingAgentConfig};
+    use crate::agent::{AgentSelection, ChatAgentConfig, CodingAgentConfig, CodingTool};
     use crate::execution_limits::HistoryLimits;
     use crate::task::{OutputTarget, TaskKind, TaskManager, TaskRequest};
     use crate::technology::TechStack;
@@ -1464,6 +1464,14 @@ mod tests {
             critic: ChatAgentConfig::new(ChatProvider::Gemini, "critic-model-v2"),
             worker: CodingAgentConfig::new(CodingTool::ClaudeCode, "worker-model-v3"),
         }
+    }
+
+    #[test]
+    fn codex_worker_lifecycle_is_rendered_with_tool_and_model() {
+        let (title, details) = worker_lifecycle("completed", CodingTool::Codex, "codex-model");
+        assert_eq!(title, "Worker completed");
+        assert!(details.iter().any(|line| line == "Tool: Codex"));
+        assert!(details.iter().any(|line| line.contains("codex-model")));
     }
 
     fn task_with_evidence(secret: &str) -> (TaskManager, crate::task::TaskId) {

@@ -46,6 +46,10 @@ pub struct Config {
     pub gemini_models: Vec<String>,
     pub anthropic_models: Vec<String>,
     pub claude_code_models: Vec<String>,
+    /// Models offered for the Codex worker tool.
+    pub codex_models: Vec<String>,
+    /// Default model for the Codex worker tool.
+    pub codex_model: String,
     /// Permission mode passed to Claude Code. See `implementer.rs` for why the
     /// default is the permissive one.
     pub permission_mode: String,
@@ -61,6 +65,7 @@ const MAX_FIX_ITERATION_LIMIT: u32 = 5;
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 pub const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const DEFAULT_PORT: u16 = 3000;
 
@@ -168,6 +173,8 @@ impl Config {
             gemini_models: model_list("GEMINI_MODELS"),
             anthropic_models: model_list("ANTHROPIC_MODELS"),
             claude_code_models: model_list("CLAUDE_CODE_MODELS"),
+            codex_models: model_list("CODEX_MODELS"),
+            codex_model: optional("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             permission_mode: optional("CLAUDE_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
             port,
         })
@@ -237,6 +244,7 @@ impl fmt::Debug for Config {
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)
             .field("implementer_model", &self.implementer_model)
+            .field("codex_model", &self.codex_model)
             .field("permission_mode", &self.permission_mode)
             .field("port", &self.port)
             .finish()

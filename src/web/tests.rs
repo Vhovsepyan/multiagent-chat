@@ -38,6 +38,8 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         gemini_models: vec!["test-model-fast".into()],
         anthropic_models: Vec::new(),
         claude_code_models: Vec::new(),
+        codex_models: Vec::new(),
+        codex_model: "test-codex-model".into(),
         permission_mode: "acceptEdits".into(),
         port: 0,
     };
@@ -1068,6 +1070,8 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
         gemini_models: vec!["test-model-fast".into()],
         anthropic_models: Vec::new(),
         claude_code_models: Vec::new(),
+        codex_models: Vec::new(),
+        codex_model: "test-codex-model".into(),
         permission_mode: "acceptEdits".into(),
         port: 0,
     };
@@ -1097,6 +1101,11 @@ async fn agent_options_expose_models_but_never_credentials() {
     assert_eq!(options["chat_providers"][0]["id"], "gemini");
     assert_eq!(options["chat_providers"][1]["id"], "anthropic");
     assert_eq!(options["coding_tools"][0]["id"], "claude_code");
+    assert_eq!(options["coding_tools"][1]["id"], "codex");
+    assert_eq!(
+        options["coding_tools"][1]["default_model"],
+        "test-codex-model"
+    );
     // The configured default is always offered, plus any extra models.
     assert_eq!(
         options["chat_providers"][0]["models"],
@@ -1152,6 +1161,32 @@ async fn creating_a_task_stores_the_selected_agents_per_role() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[tokio::test]
+async fn creating_a_task_can_select_codex_as_worker() {
+    let (state, root) = test_state("agent-codex-select");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project",
+                "title": "Codex worker",
+                "description": "exercise the alternative worker",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "agents": {
+                    "worker": {"tool": "codex", "model": "test-codex-model"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["agents"]["worker"]["tool"], "codex");
+    assert_eq!(task["agents"]["worker"]["model"], "test-codex-model");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Requirement 5: a request that says nothing about agents behaves exactly as
 /// it did before this feature existed.
 #[tokio::test]
@@ -1202,11 +1237,11 @@ async fn invalid_agent_selections_are_rejected_rather_than_substituted() {
             json!({"proposer": {"provider": "openai"}}),
             vec!["proposer", "openai", "gemini", "anthropic"],
         ),
-        // 7: a worker tool this build does not serve (Codex is task 0015).
+        // 7: a worker tool this build does not serve.
         (
             "unknown-tool",
-            json!({"worker": {"tool": "codex"}}),
-            vec!["worker", "codex", "claude_code"],
+            json!({"worker": {"tool": "future_worker"}}),
+            vec!["future_worker", "claude_code", "codex"],
         ),
         // 6: a model configured for a different provider.
         (
@@ -1444,6 +1479,8 @@ fn state_with_credentials(
         gemini_models: Vec::new(),
         anthropic_models: Vec::new(),
         claude_code_models: Vec::new(),
+        codex_models: Vec::new(),
+        codex_model: "test-codex-model".into(),
         permission_mode: "acceptEdits".into(),
         port: 0,
     };
@@ -1484,6 +1521,7 @@ async fn agent_options_list_only_available_providers() {
     assert_eq!(providers.len(), 1, "got {providers:?}");
     assert_eq!(providers[0]["id"], "gemini");
     assert_eq!(options["coding_tools"][0]["id"], "claude_code");
+    assert_eq!(options["coding_tools"][1]["id"], "codex");
     // The critic default is unavailable, so the UI is told what to configure
     // rather than being handed a substitute provider.
     assert!(options["defaults"].is_null());
@@ -1583,7 +1621,7 @@ async fn no_chat_credentials_still_serves_the_application() {
 
     let options = body_json(app.clone().oneshot(get("/api/agents")).await.unwrap()).await;
     assert!(options["chat_providers"].as_array().unwrap().is_empty());
-    assert_eq!(options["coding_tools"].as_array().unwrap().len(), 1);
+    assert_eq!(options["coding_tools"].as_array().unwrap().len(), 2);
     assert!(options["defaults"].is_null());
 
     let response = app

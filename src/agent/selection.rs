@@ -63,25 +63,28 @@ impl std::fmt::Display for ChatProvider {
     }
 }
 
-/// A tool that can serve the Worker role. Codex joins this enum in task 0015.
+/// A tool that can serve the Worker role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodingTool {
     ClaudeCode,
+    Codex,
 }
 
 impl CodingTool {
-    pub const ALL: [CodingTool; 1] = [CodingTool::ClaudeCode];
+    pub const ALL: [CodingTool; 2] = [CodingTool::ClaudeCode, CodingTool::Codex];
 
     pub fn id(self) -> &'static str {
         match self {
             CodingTool::ClaudeCode => "claude_code",
+            CodingTool::Codex => "codex",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             CodingTool::ClaudeCode => "Claude Code",
+            CodingTool::Codex => "Codex",
         }
     }
 
@@ -253,9 +256,17 @@ mod tests {
             "\"claude_code\""
         );
         assert_eq!(
+            serde_json::to_string(&CodingTool::Codex).unwrap(),
+            "\"codex\""
+        );
+        assert_eq!(
             serde_json::from_str::<ChatProvider>("\"gemini\"").unwrap(),
             ChatProvider::Gemini
         );
         assert!(serde_json::from_str::<ChatProvider>("\"openai\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<CodingTool>("\"codex\"").unwrap(),
+            CodingTool::Codex
+        );
     }
 }
