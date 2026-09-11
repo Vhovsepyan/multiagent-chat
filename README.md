@@ -110,9 +110,10 @@ Results otherwise remain in memory until persistence is implemented.
 Inspection skips linked repository files, including instructions and metadata.
 Each task workspace has separate `repo/` and `artifacts/` directories. The exact
 approved text, including user edits, is saved as `artifacts/approved-spec.md`
-and its absolute path is supplied to Claude Code. It is never written into the
-repository, never replaces a project-owned `SPEC.md`, and does not appear in
-the project's diff. Cleanup covers both directories.
+and its absolute path is supplied to the worker. Codex receives the task-owned
+artifact directory through its `--add-dir` sandbox allowance; it is never
+written into the repository, never replaces a project-owned `SPEC.md`, and
+does not appear in the project's diff. Cleanup covers both directories.
 
 Git, verification tools, and Claude Code start with cleared environments and
 an explicit runtime-variable allowlist (OS paths, home/temp locations, locale,
@@ -121,7 +122,10 @@ configured `ANTHROPIC_API_KEY`, and none at all when that key is not configured
 — it then uses its own stored login; other provider keys, database/cloud credentials,
 alternate provider endpoints/tokens, and arbitrary tool options are not inherited.
 Custom setups relying on other environment variables may need a reviewed policy
-change. This reduces environment exposure, but is **not a sandbox**: child
+change. Cloned task workspaces also have every inherited Git remote removed
+before a worker can run, so a source repository's `origin` cannot be used for
+an unattended push; explicit GitHub publication remains a separate persistent
+output action. This reduces environment exposure, but is **not a sandbox**: child
 processes still have the server user's filesystem/network access, can read
 on-disk credentials or tool configuration, and Claude Code's own subprocesses
 may inherit its required Anthropic credential. Do not execute untrusted

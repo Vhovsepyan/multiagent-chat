@@ -52,6 +52,10 @@ impl CodingAgent for CodexAgent {
     ) -> Result<CodingTaskResult> {
         let model = self.model.clone();
         let spec_path = request.spec_path.to_path_buf();
+        let artifacts = spec_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("approved specification has no parent directory"))?
+            .to_path_buf();
         let instructions = request.instructions.to_string();
         run_worker_command(
             &self.config,
@@ -64,6 +68,12 @@ impl CodingAgent for CodexAgent {
                     .arg("exec")
                     .arg("--sandbox")
                     .arg("workspace-write")
+                    // The approved specification deliberately lives outside
+                    // the repository diff boundary. Add only its task-owned
+                    // artifact directory to Codex's sandbox instead of
+                    // widening the worker's filesystem access.
+                    .arg("--add-dir")
+                    .arg(&artifacts)
                     .arg("--model")
                     .arg(&model)
                     .arg(prompt(&spec_path, &instructions));
@@ -91,14 +101,17 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_keeps_prompt_and_model_provider_specific() {
+    fn codex_command_keeps_prompt_model_and_artifact_access_provider_specific() {
         let model = "codex-model";
         let spec = Path::new("/tmp/approved.md");
+        let artifacts = spec.parent().unwrap();
         let mut command = crate::process_environment::worker_command(CODEX_BIN);
         command
             .arg("exec")
             .arg("--sandbox")
             .arg("workspace-write")
+            .arg("--add-dir")
+            .arg(artifacts)
             .arg("--model")
             .arg(model)
             .arg(prompt(spec, "Implement milestone one."));
@@ -108,11 +121,19 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(
-            &args[..5],
-            ["exec", "--sandbox", "workspace-write", "--model", model]
+            &args[..7],
+            [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "--add-dir",
+                "/tmp",
+                "--model",
+                model
+            ]
         );
-        assert!(args[5].contains("approved.md"));
-        assert!(args[5].contains("Implement milestone one."));
+        assert!(args[7].contains("approved.md"));
+        assert!(args[7].contains("Implement milestone one."));
     }
 
     #[test]

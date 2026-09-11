@@ -151,6 +151,12 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
                             String::from_utf8_lossy(&output.stderr).trim()
                         );
                     }
+                    // `git clone` creates an `origin` remote. The workspace is
+                    // handed to an unattended coding worker, so that inherited
+                    // publishing capability must be removed before inspection
+                    // or implementation can reach it. The checked-out commit
+                    // below remains the task's source baseline.
+                    remove_worker_remotes(&path, &self.limits)?;
                 }
                 None => {
                     fs::create_dir(&path).with_context(|| {
@@ -196,6 +202,35 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
         }
         Ok(())
     }
+}
+
+/// Remove remotes inherited by a cloned source before the repository is made
+/// available to a coding worker. A task workspace never needs a remote to
+/// inspect, modify, verify, diff, or commit its local checkout; explicit
+/// publishing operates later on persistent output through its own boundary.
+fn remove_worker_remotes(repo: &Path, limits: &ExecutionLimits) -> Result<()> {
+    let remotes = git_command(repo, &["remote"], limits)?;
+    if !remotes.status.success() {
+        bail!("could not inspect cloned repository remotes");
+    }
+    for remote in String::from_utf8_lossy(&remotes.stdout).lines() {
+        let remote = remote.trim();
+        if remote.is_empty() {
+            continue;
+        }
+        let output = git_command(repo, &["remote", "remove", remote], limits)?;
+        if !output.status.success() {
+            bail!("could not disable inherited Git remote {remote:?}");
+        }
+    }
+    let remaining = git_command(repo, &["remote"], limits)?;
+    if !remaining.status.success() {
+        bail!("could not verify cloned repository remotes");
+    }
+    if !String::from_utf8_lossy(&remaining.stdout).trim().is_empty() {
+        bail!("cloned repository still has a worker-accessible Git remote");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -575,6 +610,20 @@ mod tests {
         );
     }
 
+    fn git_text(root: &Path, args: &[&str]) -> String {
+        let output = crate::process_environment::command("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn test_repository() -> PathBuf {
         let root = std::env::temp_dir().join(format!("mac-diff-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -611,6 +660,7 @@ mod tests {
         assert_eq!(first.path, first.root.join("repo"));
         assert!(first.artifacts().is_dir());
         assert!(!first.artifacts().starts_with(&first.path));
+        assert!(git_text(&first.path, &["remote"]).is_empty());
         let artifact =
             crate::spec::write_artifact(&first.artifacts(), "approved orchestration-only text")
                 .unwrap();
@@ -627,6 +677,50 @@ mod tests {
         assert!(second.path.is_dir());
         provider.cleanup(&second).unwrap();
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cloned_worker_workspace_removes_inherited_remotes_without_losing_baseline() {
+        let source = test_repository();
+        let root = std::env::temp_dir().join(format!("mac-worker-remotes-{}", Uuid::new_v4()));
+        let remote = root.join("source.git");
+        let worker = root.join("worker");
+        fs::create_dir_all(&root).unwrap();
+        git(&source, &["clone", "--bare", ".", remote.to_str().unwrap()]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap(),
+            ],
+        );
+        git(
+            &worker,
+            &["remote", "add", "secondary", remote.to_str().unwrap()],
+        );
+        let baseline = git_text(&worker, &["rev-parse", "HEAD"]);
+
+        remove_worker_remotes(&worker, &ExecutionLimits::default()).unwrap();
+
+        assert!(git_text(&worker, &["remote"]).is_empty());
+        let push = crate::process_environment::command("git")
+            .args(["push", "origin", "HEAD"])
+            .current_dir(&worker)
+            .output()
+            .unwrap();
+        assert!(
+            !push.status.success(),
+            "worker unexpectedly retained origin"
+        );
+
+        fs::write(worker.join("tracked.txt"), "after\n").unwrap();
+        let diff = task_result_diff(&worker, Some(&baseline), &ExecutionLimits::default()).unwrap();
+        assert!(diff.contains("-before\n+after"), "{diff}");
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
