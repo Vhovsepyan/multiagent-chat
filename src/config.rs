@@ -65,7 +65,7 @@ const MAX_FIX_ITERATION_LIMIT: u32 = 5;
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 pub const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.3-codex";
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const DEFAULT_PORT: u16 = 3000;
 

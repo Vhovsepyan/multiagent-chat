@@ -2391,6 +2391,7 @@ mod review_loop_tests {
 
     /// A `CodingAgent` that replays canned outcomes and records its prompts.
     struct ScriptedWorker {
+        tool: CodingTool,
         model: String,
         outcomes: Mutex<VecDeque<std::result::Result<(), String>>>,
         seen: Mutex<Vec<String>>,
@@ -2398,8 +2399,21 @@ mod review_loop_tests {
 
     impl ScriptedWorker {
         fn new(outcomes: Vec<std::result::Result<(), String>>) -> Self {
+            Self::with_tool(CodingTool::ClaudeCode, outcomes)
+        }
+
+        fn with_tool(tool: CodingTool, outcomes: Vec<std::result::Result<(), String>>) -> Self {
+            Self::with_tool_model(tool, "scripted-worker", outcomes)
+        }
+
+        fn with_tool_model(
+            tool: CodingTool,
+            model: &str,
+            outcomes: Vec<std::result::Result<(), String>>,
+        ) -> Self {
             Self {
-                model: "scripted-worker".into(),
+                tool,
+                model: model.into(),
                 outcomes: Mutex::new(outcomes.into()),
                 seen: Mutex::new(Vec::new()),
             }
@@ -2417,7 +2431,7 @@ mod review_loop_tests {
     #[async_trait::async_trait]
     impl CodingAgent for ScriptedWorker {
         fn tool(&self) -> CodingTool {
-            CodingTool::ClaudeCode
+            self.tool
         }
 
         fn model(&self) -> &str {
@@ -2435,7 +2449,7 @@ mod review_loop_tests {
                 .push(request.instructions.to_string());
             match self.outcomes.lock().unwrap().pop_front() {
                 Some(Ok(())) => Ok(CodingTaskResult {
-                    tool: CodingTool::ClaudeCode,
+                    tool: self.tool,
                     model: self.model.clone(),
                 }),
                 Some(Err(error)) => bail!("{error}"),
@@ -2459,6 +2473,10 @@ mod review_loop_tests {
 
     impl Harness {
         fn new(tag: &str) -> Self {
+            Self::with_worker_tool(tag, CodingTool::ClaudeCode)
+        }
+
+        fn with_worker_tool(tag: &str, worker_tool: CodingTool) -> Self {
             let (state, root) = crate::web::tests::test_state(tag);
             let task = state
                 .manager
@@ -2484,8 +2502,11 @@ mod review_loop_tests {
                             "configured-critic-model",
                         ),
                         worker: CodingAgentConfig::new(
-                            CodingTool::ClaudeCode,
-                            "configured-worker-model",
+                            worker_tool,
+                            match worker_tool {
+                                CodingTool::ClaudeCode => "configured-worker-model",
+                                CodingTool::Codex => "configured-codex-model",
+                            },
                         ),
                     },
                 )
@@ -2660,6 +2681,44 @@ mod review_loop_tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_worker_runs_through_a_normal_milestone_stage() {
+        let harness = Harness::with_worker_tool("review-codex-milestone", CodingTool::Codex);
+        let worker = ScriptedWorker::with_tool_model(
+            CodingTool::Codex,
+            "configured-codex-model",
+            vec![Ok(())],
+        );
+        execute_worker_for_milestone(
+            &worker,
+            &harness.task.agents.worker,
+            CodingTaskRequest {
+                workspace: &harness.workspace.path,
+                spec_path: &harness.spec_path,
+                instructions: "Implement the current milestone.",
+            },
+            &harness.emitter,
+            Some((&harness.milestone.id, &harness.milestone.title)),
+        )
+        .await
+        .unwrap();
+
+        let stored = harness.stored();
+        assert!(stored.history.iter().any(|recorded| matches!(
+            &recorded.event,
+            TaskEvent::WorkerStarted { tool, model }
+                if *tool == CodingTool::Codex && model == "configured-codex-model"
+        )));
+        assert!(stored.history.iter().any(|recorded| matches!(
+            &recorded.event,
+            TaskEvent::WorkerCompleted { tool, model }
+                if *tool == CodingTool::Codex && model == "configured-codex-model"
+        )));
+        let evidence = serde_json::to_string(&stored.evidence).unwrap();
+        assert!(evidence.contains("\"tool\":\"codex\""), "{evidence}");
+        assert!(evidence.contains("configured-codex-model"), "{evidence}");
+    }
+
     /// Required test 2: findings go back to the worker, and the re-review passes.
     #[tokio::test]
     async fn findings_are_fixed_and_then_pass() {
@@ -2711,6 +2770,38 @@ mod review_loop_tests {
         let recorded = stored.milestones[0].review.as_ref().unwrap();
         assert_eq!(recorded.status, ReviewStatus::Pass);
         assert_eq!(recorded.iterations_used, 1);
+    }
+
+    #[tokio::test]
+    async fn codex_worker_completes_the_fix_required_review_loop() {
+        let harness = Harness::with_worker_tool("review-codex-fix", CodingTool::Codex);
+        let critic = ScriptedAgent::new(ChatProvider::Anthropic, &[FIX, PASS]);
+        let worker = ScriptedWorker::with_tool_model(
+            CodingTool::Codex,
+            "configured-codex-model",
+            vec![Ok(())],
+        );
+        let mut verification = harness.passing_verification();
+        let mut all = verification.clone();
+
+        let review = harness
+            .review_loop(&critic, &worker, &[])
+            .run(&harness.milestone, &mut verification, &mut all)
+            .await
+            .unwrap()
+            .expect("a completed review");
+
+        assert_eq!(review.status, ReviewStatus::Pass);
+        assert_eq!(review.iterations_used, 1);
+        let stored = harness.stored();
+        assert!(stored.history.iter().any(|recorded| matches!(
+            &recorded.event,
+            TaskEvent::FixCompleted { tool, model, .. }
+                if *tool == CodingTool::Codex && model == "configured-codex-model"
+        )));
+        let evidence = serde_json::to_string(&stored.evidence).unwrap();
+        assert!(evidence.contains("\"tool\":\"codex\""), "{evidence}");
+        assert!(evidence.contains("configured-codex-model"), "{evidence}");
     }
 
     /// Required test 3: the loop is bounded, and unresolved findings never pass.

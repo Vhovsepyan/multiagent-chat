@@ -62,7 +62,8 @@ impl CodingAgent for CodexAgent {
             move |command| {
                 command
                     .arg("exec")
-                    .arg("--full-auto")
+                    .arg("--sandbox")
+                    .arg("workspace-write")
                     .arg("--model")
                     .arg(&model)
                     .arg(prompt(&spec_path, &instructions));
@@ -96,7 +97,8 @@ mod tests {
         let mut command = crate::process_environment::worker_command(CODEX_BIN);
         command
             .arg("exec")
-            .arg("--full-auto")
+            .arg("--sandbox")
+            .arg("workspace-write")
             .arg("--model")
             .arg(model)
             .arg(prompt(spec, "Implement milestone one."));
@@ -105,9 +107,12 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(&args[..4], ["exec", "--full-auto", "--model", model]);
-        assert!(args[4].contains("approved.md"));
-        assert!(args[4].contains("Implement milestone one."));
+        assert_eq!(
+            &args[..5],
+            ["exec", "--sandbox", "workspace-write", "--model", model]
+        );
+        assert!(args[5].contains("approved.md"));
+        assert!(args[5].contains("Implement milestone one."));
     }
 
     #[test]
