@@ -19,8 +19,9 @@ GitHub public repositories are the initial existing-project source. Each task us
 - Git on `PATH` for repository-backed tasks.
 - Claude Code CLI on `PATH` for implementation.
 - An API key for each chat provider you want to use: `GEMINI_API_KEY` (Google AI
-  Studio), `ANTHROPIC_API_KEY` (Anthropic), and/or `OPENAI_API_KEY` (OpenAI). Neither is required to start
-  the application; each one enables its own provider.
+  Studio), `ANTHROPIC_API_KEY` (Anthropic), and/or `OPENAI_API_KEY` (OpenAI). No
+  chat-provider API key is required to start the application; each one enables
+  its own provider.
 - A Claude Code stored login for worker execution when `ANTHROPIC_API_KEY` is
   not configured. The worker does not require that key solely to run.
 
@@ -34,9 +35,10 @@ cp .env.example .env
 
 Set the key for each chat provider you intend to use in `.env`; providers
 without keys are not offered. Do not commit this file or expose its values.
-Both keys are needed only when using the default proposer/critic wiring; a
-single-provider installation can explicitly select that provider for both chat
-roles. Claude Code may instead use its own stored login for worker execution.
+The default Gemini/Anthropic proposer/critic wiring requires those providers'
+keys; an installation with one configured chat provider can explicitly select
+it for both chat roles. Claude Code may instead use its own stored login for
+worker execution.
 See [Agent selection](#agent-selection) for details.
 
 `WORKSPACE_ROOT` is no longer required by the web application. It remains an optional compatibility setting for the original CLI workflow.
