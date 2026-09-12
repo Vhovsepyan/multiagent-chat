@@ -239,7 +239,76 @@ impl crate::agent::ChatAgent for OpenAiClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+
     use super::*;
+    use crate::agent::{ChatAgent, ChatProvider, ChatRequest};
+
+    const TEST_API_KEY: &str = "test-openai-api-key";
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: String,
+        target: String,
+        has_bearer_authorization: bool,
+        body: serde_json::Value,
+    }
+
+    fn mock_server(status: u16, response: &'static str) -> (String, Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push(line);
+            }
+            let content_length = headers
+                .iter()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut parts = request_line.split_whitespace();
+            sender
+                .send(CapturedRequest {
+                    method: parts.next().unwrap().to_string(),
+                    target: parts.next().unwrap().to_string(),
+                    has_bearer_authorization: headers.iter().any(|line| {
+                        line.starts_with("authorization: Bearer ")
+                            && line.trim().len() > "authorization: Bearer".len()
+                    }),
+                    body: serde_json::from_slice(&body).unwrap(),
+                })
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/v1"), receiver)
+    }
+
+    fn client_for(base_url: String) -> OpenAiClient {
+        let mut config = crate::agent::test_config();
+        config.openai_api_key = Some(TEST_API_KEY.into());
+        config.openai_base_url = base_url;
+        OpenAiClient::new(&config, "gpt-5.6-sol").unwrap()
+    }
 
     #[test]
     fn request_uses_responses_input_and_never_requests_provider_storage() {
@@ -288,5 +357,63 @@ mod tests {
             client.redact_api_key("request rejected: openai-secret"),
             "request rejected: [REDACTED]"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_api_request_and_chat_response_use_the_local_server_contract() {
+        let (base_url, requests) = mock_server(
+            200,
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"local response"}]}]}"#,
+        );
+        let client = client_for(base_url);
+        let messages = [Message::user("first"), Message::assistant("second")];
+
+        let response = client
+            .complete(ChatRequest::new(
+                Some("follow the system instruction"),
+                &messages,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "local response");
+        assert_eq!(response.provider, ChatProvider::OpenAI);
+        assert_eq!(response.model, "gpt-5.6-sol");
+        let request = requests.recv().unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/responses");
+        assert!(request.has_bearer_authorization);
+        assert_eq!(request.body["model"], "gpt-5.6-sol");
+        assert_eq!(
+            request.body["instructions"],
+            "follow the system instruction"
+        );
+        assert_eq!(request.body["store"], false);
+        assert_eq!(request.body["input"][0]["role"], "user");
+        assert_eq!(request.body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(request.body["input"][0]["content"][0]["text"], "first");
+        assert_eq!(request.body["input"][1]["role"], "assistant");
+        assert_eq!(request.body["input"][1]["content"][0]["text"], "second");
+    }
+
+    #[tokio::test]
+    async fn local_api_failures_are_safely_reported_without_the_api_key() {
+        let (base_url, requests) = mock_server(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"model unavailable for test-openai-api-key"}}"#,
+        );
+        let client = client_for(base_url);
+
+        let error = client
+            .complete_text(None, &[Message::user("hello")])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("OpenAI API 400"));
+        assert!(error.contains("invalid_request_error"));
+        assert!(error.contains("[REDACTED]"));
+        assert!(!error.contains(TEST_API_KEY));
+        assert!(requests.recv().unwrap().has_bearer_authorization);
     }
 }

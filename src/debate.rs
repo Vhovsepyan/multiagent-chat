@@ -462,6 +462,52 @@ VERDICT: APPROVED"],
         assert_eq!(outcome.transcript.turns[1].speaker, Speaker::Critic);
     }
 
+    #[tokio::test]
+    async fn openai_can_serve_as_the_proposer() {
+        let proposer = ScriptedAgent::new(ChatProvider::OpenAI, &["an OpenAI proposal"]);
+        let critic = ScriptedAgent::new(
+            ChatProvider::Gemini,
+            &["REASON: complete\nVERDICT: APPROVED"],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 1).await;
+
+        assert!(outcome.approved);
+        assert_eq!(proposer.provider(), ChatProvider::OpenAI);
+        assert_eq!(proposer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_can_serve_as_the_critic() {
+        let proposer = ScriptedAgent::new(ChatProvider::Gemini, &["a Gemini proposal"]);
+        let critic = ScriptedAgent::new(
+            ChatProvider::OpenAI,
+            &["REASON: complete\nVERDICT: APPROVED"],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 1).await;
+
+        assert!(outcome.approved);
+        assert_eq!(critic.provider(), ChatProvider::OpenAI);
+        assert_eq!(critic.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_openai_and_anthropic_debate_flow_remains_provider_agnostic() {
+        let proposer = ScriptedAgent::new(ChatProvider::OpenAI, &["an OpenAI proposal"]);
+        let critic = ScriptedAgent::new(
+            ChatProvider::Anthropic,
+            &["REASON: complete\nVERDICT: APPROVED"],
+        );
+
+        let outcome = debate_with(&proposer, &critic, 1).await;
+
+        assert!(outcome.approved);
+        assert_eq!(outcome.transcript.turns.len(), 2);
+        assert_eq!(proposer.provider(), ChatProvider::OpenAI);
+        assert_eq!(critic.provider(), ChatProvider::Anthropic);
+    }
+
     /// NEEDS_WORK sends the review back and the second round sees it, which is
     /// what proves the two agents share one transcript (DP-1).
     #[tokio::test]

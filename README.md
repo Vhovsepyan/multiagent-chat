@@ -2,7 +2,7 @@
 
 A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace.
 
-The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (Gemini, Anthropic, or OpenAI); the worker uses a configured coding tool and model (currently Claude Code). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
+The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (Gemini, Anthropic, or OpenAI); the worker uses a configured coding tool and model (Claude Code or Codex). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
 
 Multiagent Chat supports four task kinds:
 
