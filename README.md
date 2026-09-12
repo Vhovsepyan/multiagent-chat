@@ -85,6 +85,12 @@ output and **Commit after each successful milestone**. A valid safe destination
 folder name is required; temporary-only output is refused. Nothing is pushed
 automatically; publication is a separate, explicitly confirmed action.
 
+Before a take-home project is persisted, completed, or published, the
+correctness gate requires every acceptance criterion to be `PASSED`, every
+milestone to have passed verification and critic review, and no failed
+verification. A blocked gate records its reason in the task audit and evidence
+instead of presenting a partial delivery as complete.
+
 Its task page includes a completion checklist derived from recorded task state:
 implementation, verification, acceptance review, final critic review,
 documentation, evidence-export availability, and retained Git history are each

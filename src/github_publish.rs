@@ -207,6 +207,9 @@ fn inspect(task: &Task, limits: &ExecutionLimits) -> Result<RepositorySnapshot> 
     if task.status != crate::task::TaskStatus::Completed || task.result.is_none() {
         bail!("GitHub publishing requires a completed task result");
     }
+    if let Some(reason) = task.take_home_correctness_error() {
+        bail!("GitHub publishing blocked: {reason}");
+    }
     let root = repository_root(task)?;
     let metadata = fs::symlink_metadata(&root).context("could not inspect persisted project")?;
     if crate::repository_file::is_link(&metadata) || !metadata.is_dir() {
@@ -746,6 +749,24 @@ mod tests {
             fixture.remote_head().as_deref(),
             Some(preview.head_sha.as_str())
         );
+    }
+
+    #[test]
+    fn publication_preflight_rejects_an_incomplete_take_home_assignment() {
+        let fixture = Fixture::new("take-home-gate");
+        let mut task = fixture.task(Vec::new());
+        task.kind = crate::task::TaskKind::TakeHomeAssignment;
+        task.acceptance = vec![crate::acceptance::AcceptanceCriterion {
+            id: "AC-001".into(),
+            description: "Required behavior".into(),
+            status: crate::acceptance::CriterionStatus::Failed,
+            milestones: vec!["m1".into()],
+            evidence: Vec::new(),
+            blocking_findings: Vec::new(),
+        }];
+
+        let error = prepare(&task, &limits()).unwrap_err().to_string();
+        assert!(error.contains("take-home correctness gate"), "{error}");
     }
 
     #[test]

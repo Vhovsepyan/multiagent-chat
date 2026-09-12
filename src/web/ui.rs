@@ -926,6 +926,13 @@ fn event_html(
                 esc(error)
             ),
         )),
+        TaskEvent::TakeHomeCorrectnessBlocked { reason } => Some((
+            "build",
+            format!(
+                r#"<div class="notice err">Take-home correctness gate blocked finalization Â· {}</div>"#,
+                esc(reason)
+            ),
+        )),
         TaskEvent::GitHubPublishStarted {
             repository, branch, ..
         } => Some((

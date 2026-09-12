@@ -115,14 +115,20 @@ fn finish_run(
                     .manager
                     .get(id)
                     .is_some_and(|task| task.status == TaskStatus::Rejected);
-                (
-                    if rejected {
-                        TaskStatus::Rejected
-                    } else {
-                        TaskStatus::Completed
-                    },
-                    None,
-                )
+                if rejected {
+                    (TaskStatus::Rejected, None)
+                } else if let Some(reason) = state
+                    .manager
+                    .get(id)
+                    .and_then(|task| task.take_home_correctness_error())
+                {
+                    emitter.emit(TaskEvent::TakeHomeCorrectnessBlocked {
+                        reason: reason.clone(),
+                    });
+                    (TaskStatus::Failed, Some(reason))
+                } else {
+                    (TaskStatus::Completed, None)
+                }
             }
         }
     };
@@ -140,6 +146,21 @@ fn finish_run(
         TaskStatus::Cancelled => {}
         _ => {}
     }
+}
+
+/// Prevent a take-home task from crossing a durable or terminal boundary while
+/// its recorded milestone and acceptance evidence is inconsistent.
+fn require_take_home_correctness(state: &AppState, id: TaskId, emitter: &Emitter) -> Result<()> {
+    let Some(task) = state.manager.get(id) else {
+        bail!("task disappeared before take-home correctness could be checked");
+    };
+    if let Some(reason) = task.take_home_correctness_error() {
+        emitter.emit(TaskEvent::TakeHomeCorrectnessBlocked {
+            reason: reason.clone(),
+        });
+        bail!("{reason}");
+    }
+    Ok(())
 }
 
 fn schedule_recovery_cleanup(state: &AppState, workspace: &TaskWorkspace, emitter: &Emitter) {
@@ -533,11 +554,6 @@ async fn run(
             // The loop already recorded why the milestone stopped.
             return Ok(());
         };
-        // Only a milestone that passed review and has automatic verification
-        // evidence (or an explicit critic PASS where no command exists) can
-        // satisfy what it owns, and only where no finding is still open.
-        acceptance.findings_cleared(&milestone.id);
-        acceptance.passed_after_review(&milestone.id, &review, &verification);
         let worker_summary = if review.iterations_used == 0 {
             "Worker completed successfully.".to_string()
         } else {
@@ -591,6 +607,11 @@ async fn run(
             }
             None => {}
         }
+        // Commit-per-milestone finalization is part of satisfying take-home
+        // criteria. A commit failure above leaves them Implemented instead of
+        // falsely recording a PASS.
+        acceptance.findings_cleared(&milestone.id);
+        acceptance.passed_after_review(&milestone.id, &review, &verification);
         emitter.emit(TaskEvent::MilestoneCompleted {
             id: milestone.id,
             order: milestone.order,
@@ -599,6 +620,7 @@ async fn run(
             worker_result_summary: worker_summary,
         });
     }
+    require_take_home_correctness(state, id, emitter)?;
     // Task 0013: documentation is written BEFORE the result is captured, so it
     // is part of the diff the user reviews and of any persisted project.
     generate_documentation(
@@ -634,7 +656,7 @@ async fn run(
             emitter.notice("task cancelled before the project was persisted");
             return Ok(());
         }
-        persist_project(state, emitter, destination, workspace_ref).await?;
+        persist_project(state, id, emitter, destination, workspace_ref).await?;
     }
     Ok(())
 }
@@ -661,10 +683,12 @@ fn persistent_destination(state: &AppState, task: &Task) -> Result<Option<Persis
 /// a completed persistent result when the project did not actually reach it.
 async fn persist_project(
     state: &AppState,
+    id: TaskId,
     emitter: &Emitter,
     destination: &PersistentDestination,
     workspace: &TaskWorkspace,
 ) -> Result<()> {
+    require_take_home_correctness(state, id, emitter)?;
     emitter.emit(TaskEvent::ProjectPersistenceStarted {
         destination: destination.display(),
     });
@@ -2100,6 +2124,26 @@ mod persistent_output_tests {
             .unwrap()
     }
 
+    fn take_home_project(state: &AppState, destination: &str) -> Task {
+        state
+            .manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::TakeHomeAssignment,
+                    title: "Candidate portal".into(),
+                    description: "Build the requested assignment".into(),
+                    project_id: None,
+                    technology: Some(TechStack::Rust),
+                    output: None,
+                    destination: Some(destination.into()),
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap()
+    }
+
     fn workspace_with_project(state: &AppState, task: &Task) -> TaskWorkspace {
         let workspace = state
             .workspaces
@@ -2153,7 +2197,7 @@ mod persistent_output_tests {
             .expect("a persistent task resolves a destination");
         let workspace = workspace_with_project(&state, &task);
 
-        persist_project(&state, &emitter, &destination, &workspace)
+        persist_project(&state, task.id, &emitter, &destination, &workspace)
             .await
             .unwrap();
         finish_run(&state, task.id, &emitter, Some(&workspace), Ok(()));
@@ -2184,6 +2228,88 @@ mod persistent_output_tests {
             "{report}"
         );
         assert!(report.contains("Persisted to"), "{report}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_take_home_criterion_blocks_persistence_and_is_audited() {
+        let (state, root) = crate::web::tests::test_state("take-home-persist-gate");
+        let task = take_home_project(&state, "blocked-project");
+        let emitter = state.manager.emitter(task.id);
+        emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
+            criteria: vec![AcceptanceCriterion {
+                id: "AC-001".into(),
+                description: "Required behavior".into(),
+                status: CriterionStatus::Failed,
+                milestones: vec!["m1".into()],
+                evidence: Vec::new(),
+                blocking_findings: Vec::new(),
+            }],
+        });
+        let destination = persistent_destination(&state, &task).unwrap().unwrap();
+        let workspace = workspace_with_project(&state, &task);
+
+        let error = persist_project(&state, task.id, &emitter, &destination, &workspace)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("AC-001 is FAILED"), "{error}");
+        assert!(!destination.path().exists());
+        finish_run(
+            &state,
+            task.id,
+            &emitter,
+            Some(&workspace),
+            Err(anyhow::anyhow!(error)),
+        );
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert_eq!(stored.persistence, None);
+        assert!(
+            !stored
+                .completion_checklist
+                .as_ref()
+                .unwrap()
+                .acceptance_criteria_reviewed
+        );
+        assert!(stored.history.iter().any(|recorded| matches!(
+            recorded.event,
+            TaskEvent::TakeHomeCorrectnessBlocked { .. }
+        )));
+        let report = final_report(&state, task.id);
+        assert!(report.contains("Final status: Failed"), "{report}");
+        assert!(
+            report.contains("`AC-001` — Required behavior — **FAILED**"),
+            "{report}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn terminal_take_home_gate_refuses_incomplete_success() {
+        let (state, root) = crate::web::tests::test_state("take-home-terminal-gate");
+        let task = take_home_project(&state, "terminal-blocked");
+        let emitter = state.manager.emitter(task.id);
+        emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
+            criteria: vec![AcceptanceCriterion {
+                id: "AC-001".into(),
+                description: "Required behavior".into(),
+                status: CriterionStatus::Implemented,
+                milestones: vec!["m1".into()],
+                evidence: Vec::new(),
+                blocking_findings: Vec::new(),
+            }],
+        });
+
+        finish_run(&state, task.id, &emitter, None, Ok(()));
+
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert!(stored.error.unwrap().contains("AC-001 is IMPLEMENTED"));
+        assert!(stored.history.iter().any(|recorded| matches!(
+            recorded.event,
+            TaskEvent::TakeHomeCorrectnessBlocked { .. }
+        )));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2245,7 +2371,7 @@ mod persistent_output_tests {
         std::fs::create_dir_all(destination.path()).unwrap();
         std::fs::write(destination.path().join("existing.txt"), "user work\n").unwrap();
 
-        let error = persist_project(&state, &emitter, &destination, &workspace)
+        let error = persist_project(&state, task.id, &emitter, &destination, &workspace)
             .await
             .unwrap_err();
         finish_run(&state, task.id, &emitter, Some(&workspace), Err(error));
@@ -2322,7 +2448,7 @@ mod persistent_output_tests {
         let destination = persistent_destination(&state, &task).unwrap().unwrap();
         let workspace = workspace_with_project(&state, &task);
 
-        persist_project(&state, &emitter, &destination, &workspace)
+        persist_project(&state, task.id, &emitter, &destination, &workspace)
             .await
             .expect("a published project is not a failed persistence");
         finish_run(&state, task.id, &emitter, Some(&workspace), Ok(()));

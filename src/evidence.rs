@@ -844,6 +844,10 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                 format!("Error: {}", markdown_inline(error)),
             ],
         ),
+        TaskEvent::TakeHomeCorrectnessBlocked { reason } => (
+            "Take-home correctness gate blocked finalization".into(),
+            vec![format!("Reason: {}", markdown_inline(reason))],
+        ),
         TaskEvent::GitHubPublishStarted {
             repository,
             branch,

@@ -611,6 +611,11 @@ pub enum TaskEvent {
         destination: String,
         error: String,
     },
+    /// A take-home run cannot be finalized because required delivery evidence
+    /// is incomplete.
+    TakeHomeCorrectnessBlocked {
+        reason: String,
+    },
 
     /// Explicit, user-confirmed publication lifecycle. These events contain
     /// repository identity and commit metadata only; never credentials or
@@ -957,6 +962,7 @@ impl TaskEvent {
                 clean(destination);
                 clean(error);
             }
+            Self::TakeHomeCorrectnessBlocked { reason } => clean(reason),
             Self::Build { chunk } => clean(chunk),
             Self::Notice { message } | Self::Warning { message } => clean(message),
             Self::Finished { error, .. } => {
@@ -1302,11 +1308,7 @@ impl Task {
                     .any(|recorded| matches!(recorded.event, TaskEvent::VerificationFailed { .. }));
             let acceptance_criteria_reviewed = !self.acceptance.is_empty()
                 && self.acceptance.iter().all(|criterion| {
-                    !matches!(
-                        criterion.status,
-                        crate::acceptance::CriterionStatus::Pending
-                            | crate::acceptance::CriterionStatus::Implemented
-                    )
+                    criterion.status == crate::acceptance::CriterionStatus::Passed
                 });
             let final_critic_review_complete = implementation_complete
                 && self.milestones.iter().all(|milestone| {
@@ -1337,6 +1339,73 @@ impl Task {
                 git_history_available,
             }
         })
+    }
+
+    /// The mandatory delivery gate for take-home assignments. Other task kinds
+    /// deliberately retain their established completion behavior.
+    pub fn take_home_correctness_error(&self) -> Option<String> {
+        if !self.kind.is_take_home_assignment() {
+            return None;
+        }
+        if self.acceptance.is_empty() {
+            return Some("take-home correctness gate blocked completion: no acceptance criteria were generated".into());
+        }
+        if let Some(criterion) = self
+            .acceptance
+            .iter()
+            .find(|criterion| criterion.status != crate::acceptance::CriterionStatus::Passed)
+        {
+            return Some(format!(
+                "take-home correctness gate blocked completion: {} is {}",
+                criterion.id,
+                criterion.status.label()
+            ));
+        }
+        if self.milestones.is_empty() {
+            return Some(
+                "take-home correctness gate blocked completion: no milestones were planned".into(),
+            );
+        }
+        if let Some(milestone) = self
+            .milestones
+            .iter()
+            .find(|milestone| milestone.status != MilestoneStatus::Passed)
+        {
+            return Some(format!(
+                "take-home correctness gate blocked completion: milestone {} is not complete",
+                milestone.order
+            ));
+        }
+        if let Some(milestone) = self.milestones.iter().find(|milestone| {
+            !milestone
+                .review
+                .as_ref()
+                .is_some_and(|review| review.status.is_pass())
+        }) {
+            return Some(format!(
+                "take-home correctness gate blocked completion: milestone {} has no passing critic review",
+                milestone.order
+            ));
+        }
+        let completed_verifications = self
+            .history
+            .iter()
+            .filter(|recorded| matches!(recorded.event, TaskEvent::VerificationCompleted { .. }))
+            .count();
+        if completed_verifications < self.milestones.len() {
+            return Some("take-home correctness gate blocked completion: required verification is incomplete".into());
+        }
+        if self
+            .history
+            .iter()
+            .any(|recorded| matches!(recorded.event, TaskEvent::VerificationFailed { .. }))
+        {
+            return Some(
+                "take-home correctness gate blocked completion: required verification failed"
+                    .into(),
+            );
+        }
+        None
     }
 
     /// What the models are actually asked about (DP-8).
@@ -3051,6 +3120,46 @@ mod tests {
         assert!(checklist.documentation_generated);
         assert!(checklist.evidence_export_available);
         assert!(checklist.git_history_available);
+        assert_eq!(
+            manager.get(task.id).unwrap().take_home_correctness_error(),
+            None
+        );
+    }
+
+    #[test]
+    fn take_home_correctness_gate_rejects_unresolved_delivery_state() {
+        let mut task = Task::from_request(
+            TaskRequest {
+                kind: TaskKind::TakeHomeAssignment,
+                title: "Candidate portal".into(),
+                description: "Build the requested assignment".into(),
+                project_id: None,
+                technology: Some(TechStack::Rust),
+                output: None,
+                destination: Some("candidate-portal".into()),
+                agents: None,
+                git_mode: None,
+            },
+            AgentSelection::compiled_defaults(),
+        )
+        .unwrap();
+        task.acceptance = vec![crate::acceptance::AcceptanceCriterion {
+            id: "AC-001".into(),
+            description: "Portal works".into(),
+            status: crate::acceptance::CriterionStatus::Deferred,
+            milestones: Vec::new(),
+            evidence: Vec::new(),
+            blocking_findings: Vec::new(),
+        }];
+
+        let error = task.take_home_correctness_error().unwrap();
+        assert!(error.contains("AC-001 is DEFERRED"), "{error}");
+        assert!(
+            !task
+                .take_home_completion_checklist()
+                .unwrap()
+                .acceptance_criteria_reviewed
+        );
     }
 
     #[test]
