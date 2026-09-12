@@ -69,11 +69,20 @@ pub fn plan_from_spec(
             continue;
         }
 
-        if let Some(heading) = line.trim_start().strip_prefix("## ") {
+        if !in_steps {
+            if let Some(heading) = trimmed_start.strip_prefix("## ") {
+                in_steps = heading.trim().eq_ignore_ascii_case("Steps");
+            }
+            continue;
+        }
+
+        // An indented `##` line is continuation or code content. Only a
+        // column-zero heading closes the Steps section.
+        if let Some(heading) = line.strip_prefix("## ") {
             in_steps = heading.trim().eq_ignore_ascii_case("Steps");
             continue;
         }
-        if !in_steps || line.trim().is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
 
@@ -233,6 +242,16 @@ mod tests {
     }
 
     #[test]
+    fn indented_heading_content_does_not_end_steps() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Add parser\n    ## This is indented code\n\t## This is a tab-indented continuation\n2. Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Add parser", "Add tests"]);
+    }
+
+    #[test]
     fn ignores_indented_continuations_and_nested_lists() {
         let plan = plan_from_spec(
             "## Steps\n1. Implement parser\n   Explain the parsing rules.\n   - Accept numbered entries\n   - Ignore nested bullets\n2. Add tests",
@@ -256,6 +275,16 @@ mod tests {
     fn next_level_two_section_ends_step_parsing() {
         let plan = plan_from_spec(
             "## Steps\n1. Implement parser\n## Notes\n- This is not a milestone",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Implement parser"]);
+    }
+
+    #[test]
+    fn a_top_level_notes_heading_ends_steps() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Implement parser\n## Notes\n2. This is not a milestone",
             &[],
         )
         .unwrap();
