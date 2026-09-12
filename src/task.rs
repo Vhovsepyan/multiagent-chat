@@ -26,6 +26,7 @@ use crate::execution_limits::{HistoryLimits, bounded_text};
 use crate::git::{GitMode, MilestoneCommit};
 use crate::milestone::{Milestone, MilestoneStatus};
 use crate::project::ProjectId;
+use crate::task_store::TaskStore;
 use crate::technology::{ProjectProfile, TechStack};
 use crate::verification::VerificationResult;
 
@@ -295,7 +296,7 @@ pub struct TaskResult {
 /// A take-home delivery checklist derived from recorded task state. It is
 /// intentionally evidence-facing: an item is never marked complete merely
 /// because this task kind selected the corresponding feature by default.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionChecklist {
     pub implementation_complete: bool,
     pub verification_complete: bool,
@@ -314,7 +315,7 @@ pub struct CompletionChecklist {
 ///
 /// `Serialize` renders these as `"debating"`, `"waiting_for_approval"` and so
 /// on, which is what the browser will switch the timeline UI on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Accepted, nothing started yet.
@@ -348,6 +349,13 @@ impl TaskStatus {
                 | TaskStatus::Cancelled
         )
     }
+
+    pub(crate) fn is_interrupted_active(self) -> bool {
+        matches!(
+            self,
+            Self::Debating | Self::GeneratingSpec | Self::Implementing
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +363,7 @@ impl TaskStatus {
 // ---------------------------------------------------------------------------
 
 /// Which part of a run caused a chat-agent call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStage {
     Debate,
@@ -368,7 +376,7 @@ pub enum AgentStage {
 ///
 /// `#[serde(tag = "type")]` puts a discriminator in the JSON, so the browser
 /// gets `{"type":"proposal","round":1,"text":"..."}` and can switch on `type`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskEvent {
     TaskCreated {
@@ -994,7 +1002,7 @@ impl TaskEvent {
 }
 
 /// Backend-authored metadata shared by every stored and streamed event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedEvent {
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
@@ -1076,6 +1084,18 @@ fn redact_credential_line(line: &str) -> String {
         let newline = if line.ends_with('\n') { "\n" } else { "" };
         return format!("[REDACTED authorization]{newline}");
     }
+    if line.split_whitespace().any(|word| {
+        word.split_once("://")
+            .is_some_and(|(_, authority_and_path)| {
+                authority_and_path
+                    .split_once('/')
+                    .map_or(authority_and_path, |(authority, _)| authority)
+                    .contains('@')
+            })
+    }) {
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        return format!("[REDACTED repository credential]{newline}");
+    }
     redact_token_prefixes(line)
 }
 
@@ -1138,7 +1158,7 @@ impl std::fmt::Display for DecisionError {
 ///
 /// DP-8: `title` and `description` are captured separately in the UI and joined
 /// into one topic string for the models — see `Task::topic`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub title: String,
@@ -1165,16 +1185,16 @@ pub struct Task {
     pub history: Vec<RecordedEvent>,
     /// Detailed agent/worker evidence is durable for this in-memory task but is
     /// deliberately omitted from ordinary task snapshots and the live UI.
-    #[serde(skip)]
+    #[serde(skip, default)]
     pub evidence: Vec<EvidenceRecord>,
     /// Repetitive UI output remains bounded independently from the audit log.
     pub log_tail: Vec<RecordedEvent>,
     pub discarded_log_events: usize,
-    #[serde(skip)]
+    #[serde(skip, default = "HistoryLimits::default")]
     history_limits: HistoryLimits,
-    #[serde(skip)]
+    #[serde(skip, default = "default_next_event_sequence")]
     next_event_sequence: u64,
-    #[serde(skip)]
+    #[serde(skip, default)]
     worker_output_truncated: bool,
     pub spec: Option<String>,
     pub error: Option<String>,
@@ -1191,8 +1211,12 @@ pub struct Task {
     /// not drift into a hard-coded success summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_checklist: Option<CompletionChecklist>,
-    #[serde(skip)]
+    #[serde(skip, default)]
     cancelled: bool,
+}
+
+fn default_next_event_sequence() -> u64 {
+    1
 }
 
 impl Task {
@@ -1668,7 +1692,7 @@ impl Task {
         )
     }
 
-    fn sanitize_for_export(&mut self, redactor: &AuditRedactor) {
+    pub(crate) fn sanitize_for_export(&mut self, redactor: &AuditRedactor) {
         let clean = |text: &mut String| *text = redactor.redact(text);
         clean(&mut self.title);
         clean(&mut self.description);
@@ -1752,6 +1776,67 @@ impl Task {
         events.sort_unstable_by_key(|event| event.sequence);
         events
     }
+
+    /// Rebuild the transient, bounded views from the append-only durable audit
+    /// files.  State itself comes from the atomically-written task snapshot;
+    /// replaying events here would make a partially-written audit log able to
+    /// change a completed task's outcome.
+    pub(crate) fn restore_durable_audit(
+        &mut self,
+        mut events: Vec<RecordedEvent>,
+        mut evidence: Vec<EvidenceRecord>,
+        history_limits: HistoryLimits,
+    ) {
+        events.sort_unstable_by_key(|record| record.sequence);
+        evidence.sort_unstable_by_key(|record| record.sequence);
+        self.history.clear();
+        self.log_tail.clear();
+        self.discarded_log_events = 0;
+        self.history_limits = history_limits;
+        self.worker_output_truncated = false;
+        self.next_event_sequence = 1;
+        for record in events {
+            self.next_event_sequence = self
+                .next_event_sequence
+                .max(record.sequence.saturating_add(1));
+            if matches!(&record.event, TaskEvent::Build { chunk } if chunk.contains(crate::execution_limits::TRUNCATED))
+            {
+                self.worker_output_truncated = true;
+            }
+            if record.event.log_text().is_some() {
+                self.log_tail.push(record);
+            } else {
+                self.history.push(record);
+            }
+        }
+        while self.log_tail.len() > self.history_limits.log_events
+            || self
+                .log_tail
+                .iter()
+                .filter_map(|record| record.event.log_text())
+                .map(str::len)
+                .sum::<usize>()
+                > self.history_limits.log_bytes
+        {
+            self.log_tail.remove(0);
+            self.discarded_log_events += 1;
+        }
+        for record in &evidence {
+            self.next_event_sequence = self
+                .next_event_sequence
+                .max(record.sequence.saturating_add(1));
+        }
+        self.evidence = evidence;
+        self.completion_checklist = self.take_home_completion_checklist();
+    }
+
+    pub(crate) fn durable_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.history.clear();
+        snapshot.log_tail.clear();
+        snapshot.evidence.clear();
+        snapshot
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,6 +1915,7 @@ struct Inner {
     redactor: AuditRedactor,
     /// One waker per task, used to unpark a pipeline sitting at Gate 2.
     gates: RwLock<HashMap<TaskId, Arc<Notify>>>,
+    store: Option<TaskStore>,
 }
 
 impl Inner {
@@ -1844,6 +1930,7 @@ impl Inner {
             tx,
             redactor: AuditRedactor::default(),
             gates: RwLock::new(HashMap::new()),
+            store: None,
         }
     }
 
@@ -1860,6 +1947,7 @@ impl Inner {
         if let Some(task) = tasks.get_mut(&id) {
             let event = event.sanitized(&self.redactor).bounded(self.history_limits);
             let recorded = task.record_event(event);
+            self.persist_event(task, &recorded);
             let _ = self.tx.send((id, recorded));
         }
     }
@@ -1867,7 +1955,24 @@ impl Inner {
     fn record_evidence(&self, id: TaskId, payload: EvidencePayload) {
         let mut tasks = self.tasks.write().expect("task registry lock poisoned");
         if let Some(task) = tasks.get_mut(&id) {
-            task.record_evidence(payload, &self.redactor);
+            let recorded = task.record_evidence(payload, &self.redactor);
+            self.persist_evidence(task, &recorded);
+        }
+    }
+
+    fn persist_event(&self, task: &Task, event: &RecordedEvent) {
+        if let Some(store) = &self.store {
+            store
+                .persist_event(task, event)
+                .expect("durable task event persistence failed");
+        }
+    }
+
+    fn persist_evidence(&self, task: &Task, evidence: &EvidenceRecord) {
+        if let Some(store) = &self.store {
+            store
+                .persist_evidence(task, evidence)
+                .expect("durable task evidence persistence failed");
         }
     }
 }
@@ -1902,6 +2007,41 @@ impl TaskManager {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Construct the production registry and restore validated task records.
+    /// A storage failure prevents startup rather than silently accepting work
+    /// that cannot be audited after a restart.
+    pub fn with_durable_history_limits_and_secrets(
+        history_limits: HistoryLimits,
+        secrets: impl IntoIterator<Item = String>,
+        runtime_root: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let redactor = AuditRedactor::new(secrets);
+        let store = TaskStore::open(runtime_root, redactor.clone())?;
+        let mut inner = Inner::new();
+        inner.history_limits = history_limits;
+        inner.redactor = redactor;
+        inner.store = Some(store.clone());
+        for mut task in store.load(history_limits)? {
+            if task.status.is_interrupted_active() {
+                let error =
+                    "task interrupted by application restart; manual recovery required".to_string();
+                let recorded = task.record_event(TaskEvent::Finished {
+                    status: TaskStatus::Failed,
+                    error: Some(error),
+                });
+                store.persist_event(&task, &recorded)?;
+            }
+            inner
+                .tasks
+                .get_mut()
+                .expect("new registry lock")
+                .insert(task.id, task);
+        }
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
     pub fn new() -> Self {
         TaskManager {
@@ -1961,6 +2101,11 @@ impl TaskManager {
         .sanitized(&self.inner.redactor)
         .bounded(self.inner.history_limits);
         task.record_event(created);
+        if let Some(store) = &self.inner.store {
+            store
+                .persist_new_task(&task)
+                .expect("durable task creation persistence failed");
+        }
         let mut tasks = self
             .inner
             .tasks
@@ -2026,6 +2171,7 @@ impl TaskManager {
         .sanitized(&self.inner.redactor)
         .bounded(self.inner.history_limits);
         let recorded = task.record_event(event);
+        self.inner.persist_event(task, &recorded);
         let _ = self.inner.tx.send((id, recorded));
         true
     }
@@ -2109,6 +2255,11 @@ impl TaskManager {
                         events.push(task.record_event(TaskEvent::SpecRejected));
                     }
                     task.decision = Some(decision);
+                    if let Some(store) = &self.inner.store {
+                        store
+                            .persist_events(task, &events)
+                            .expect("durable task decision persistence failed");
+                    }
                     for event in &events {
                         let _ = self.inner.tx.send((id, event.clone()));
                     }
@@ -2161,6 +2312,7 @@ impl TaskManager {
                     .sanitized(&self.inner.redactor)
                     .bounded(self.inner.history_limits);
                 let recorded = task.record_event(event);
+                self.inner.persist_event(task, &recorded);
                 let _ = self.inner.tx.send((id, recorded));
                 true
             }

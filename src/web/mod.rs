@@ -13,6 +13,7 @@ pub mod ui;
 #[cfg(test)]
 mod tests;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -45,8 +46,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let manager = task_manager(&config);
-        AppState {
+        Self::try_new(config).expect("durable task storage should be available")
+    }
+
+    pub fn try_new(config: Config) -> Result<Self> {
+        let manager = task_manager(&config)?;
+        Ok(AppState {
             manager,
             projects: ProjectStore::default(),
             workspaces: Arc::new(
@@ -55,12 +60,12 @@ impl AppState {
             ),
             catalogue: Arc::new(AgentCatalogue::from_config(&config)),
             config: Arc::new(config),
-        }
+        })
     }
 
     #[cfg(test)]
     pub fn with_workspace(config: Config, workspaces: Arc<dyn WorkspaceProvider>) -> Self {
-        let manager = task_manager(&config);
+        let manager = task_manager(&config).expect("durable task storage should be available");
         AppState {
             manager,
             projects: ProjectStore::default(),
@@ -71,8 +76,12 @@ impl AppState {
     }
 }
 
-fn task_manager(config: &Config) -> TaskManager {
-    TaskManager::with_history_limits_and_secrets(
+fn task_manager(config: &Config) -> Result<TaskManager> {
+    let runtime_root = config
+        .workspace_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".runtime"));
+    TaskManager::with_durable_history_limits_and_secrets(
         config.execution.history,
         [
             config.gemini_api_key.clone(),
@@ -80,6 +89,7 @@ fn task_manager(config: &Config) -> TaskManager {
         ]
         .into_iter()
         .flatten(),
+        runtime_root,
     )
 }
 
@@ -171,7 +181,7 @@ async fn require_local_origin(
 /// Bind the port and serve until interrupted.
 pub async fn serve(config: Config) -> Result<()> {
     let port = config.port;
-    let state = AppState::new(config);
+    let state = AppState::try_new(config)?;
     let app = router(state);
 
     let address = format!("127.0.0.1:{port}");

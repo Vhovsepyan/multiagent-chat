@@ -221,7 +221,17 @@ before events or detailed evidence enter task state. Prompts, responses, worker
 summaries, errors, and export metadata use the same redaction layer. Event
 metadata never includes API keys, environment snapshots, or authorization
 headers. This is defense in depth; task and evidence state are still lost when
-the process restarts.
+the process restarts only if the local `.runtime` task store is removed or its
+individual task record is corrupt. The store never contains credentials.
+
+Task state is durable under `.runtime/tasks/<task-id>/` (or under
+`WORKSPACE_ROOT/.runtime` when that compatibility root is configured). Each
+task has an atomic `task.json` state snapshot and append-only `events.jsonl` and
+`evidence.jsonl` audit files. Startup validates each task independently: a
+waiting approval gate remains waiting, while an interrupted active run is
+recorded as failed with a manual-recovery message and is never auto-resumed.
+Generated repositories remain in their existing persistent-output destination;
+the runtime store retains only task metadata and evidence.
 
 ## Evidence export
 
@@ -678,6 +688,7 @@ src/
   workflow.rs      task-kind-specific agent instructions
   verification.rs profile-aware command planning and execution
   task.rs          task state, recorded audit events, redaction, and ordering
+  task_store.rs    durable task snapshots and append-only audit/evidence files
   evidence.rs      detailed interaction records and deterministic evidence ZIP
   debate.rs        proposer/critic collaboration
   spec.rs          specification drafting and checking
@@ -694,15 +705,15 @@ src/
   web/             axum API, pipeline, SSE, and production UI
 ```
 
-Project/task stores remain in memory in this phase. The boundaries are designed for later external persistence and separate task execution; local container disk is not treated as durable application state.
+Project source registration remains in memory. Task state and evidence use the
+local durable runtime store described above; this is single-process local
+storage, not a shared or cloud-backed task queue.
 
 ## Current limitations
 
 - Only public GitHub repositories are supported; no OAuth or GitHub App authentication exists yet.
-- Projects and task history are lost when the process restarts.
-- Evidence retention is in memory and is lost on restart. Raw worker
-  stdout/stderr is intentionally not retained in the evidence transcript; the
-  existing bounded UI log and process capture remain separate.
+- Raw worker stdout/stderr is intentionally not retained in the evidence
+  transcript; the existing bounded UI log and process capture remain separate.
 - A persistent New Project can be explicitly published to an existing GitHub remote after completion, using the local Git credential helper/SSH agent. OAuth/App authentication, automatic repository creation, and unattended pushes are not implemented.
 - Persistent output requires a configured `PERSISTENT_OUTPUT_ROOT` (or `WORKSPACE_ROOT`); it cannot write anywhere else, and the generated project must contain no symlinks or junctions.
 - Workspaces use the server's temporary directory and are cleaned after execution unless failed result capture requires manual recovery.

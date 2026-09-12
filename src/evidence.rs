@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{ChatProvider, CodingTool};
 use crate::api::{Message, Role};
@@ -32,7 +32,7 @@ pub fn archive_filename(id: crate::task::TaskId) -> String {
     format!("task-{id}-evidence.zip")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceRole {
     Proposer,
@@ -48,7 +48,7 @@ impl EvidenceRole {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceStatus {
     Completed,
@@ -66,7 +66,7 @@ impl EvidenceStatus {
 
 /// A detailed evidence record. `sequence` and `timestamp` are assigned by the
 /// same locked task allocator used for `RecordedEvent`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceRecord {
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
@@ -74,7 +74,7 @@ pub struct EvidenceRecord {
     pub payload: EvidencePayload,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidencePayload {
     AgentInteraction {
@@ -110,13 +110,13 @@ pub enum EvidencePayload {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRole {
     Worker,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStage {
     Implementation,

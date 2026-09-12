@@ -34,6 +34,7 @@ mod spec;
 mod submission;
 mod target;
 mod task;
+mod task_store;
 mod technology;
 mod ui;
 mod verification;
