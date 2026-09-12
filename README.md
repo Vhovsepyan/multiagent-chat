@@ -233,6 +233,12 @@ recorded as failed with a manual-recovery message and is never auto-resumed.
 Generated repositories remain in their existing persistent-output destination;
 the runtime store retains only task metadata and evidence.
 
+Each snapshot carries the highest audit sequence it commits. Recovery accepts
+only the contiguous event/evidence prefix through that checkpoint, discards an
+uncommitted or torn final journal tail, and may use a newer flushed replacement
+snapshot when its checkpoint is complete. A malformed record before the final
+journal line causes that task alone to be skipped.
+
 ## Evidence export
 
 Each task retains a detailed evidence stream separately from `history` and the

@@ -1837,6 +1837,10 @@ impl Task {
         snapshot.evidence.clear();
         snapshot
     }
+
+    pub(crate) fn durable_sequence(&self) -> u64 {
+        self.next_event_sequence.saturating_sub(1)
+    }
 }
 
 // ---------------------------------------------------------------------------

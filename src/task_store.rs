@@ -6,10 +6,11 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::evidence::EvidenceRecord;
@@ -20,6 +21,16 @@ const TASKS_DIRECTORY: &str = "tasks";
 const SNAPSHOT: &str = "task.json";
 const EVENTS: &str = "events.jsonl";
 const EVIDENCE: &str = "evidence.jsonl";
+
+/// A checkpoint couples a task-state snapshot to the exact prefix of the two
+/// append-only journals which produced it.  Journal entries past this sequence
+/// are an uncommitted crash tail, never state to replay onto an older snapshot.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotFile {
+    version: u8,
+    committed_sequence: u64,
+    task: Task,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TaskStore {
@@ -87,15 +98,6 @@ impl TaskStore {
     }
 
     fn load_one(&self, id: TaskId, directory: &Path, limits: HistoryLimits) -> Result<Task> {
-        let snapshot_path = self.recoverable_snapshot_path(directory)?;
-        let mut task: Task = serde_json::from_reader(
-            File::open(&snapshot_path)
-                .with_context(|| format!("missing {}", snapshot_path.display()))?,
-        )
-        .context("invalid task snapshot JSON")?;
-        if task.id != id {
-            bail!("snapshot id does not match its directory");
-        }
         let event_path = directory.join(EVENTS);
         if !event_path.is_file() {
             bail!("missing required event audit file");
@@ -103,46 +105,125 @@ impl TaskStore {
         let events = self.read_jsonl::<RecordedEvent>(&event_path)?;
         let evidence = self.read_jsonl::<EvidenceRecord>(&directory.join(EVIDENCE))?;
         validate_audit_order(&events, &evidence)?;
+        let (mut task, committed_sequence) =
+            self.select_snapshot(id, directory, &events, &evidence)?;
+        let events: Vec<RecordedEvent> = events
+            .into_iter()
+            .filter(|record| record.sequence <= committed_sequence)
+            .collect();
+        let evidence: Vec<EvidenceRecord> = evidence
+            .into_iter()
+            .filter(|record| record.sequence <= committed_sequence)
+            .collect();
+        self.reconcile_journals(directory, &events, &evidence)?;
         task.restore_durable_audit(events, evidence, limits);
         Ok(task)
+    }
+
+    fn select_snapshot(
+        &self,
+        id: TaskId,
+        directory: &Path,
+        events: &[RecordedEvent],
+        evidence: &[EvidenceRecord],
+    ) -> Result<(Task, u64)> {
+        let mut candidates = self.snapshot_candidates(directory)?;
+        candidates.sort_by_key(|(sequence, _, _)| *sequence);
+        while let Some((committed_sequence, task, _path)) = candidates.pop() {
+            let committed_sequence = if committed_sequence == 0 {
+                events
+                    .iter()
+                    .map(|record| record.sequence)
+                    .chain(evidence.iter().map(|record| record.sequence))
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                committed_sequence
+            };
+            if task.id == id && audit_prefix_is_complete(committed_sequence, events, evidence) {
+                return Ok((task, committed_sequence));
+            }
+        }
+        bail!("no snapshot matches a complete committed audit prefix")
     }
 
     fn read_jsonl<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<Vec<T>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        BufReader::new(File::open(path)?)
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.as_ref().is_ok_and(|line| !line.trim().is_empty()))
-            .map(|(index, line)| {
-                let line = line?;
-                serde_json::from_str(&line)
-                    .with_context(|| format!("invalid JSONL record at line {}", index + 1))
-            })
-            .collect()
+        let bytes = fs::read(path)?;
+        let ends_with_newline = bytes.ends_with(b"\n");
+        let lines = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        for (index, raw) in lines.iter().enumerate() {
+            let is_final = index + 1 == lines.len() && !ends_with_newline;
+            let text = std::str::from_utf8(raw)
+                .with_context(|| format!("invalid UTF-8 JSONL record at line {}", index + 1))?
+                .trim();
+            if text.is_empty() {
+                continue;
+            }
+            match serde_json::from_str(text) {
+                Ok(record) => records.push(record),
+                // A crash during append leaves an unterminated last line. Its
+                // prior complete records are still a valid journal prefix.
+                Err(_) if is_final => break,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("invalid JSONL record at line {}", index + 1));
+                }
+            }
+        }
+        Ok(records)
     }
 
-    /// On Windows replacing a destination may briefly require removing it
-    /// first.  The flushed temporary snapshot is therefore also a recovery
-    /// candidate, so that window never loses the only usable task state.
-    fn recoverable_snapshot_path(&self, directory: &Path) -> Result<PathBuf> {
-        let snapshot = directory.join(SNAPSHOT);
-        if snapshot.is_file() {
-            return Ok(snapshot);
-        }
-        let mut candidates = fs::read_dir(directory)?
+    /// The normal snapshot and every flushed replacement temporary file are
+    /// candidates.  This specifically covers Windows' remove-then-rename
+    /// window: a newer temp is selected only when its journal checkpoint is
+    /// complete, otherwise the older intact snapshot remains authoritative.
+    fn snapshot_candidates(&self, directory: &Path) -> Result<Vec<(u64, Task, PathBuf)>> {
+        let paths = fs::read_dir(directory)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
                 path.file_name().is_some_and(|name| {
                     let name = name.to_string_lossy();
-                    name.starts_with(&format!(".{SNAPSHOT}.")) && name.ends_with(".tmp")
+                    name == SNAPSHOT
+                        || (name.starts_with(&format!(".{SNAPSHOT}.")) && name.ends_with(".tmp"))
                 })
             })
             .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.pop().context("missing task snapshot")
+        let mut snapshots = Vec::new();
+        for path in paths {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let snapshot = match serde_json::from_slice::<SnapshotFile>(&bytes) {
+                Ok(snapshot) => Some(snapshot),
+                // Version 1 snapshots had no checkpoint. They are accepted as
+                // a one-time migration only when their complete journal is a
+                // contiguous audit prefix.
+                Err(_) => serde_json::from_slice::<Task>(&bytes)
+                    .ok()
+                    .map(|task| SnapshotFile {
+                        version: 0,
+                        committed_sequence: 0,
+                        task,
+                    }),
+            };
+            if let Some(snapshot) = snapshot {
+                snapshots.push((snapshot.committed_sequence, snapshot.task, path));
+            }
+        }
+        if snapshots.is_empty() {
+            bail!("missing valid task snapshot");
+        }
+        // A legacy snapshot commits the whole validated journal, calculated
+        // after parsing rather than guessed from the task JSON.
+        Ok(snapshots)
     }
 
     fn append_json<T: serde::Serialize>(&self, path: &Path, value: &T) -> Result<()> {
@@ -155,6 +236,31 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Recovery is the sole exception to append-only operation.  Once a
+    /// checkpoint selects a prefix, replace each journal with that exact valid
+    /// prefix so a later append cannot follow a torn or uncommitted tail.
+    fn reconcile_journals(
+        &self,
+        directory: &Path,
+        events: &[RecordedEvent],
+        evidence: &[EvidenceRecord],
+    ) -> Result<()> {
+        self.replace_jsonl(&directory.join(EVENTS), events)?;
+        self.replace_jsonl(&directory.join(EVIDENCE), evidence)
+    }
+
+    fn replace_jsonl<T: serde::Serialize>(&self, destination: &Path, values: &[T]) -> Result<()> {
+        let temporary = destination.with_extension(format!("jsonl.{}.tmp", Uuid::new_v4()));
+        let mut file = File::create(&temporary)?;
+        for value in values {
+            serde_json::to_writer(&mut file, value)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, destination)
+    }
+
     fn write_snapshot(&self, task: &Task) -> Result<()> {
         let directory = self.task_directory(task.id);
         fs::create_dir_all(&directory)?;
@@ -163,7 +269,14 @@ impl TaskStore {
         let mut file = File::create(&temporary)?;
         let mut snapshot = task.durable_snapshot();
         snapshot.sanitize_for_export(&self.redactor);
-        serde_json::to_writer(&mut file, &snapshot)?;
+        serde_json::to_writer(
+            &mut file,
+            &SnapshotFile {
+                version: 1,
+                committed_sequence: task.durable_sequence(),
+                task: snapshot,
+            },
+        )?;
         file.sync_all()?;
         drop(file);
         replace_file(&temporary, &destination)?;
@@ -199,6 +312,22 @@ fn validate_audit_order(events: &[RecordedEvent], evidence: &[EvidenceRecord]) -
         last_evidence = record.sequence;
     }
     Ok(())
+}
+
+fn audit_prefix_is_complete(
+    committed_sequence: u64,
+    events: &[RecordedEvent],
+    evidence: &[EvidenceRecord],
+) -> bool {
+    let mut sequences = events
+        .iter()
+        .map(|record| record.sequence)
+        .chain(evidence.iter().map(|record| record.sequence))
+        .filter(|sequence| *sequence <= committed_sequence)
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    sequences.len() == committed_sequence as usize
+        && sequences.iter().copied().eq(1..=committed_sequence)
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
@@ -240,6 +369,26 @@ mod tests {
             path,
         )
         .unwrap()
+    }
+
+    fn task_directory(root: &Path, id: TaskId) -> PathBuf {
+        root.join(TASKS_DIRECTORY).join(id.to_string())
+    }
+
+    fn worker_evidence() -> EvidencePayload {
+        EvidencePayload::WorkerExecution {
+            role: WorkerRole::Worker,
+            stage: WorkerStage::Implementation,
+            milestone_id: None,
+            milestone_title: None,
+            tool: CodingTool::Codex,
+            model: "model".into(),
+            instruction: "safe evidence".into(),
+            summary: "completed".into(),
+            status: EvidenceStatus::Completed,
+            duration_ms: 1,
+            truncated: false,
+        }
     }
 
     #[test]
@@ -294,19 +443,7 @@ mod tests {
                 published_at: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now()),
             },
         });
-        emitter.record_evidence(EvidencePayload::WorkerExecution {
-            role: WorkerRole::Worker,
-            stage: WorkerStage::Implementation,
-            milestone_id: None,
-            milestone_title: None,
-            tool: CodingTool::Codex,
-            model: "model".into(),
-            instruction: "safe evidence".into(),
-            summary: "completed".into(),
-            status: EvidenceStatus::Completed,
-            duration_ms: 1,
-            truncated: false,
-        });
+        emitter.record_evidence(worker_evidence());
         emitter.emit(TaskEvent::TaskCompleted);
         let before = manager.get(task.id).unwrap();
         let audit = before
@@ -406,6 +543,121 @@ mod tests {
         let restored = new_manager(&root);
         assert!(restored.get(good.id).is_some());
         assert_eq!(restored.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_snapshot_discards_uncommitted_event_tail_and_reuses_its_sequence() {
+        let root = root("stale-snapshot");
+        let manager = new_manager(&root);
+        let task = manager.create("checkpoint", "event", "legacy");
+        let directory = task_directory(&root, task.id);
+        let old_snapshot = fs::read(directory.join(SNAPSHOT)).unwrap();
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        fs::write(directory.join(SNAPSHOT), old_snapshot).unwrap();
+        drop(manager);
+
+        let restored = new_manager(&root);
+        assert_eq!(restored.get(task.id).unwrap().status, TaskStatus::Created);
+        restored.emitter(task.id).notice("new committed event");
+        let restored = new_manager(&root);
+        let task = restored.get(task.id).unwrap();
+        assert_eq!(
+            task.display_history()
+                .into_iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_temporary_snapshot_wins_when_its_checkpoint_is_complete() {
+        let root = root("temporary-snapshot");
+        let manager = new_manager(&root);
+        let task = manager.create("checkpoint", "temp", "legacy");
+        let directory = task_directory(&root, task.id);
+        let old_snapshot = fs::read(directory.join(SNAPSHOT)).unwrap();
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        let newer_snapshot = fs::read(directory.join(SNAPSHOT)).unwrap();
+        fs::write(
+            directory.join(format!(".{SNAPSHOT}.replacement.tmp")),
+            newer_snapshot,
+        )
+        .unwrap();
+        fs::write(directory.join(SNAPSHOT), old_snapshot).unwrap();
+        drop(manager);
+
+        let restored = new_manager(&root);
+        assert_eq!(
+            restored.get(task.id).unwrap().status,
+            TaskStatus::WaitingForApproval
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn torn_final_journal_records_are_dropped_without_losing_committed_state() {
+        let root = root("torn-journal");
+        let manager = new_manager(&root);
+        let task = manager.create("torn", "journal", "legacy");
+        let directory = task_directory(&root, task.id);
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        manager.emitter(task.id).record_evidence(worker_evidence());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(EVENTS))
+            .unwrap()
+            .write_all(b"{\"sequence\":")
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(EVIDENCE))
+            .unwrap()
+            .write_all(b"{\"sequence\":")
+            .unwrap();
+        drop(manager);
+
+        let restored = new_manager(&root);
+        let task = restored.get(task.id).unwrap();
+        assert_eq!(task.status, TaskStatus::WaitingForApproval);
+        assert_eq!(task.evidence.len(), 1);
+        restored.emitter(task.id).notice("after torn tails");
+        assert_eq!(
+            restored
+                .get(task.id)
+                .unwrap()
+                .display_history()
+                .last()
+                .unwrap()
+                .sequence,
+            4
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_middle_journal_record_skips_only_that_task() {
+        let root = root("middle-corruption");
+        let manager = new_manager(&root);
+        let task = manager.create("corrupt", "middle", "legacy");
+        let directory = task_directory(&root, task.id);
+        let created = fs::read(directory.join(EVENTS)).unwrap();
+        fs::write(
+            directory.join(EVENTS),
+            [created, b"not json\n".to_vec(), b"{}\n".to_vec()].concat(),
+        )
+        .unwrap();
+        drop(manager);
+
+        assert!(new_manager(&root).get(task.id).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }
