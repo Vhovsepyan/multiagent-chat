@@ -58,31 +58,60 @@ pub fn plan_from_spec(
     verification: &[VerificationCommand],
 ) -> Result<Vec<Milestone>, String> {
     let mut in_steps = false;
+    let mut fence: Option<char> = None;
     let mut titles = Vec::new();
     for line in specification.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("## ") {
-            in_steps = trimmed.eq_ignore_ascii_case("## Steps");
+        let trimmed_start = line.trim_start();
+        if let Some(open) = fence {
+            if fenced_delimiter(trimmed_start).is_some_and(|delimiter| delimiter == open) {
+                fence = None;
+            }
             continue;
         }
-        if !in_steps || trimmed.is_empty() {
+
+        if let Some(heading) = line.trim_start().strip_prefix("## ") {
+            in_steps = heading.trim().eq_ignore_ascii_case("Steps");
             continue;
         }
-        let title = trimmed
+        if !in_steps || line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(delimiter) = fenced_delimiter(trimmed_start) {
+            fence = Some(delimiter);
+            continue;
+        }
+
+        // Markdown continuation text and nested lists are indented. Milestones
+        // are deliberately limited to list entries at the section's left edge.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+
+        let title = line
             .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("* "))
             .or_else(|| {
-                let dot = trimmed.find('.')?;
-                trimmed[..dot]
+                let dot = line.find('.')?;
+                line[..dot]
                     .trim()
                     .parse::<u32>()
                     .ok()
-                    .map(|_| &trimmed[dot + 1..])
+                    .map(|_| &line[dot + 1..])
             })
             .map(str::trim)
             .filter(|title| !title.is_empty())
-            .ok_or_else(|| format!("invalid milestone entry in ## Steps: {trimmed:?}"))?;
-        titles.push(title.to_string());
+            .map(str::to_string);
+
+        match title {
+            Some(title) => titles.push(title),
+            // A Steps section must begin with a real top-level list entry, but
+            // later prose belongs to the preceding Markdown list item.
+            None if titles.is_empty() => {
+                return Err(format!("invalid milestone entry in ## Steps: {line:?}"));
+            }
+            None => continue,
+        }
     }
     if titles.is_empty() {
         return Err("approved specification must contain a non-empty ## Steps section".into());
@@ -114,6 +143,13 @@ pub fn plan_from_spec(
         .collect())
 }
 
+fn fenced_delimiter(line: &str) -> Option<char> {
+    ["```", "~~~"].into_iter().find_map(|prefix| {
+        line.starts_with(prefix)
+            .then(|| prefix.chars().next().unwrap())
+    })
+}
+
 pub fn display_command(command: &VerificationCommand) -> String {
     std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
@@ -138,6 +174,12 @@ mod tests {
     }
 
     #[test]
+    fn plans_bullet_steps_in_order() {
+        let plan = plan_from_spec("## Steps\n- Add the model\n* Add tests", &[]).unwrap();
+        assert_eq!(titles(&plan), ["Add the model", "Add tests"]);
+    }
+
+    #[test]
     fn rejects_missing_steps_instead_of_using_a_fallback() {
         assert!(plan_from_spec("## Design\n- one thing", &[]).is_err());
     }
@@ -145,5 +187,95 @@ mod tests {
     #[test]
     fn rejects_malformed_steps() {
         assert!(plan_from_spec("## Steps\nnot a list item", &[]).is_err());
+    }
+
+    #[test]
+    fn ignores_fenced_commands_between_real_steps() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Change Kafka keying\n```bash\ncargo test\n```\n2. Add regression coverage",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            titles(&plan),
+            ["Change Kafka keying", "Add regression coverage"]
+        );
+    }
+
+    #[test]
+    fn ignores_fenced_yaml_and_nested_content() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Add CI workflow\n\n   ```yaml\n   jobs:\n     build:\n       steps:\n         - uses: actions/checkout@v4\n           with:\n             fetch-depth: 0\n   ```\n\n2. Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Add CI workflow", "Add tests"]);
+    }
+
+    #[test]
+    fn ignores_fenced_json_and_continues_after_the_block() {
+        let plan = plan_from_spec(
+            "## Steps\n- Add configuration\n  ~~~json\n  {\"workers\": [\"codex\"]}\n  ~~~\n- Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Add configuration", "Add tests"]);
+    }
+
+    #[test]
+    fn a_heading_inside_a_fenced_block_does_not_end_steps() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Add parser\n```markdown\n## This is code\n```\n2. Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Add parser", "Add tests"]);
+    }
+
+    #[test]
+    fn ignores_indented_continuations_and_nested_lists() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Implement parser\n   Explain the parsing rules.\n   - Accept numbered entries\n   - Ignore nested bullets\n2. Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Implement parser", "Add tests"]);
+    }
+
+    #[test]
+    fn ignores_explanatory_paragraphs_after_a_step() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Implement parser\nThis explains why the parser must preserve existing behavior.\n2. Add tests",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Implement parser", "Add tests"]);
+    }
+
+    #[test]
+    fn next_level_two_section_ends_step_parsing() {
+        let plan = plan_from_spec(
+            "## Steps\n1. Implement parser\n## Notes\n- This is not a milestone",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(titles(&plan), ["Implement parser"]);
+    }
+
+    #[test]
+    fn rejects_a_steps_section_without_top_level_entries() {
+        assert!(
+            plan_from_spec(
+                "## Steps\n  - Nested entry\n\n  Explanatory continuation",
+                &[]
+            )
+            .is_err()
+        );
+    }
+
+    fn titles(plan: &[Milestone]) -> Vec<&str> {
+        plan.iter()
+            .map(|milestone| milestone.title.as_str())
+            .collect()
     }
 }
