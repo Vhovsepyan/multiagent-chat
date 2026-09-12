@@ -16,11 +16,17 @@ use serde::{Deserialize, Serialize};
 pub enum ChatProvider {
     Gemini,
     Anthropic,
+    #[serde(rename = "openai")]
+    OpenAI,
 }
 
 impl ChatProvider {
     /// Every provider the build knows about, in UI order.
-    pub const ALL: [ChatProvider; 2] = [ChatProvider::Gemini, ChatProvider::Anthropic];
+    pub const ALL: [ChatProvider; 3] = [
+        ChatProvider::Gemini,
+        ChatProvider::Anthropic,
+        ChatProvider::OpenAI,
+    ];
 
     /// The wire/form value. Kept in one place so the API, the HTML form and the
     /// audit trail cannot drift apart.
@@ -28,6 +34,7 @@ impl ChatProvider {
         match self {
             ChatProvider::Gemini => "gemini",
             ChatProvider::Anthropic => "anthropic",
+            ChatProvider::OpenAI => "openai",
         }
     }
 
@@ -36,6 +43,7 @@ impl ChatProvider {
         match self {
             ChatProvider::Gemini => "Gemini",
             ChatProvider::Anthropic => "Anthropic",
+            ChatProvider::OpenAI => "OpenAI",
         }
     }
 
@@ -45,6 +53,7 @@ impl ChatProvider {
         match self {
             ChatProvider::Gemini => "GEMINI_API_KEY",
             ChatProvider::Anthropic => "ANTHROPIC_API_KEY",
+            ChatProvider::OpenAI => "OPENAI_API_KEY",
         }
     }
 
@@ -263,7 +272,10 @@ mod tests {
             serde_json::from_str::<ChatProvider>("\"gemini\"").unwrap(),
             ChatProvider::Gemini
         );
-        assert!(serde_json::from_str::<ChatProvider>("\"openai\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<ChatProvider>("\"openai\"").unwrap(),
+            ChatProvider::OpenAI
+        );
         assert_eq!(
             serde_json::from_str::<CodingTool>("\"codex\"").unwrap(),
             CodingTool::Codex

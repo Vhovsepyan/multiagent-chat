@@ -86,6 +86,7 @@ fn task_manager(config: &Config) -> Result<TaskManager> {
         [
             config.gemini_api_key.clone(),
             config.anthropic_api_key.clone(),
+            config.openai_api_key.clone(),
         ]
         .into_iter()
         .flatten(),

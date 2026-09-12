@@ -28,6 +28,8 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         execution: Default::default(),
         gemini_api_key: Some("test".into()),
         anthropic_api_key: Some("test".into()),
+        openai_api_key: None,
+        openai_base_url: "https://api.openai.com/v1".into(),
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
@@ -37,6 +39,8 @@ pub(super) fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         implementer_model: "test-worker-model".into(),
         gemini_models: vec!["test-model-fast".into()],
         anthropic_models: Vec::new(),
+        openai_model: "test-openai-model".into(),
+        openai_models: Vec::new(),
         claude_code_models: Vec::new(),
         codex_models: Vec::new(),
         codex_model: "test-codex-model".into(),
@@ -1087,6 +1091,8 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
         execution: Default::default(),
         gemini_api_key: Some("gemini-credential-must-not-leak".into()),
         anthropic_api_key: Some("anthropic-credential-must-not-leak".into()),
+        openai_api_key: Some("openai-credential-must-not-leak".into()),
+        openai_base_url: "https://api.openai.com/v1".into(),
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
@@ -1096,6 +1102,8 @@ fn secret_state(tag: &str) -> (AppState, std::path::PathBuf) {
         implementer_model: "test-worker-model".into(),
         gemini_models: vec!["test-model-fast".into()],
         anthropic_models: Vec::new(),
+        openai_model: "test-openai-model".into(),
+        openai_models: vec!["test-openai-fast".into()],
         claude_code_models: Vec::new(),
         codex_models: Vec::new(),
         codex_model: "test-codex-model".into(),
@@ -1127,6 +1135,11 @@ async fn agent_options_expose_models_but_never_credentials() {
     let options: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(options["chat_providers"][0]["id"], "gemini");
     assert_eq!(options["chat_providers"][1]["id"], "anthropic");
+    assert_eq!(options["chat_providers"][2]["id"], "openai");
+    assert_eq!(
+        options["chat_providers"][2]["models"],
+        json!(["test-openai-model", "test-openai-fast"])
+    );
     assert_eq!(options["coding_tools"][0]["id"], "claude_code");
     assert_eq!(options["coding_tools"][1]["id"], "codex");
     assert_eq!(
@@ -1185,6 +1198,30 @@ async fn creating_a_task_stores_the_selected_agents_per_role() {
     assert_eq!(stored.agents.proposer.model, "test-model-fast");
     assert_eq!(stored.agents.critic.model, "test-model");
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn creating_a_task_can_freeze_an_openai_chat_selection() {
+    let (state, root) = secret_state("openai-agent-select");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "new_project", "title": "OpenAI selection", "description": "freeze the provider",
+                "technology": "rust", "output": "reviewable_result",
+                "agents": {
+                    "proposer": {"provider": "openai", "model": "test-openai-fast"},
+                    "critic": {"provider": "anthropic", "model": "test-critic-model"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["agents"]["proposer"]["provider"], "openai");
+    assert_eq!(task["agents"]["proposer"]["model"], "test-openai-fast");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1261,8 +1298,14 @@ async fn invalid_agent_selections_are_rejected_rather_than_substituted() {
         // sent and what is accepted, so the client can fix the request.
         (
             "unknown-provider",
-            json!({"proposer": {"provider": "openai"}}),
-            vec!["proposer", "openai", "gemini", "anthropic"],
+            json!({"proposer": {"provider": "future_provider"}}),
+            vec![
+                "proposer",
+                "future_provider",
+                "gemini",
+                "anthropic",
+                "openai",
+            ],
         ),
         // 7: a worker tool this build does not serve.
         (
@@ -1434,7 +1477,7 @@ async fn the_form_defaults_blank_selectors_and_refuses_bad_ones() {
         .oneshot(post_form(
             "/ui/tasks",
             "kind=new_project&title=Renamer&description=Build+it&technology=rust&output=reviewable_result\
-             &proposer_provider=openai",
+             &proposer_provider=future_provider",
         ))
         .await
         .unwrap();
@@ -1496,6 +1539,8 @@ fn state_with_credentials(
         execution: Default::default(),
         gemini_api_key: gemini.then(|| "gemini-credential-must-not-leak".into()),
         anthropic_api_key: anthropic.then(|| "anthropic-credential-must-not-leak".into()),
+        openai_api_key: None,
+        openai_base_url: "https://api.openai.com/v1".into(),
         workspace_root: Some(root.clone()),
         persistent_output_root: Some(persistent_output_root(&root)),
         max_rounds: 1,
@@ -1505,6 +1550,8 @@ fn state_with_credentials(
         implementer_model: "test-worker-model".into(),
         gemini_models: Vec::new(),
         anthropic_models: Vec::new(),
+        openai_model: "test-openai-model".into(),
+        openai_models: Vec::new(),
         claude_code_models: Vec::new(),
         codex_models: Vec::new(),
         codex_model: "test-codex-model".into(),
@@ -1678,9 +1725,9 @@ async fn malformed_json_bodies_use_the_standard_error_response() {
             "unknown-provider",
             post(
                 "/api/tasks",
-                new_project_body(Some(json!({"proposer": {"provider": "openai"}}))),
+                new_project_body(Some(json!({"proposer": {"provider": "future_provider"}}))),
             ),
-            vec!["invalid request body", "provider", "openai"],
+            vec!["invalid request body", "provider", "future_provider"],
         ),
         (
             "wrong-type",

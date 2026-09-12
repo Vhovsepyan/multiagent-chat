@@ -32,6 +32,7 @@ pub use selection::{
 
 use crate::api::claude::ClaudeClient;
 use crate::api::gemini::GeminiClient;
+use crate::api::openai::OpenAiClient;
 use crate::codex::CodexAgent;
 use crate::config::Config;
 use crate::implementer::ClaudeCodeAgent;
@@ -65,6 +66,7 @@ pub fn chat_agent(selection: &ChatAgentConfig, config: &Config) -> Result<Box<dy
     match selection.provider {
         ChatProvider::Gemini => Ok(Box::new(GeminiClient::new(config, &selection.model)?)),
         ChatProvider::Anthropic => Ok(Box::new(ClaudeClient::new(config, &selection.model)?)),
+        ChatProvider::OpenAI => Ok(Box::new(OpenAiClient::new(config, &selection.model)?)),
     }
 }
 
@@ -85,6 +87,8 @@ pub(crate) fn test_config() -> Config {
         execution: Default::default(),
         gemini_api_key: Some("test".into()),
         anthropic_api_key: Some("test".into()),
+        openai_api_key: Some("test".into()),
+        openai_base_url: "https://api.openai.com/v1".into(),
         workspace_root: None,
         persistent_output_root: None,
         max_rounds: 1,
@@ -94,6 +98,8 @@ pub(crate) fn test_config() -> Config {
         implementer_model: "worker-model".into(),
         gemini_models: Vec::new(),
         anthropic_models: Vec::new(),
+        openai_model: "openai-model".into(),
+        openai_models: Vec::new(),
         claude_code_models: Vec::new(),
         codex_models: Vec::new(),
         codex_model: "codex-worker-model".into(),

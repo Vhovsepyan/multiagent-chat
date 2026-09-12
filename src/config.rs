@@ -21,6 +21,8 @@ pub struct Config {
     /// authenticates itself). A provider without its key is simply not offered.
     pub gemini_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: String,
     /// Folder that holds all of the user's projects. The repo for one run is
     /// chosen inside this folder at runtime — see `target.rs`.
     /// Optional compatibility setting for the original terminal workflow.
@@ -45,6 +47,8 @@ pub struct Config {
     /// The default above is always offered as well, so these lists only add.
     pub gemini_models: Vec<String>,
     pub anthropic_models: Vec<String>,
+    pub openai_model: String,
+    pub openai_models: Vec<String>,
     pub claude_code_models: Vec<String>,
     /// Models offered for the Codex worker tool.
     pub codex_models: Vec<String>,
@@ -66,6 +70,33 @@ pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 pub const DEFAULT_CRITIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_IMPLEMENTER_MODEL: &str = "claude-opus-4-8";
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.3-codex";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-sol";
+pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+];
+const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+];
+const DEFAULT_GEMINI_MODELS: &[&str] = &[
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+];
 const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const DEFAULT_PORT: u16 = 3000;
 
@@ -76,6 +107,7 @@ impl Config {
         match provider {
             crate::agent::ChatProvider::Gemini => self.gemini_api_key.as_deref(),
             crate::agent::ChatProvider::Anthropic => self.anthropic_api_key.as_deref(),
+            crate::agent::ChatProvider::OpenAI => self.openai_api_key.as_deref(),
         }
     }
 
@@ -163,6 +195,10 @@ impl Config {
             execution: crate::execution_limits::ExecutionLimits::load()?,
             gemini_api_key: credential("GEMINI_API_KEY"),
             anthropic_api_key: credential("ANTHROPIC_API_KEY"),
+            openai_api_key: credential("OPENAI_API_KEY"),
+            openai_base_url: optional("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
+                .trim_end_matches('/')
+                .to_string(),
             workspace_root,
             persistent_output_root,
             max_rounds,
@@ -170,10 +206,12 @@ impl Config {
             gemini_model: optional("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             critic_model: optional("CRITIC_MODEL", DEFAULT_CRITIC_MODEL),
             implementer_model: optional("IMPLEMENTER_MODEL", DEFAULT_IMPLEMENTER_MODEL),
-            gemini_models: model_list("GEMINI_MODELS"),
-            anthropic_models: model_list("ANTHROPIC_MODELS"),
-            claude_code_models: model_list("CLAUDE_CODE_MODELS"),
-            codex_models: model_list("CODEX_MODELS"),
+            gemini_models: model_list("GEMINI_MODELS", DEFAULT_GEMINI_MODELS),
+            anthropic_models: model_list("ANTHROPIC_MODELS", DEFAULT_ANTHROPIC_MODELS),
+            openai_model: optional("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+            openai_models: model_list("OPENAI_MODELS", DEFAULT_OPENAI_MODELS),
+            claude_code_models: model_list("CLAUDE_CODE_MODELS", &[]),
+            codex_models: model_list("CODEX_MODELS", &[]),
             codex_model: optional("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             permission_mode: optional("CLAUDE_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
             port,
@@ -184,13 +222,11 @@ impl Config {
 /// A comma-separated list of model names, e.g. `GEMINI_MODELS=a,b,c`.
 ///
 /// Blank entries are dropped rather than becoming an unselectable empty model.
-/// The provider default is added by the catalogue, so an unset variable simply
-/// means "one model, the configured default" (task 0005).
-fn model_list(name: &str) -> Vec<String> {
-    let Ok(raw) = env::var(name) else {
-        return Vec::new();
-    };
-    let mut models: Vec<String> = Vec::new();
+/// Built-in catalog entries are retained, and an environment variable may add
+/// further entries without a code change.
+fn model_list(name: &str, defaults: &[&str]) -> Vec<String> {
+    let raw = env::var(name).unwrap_or_default();
+    let mut models: Vec<String> = defaults.iter().map(|model| (*model).to_string()).collect();
     for model in raw.split(',') {
         let model = model.trim();
         if !model.is_empty() && !models.iter().any(|known| known == model) {
@@ -237,12 +273,14 @@ impl fmt::Debug for Config {
             .field("execution", &self.execution)
             .field("gemini_api_key", &redacted(&self.gemini_api_key))
             .field("anthropic_api_key", &redacted(&self.anthropic_api_key))
+            .field("openai_api_key", &redacted(&self.openai_api_key))
             .field("workspace_root", &self.workspace_root)
             .field("persistent_output_root", &self.persistent_output_root)
             .field("max_rounds", &self.max_rounds)
             .field("max_fix_iterations", &self.max_fix_iterations)
             .field("gemini_model", &self.gemini_model)
             .field("critic_model", &self.critic_model)
+            .field("openai_model", &self.openai_model)
             .field("implementer_model", &self.implementer_model)
             .field("codex_model", &self.codex_model)
             .field("permission_mode", &self.permission_mode)

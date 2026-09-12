@@ -10,6 +10,7 @@
 
 pub mod claude;
 pub mod gemini;
+pub mod openai;
 
 use std::time::Duration;
 

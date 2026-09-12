@@ -349,11 +349,15 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::acceptance::{AcceptanceCriterion, CriterionStatus};
-    use crate::agent::CodingTool;
+    use crate::agent::{
+        AgentSelection, ChatAgentConfig, ChatProvider, CodingAgentConfig, CodingTool,
+    };
     use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
     use crate::git::RepositoryStatus;
     use crate::milestone::{Milestone, MilestoneStatus};
-    use crate::task::{GitHubPublication, TaskEvent, TaskManager, TaskStatus};
+    use crate::task::{
+        GitHubPublication, OutputTarget, TaskEvent, TaskKind, TaskManager, TaskRequest, TaskStatus,
+    };
 
     fn root(name: &str) -> PathBuf {
         let path =
@@ -483,6 +487,44 @@ mod tests {
         let export =
             crate::evidence::export(&restored.evidence_snapshot(task.id).unwrap()).unwrap();
         assert_eq!(export.files.len(), 5);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restores_frozen_openai_selection_without_any_provider_configuration() {
+        let root = root("openai-selection");
+        let manager = new_manager(&root);
+        let task = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::NewProject,
+                    title: "OpenAI durable selection".into(),
+                    description: "Keep the resolved provider and model".into(),
+                    project_id: None,
+                    technology: Some(crate::technology::TechStack::Rust),
+                    output: Some(OutputTarget::ReviewableResult),
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection {
+                    proposer: ChatAgentConfig::new(ChatProvider::OpenAI, "gpt-5.6-sol"),
+                    critic: ChatAgentConfig::new(ChatProvider::Anthropic, "claude-sonnet-5"),
+                    worker: CodingAgentConfig::new(CodingTool::Codex, "gpt-5.3-codex"),
+                },
+            )
+            .unwrap();
+        drop(manager);
+
+        let restored = new_manager(&root);
+        let restored_task = restored.get(task.id).unwrap();
+        assert_eq!(restored_task.agents.proposer.provider, ChatProvider::OpenAI);
+        assert_eq!(restored_task.agents.proposer.model, "gpt-5.6-sol");
+        assert_eq!(
+            restored_task.agents.critic.provider,
+            ChatProvider::Anthropic
+        );
+        assert_eq!(restored_task.agents.worker.tool, CodingTool::Codex);
         fs::remove_dir_all(root).unwrap();
     }
 

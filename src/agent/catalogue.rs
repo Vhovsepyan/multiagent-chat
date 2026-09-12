@@ -69,6 +69,7 @@ impl AgentCatalogue {
             let (configured, default) = match provider {
                 ChatProvider::Gemini => (&config.gemini_models, &config.gemini_model),
                 ChatProvider::Anthropic => (&config.anthropic_models, &config.critic_model),
+                ChatProvider::OpenAI => (&config.openai_models, &config.openai_model),
             };
             if config.chat_credential(provider).is_some() {
                 chat.push((
@@ -438,6 +439,7 @@ mod tests {
         config.gemini_api_key = (provider == Some(ChatProvider::Gemini)).then(|| "key".into());
         config.anthropic_api_key =
             (provider == Some(ChatProvider::Anthropic)).then(|| "key".into());
+        config.openai_api_key = (provider == Some(ChatProvider::OpenAI)).then(|| "key".into());
         AgentCatalogue::from_config(&config)
     }
 
@@ -526,5 +528,33 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("GEMINI_API_KEY"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn openai_is_available_only_with_its_key_and_uses_its_model_list() {
+        let mut config = configured();
+        config.gemini_api_key = None;
+        config.anthropic_api_key = None;
+        config.openai_api_key = Some("key".into());
+        config.openai_model = "gpt-5.6-sol".into();
+        config.openai_models = vec!["gpt-6-astra".into()];
+        let catalogue = AgentCatalogue::from_config(&config);
+        let options = catalogue.chat_models(ChatProvider::OpenAI).unwrap();
+        assert_eq!(options.models, vec!["gpt-5.6-sol", "gpt-6-astra"]);
+        let selection = catalogue
+            .resolve(Some(&AgentSelectionRequest {
+                proposer: Some(ChatAgentRequest {
+                    provider: Some(ChatProvider::OpenAI),
+                    model: Some("gpt-6-astra".into()),
+                }),
+                critic: Some(ChatAgentRequest {
+                    provider: Some(ChatProvider::OpenAI),
+                    model: None,
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(selection.proposer.provider, ChatProvider::OpenAI);
+        assert_eq!(selection.critic.model, "gpt-5.6-sol");
     }
 }

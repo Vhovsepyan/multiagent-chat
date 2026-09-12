@@ -2,7 +2,7 @@
 
 A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace.
 
-The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (currently Gemini or Anthropic); the worker uses a configured coding tool and model (currently Claude Code). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
+The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (Gemini, Anthropic, or OpenAI); the worker uses a configured coding tool and model (currently Claude Code). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
 
 Multiagent Chat supports four task kinds:
 
@@ -19,7 +19,7 @@ GitHub public repositories are the initial existing-project source. Each task us
 - Git on `PATH` for repository-backed tasks.
 - Claude Code CLI on `PATH` for implementation.
 - An API key for each chat provider you want to use: `GEMINI_API_KEY` (Google AI
-  Studio) and/or `ANTHROPIC_API_KEY` (Anthropic). Neither is required to start
+  Studio), `ANTHROPIC_API_KEY` (Anthropic), and/or `OPENAI_API_KEY` (OpenAI). Neither is required to start
   the application; each one enables its own provider.
 - A Claude Code stored login for worker execution when `ANTHROPIC_API_KEY` is
   not configured. The worker does not require that key solely to run.
@@ -504,8 +504,8 @@ Three roles are configured independently per task:
 
 | Role | Kind | Currently supported |
 | --- | --- | --- |
-| Proposer | chat provider + model | Gemini, Anthropic |
-| Critic | chat provider + model | Gemini, Anthropic |
+| Proposer | chat provider + model | Gemini, Anthropic, OpenAI |
+| Critic | chat provider + model | Gemini, Anthropic, OpenAI |
 | Worker | coding tool + model | Claude Code |
 
 ### Provider availability
@@ -514,8 +514,10 @@ A chat provider is offered only when its own credential is configured:
 
 - Gemini is available when `GEMINI_API_KEY` is set.
 - Anthropic is available when `ANTHROPIC_API_KEY` is set.
+- OpenAI is available when `OPENAI_API_KEY` is set. It uses the Responses API at
+  `OPENAI_BASE_URL` (default `https://api.openai.com/v1`).
 
-The application starts with one key, both, or neither. `GET /api/agents` and the
+The application starts with any combination of these keys, including none. `GET /api/agents` and the
 task form list only the available providers, and a task that asks for an
 unavailable one is refused with a message naming the variable to set. An invalid
 selection is never silently replaced by a working one.
@@ -542,14 +544,14 @@ authentication and the configured `CODEX_MODEL` default (plus models listed in
 
 ### Models
 
-Each provider or tool offers its configured default model plus any extra models
-listed in `GEMINI_MODELS`, `ANTHROPIC_MODELS`, `CLAUDE_CODE_MODELS` and
-`CODEX_MODELS`
-(comma-separated). The role defaults remain `GEMINI_MODEL`, `CRITIC_MODEL` and
-`IMPLEMENTER_MODEL`/`CODEX_MODEL`, and a default is always offered by its
-provider/tool. Model
-names come from configuration; the application does not ask providers which
-models an account may use.
+Chat providers offer their built-in general-purpose catalog, their configured
+default, and any extra models listed in `GEMINI_MODELS`, `ANTHROPIC_MODELS`, or
+`OPENAI_MODELS` (comma-separated). Coding tools offer their configured default
+plus entries in `CLAUDE_CODE_MODELS` or `CODEX_MODELS`. The role defaults remain
+`GEMINI_MODEL`, `CRITIC_MODEL` and `IMPLEMENTER_MODEL`/`CODEX_MODEL`, and a
+default is always offered by its provider/tool. Model names come from
+configuration; the application does not ask providers which models an account
+may use.
 
 ### Choosing agents
 
