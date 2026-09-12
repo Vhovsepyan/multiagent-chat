@@ -137,7 +137,13 @@ impl OpenAiClient {
                         Role::Assistant => "assistant",
                     },
                     content: vec![InputText {
-                        kind: "input_text",
+                        // A prior assistant reply is a Responses API output
+                        // item reused as input on the next turn. The API
+                        // rejects `input_text` for that role.
+                        kind: match message.role {
+                            Role::User => "input_text",
+                            Role::Assistant => "output_text",
+                        },
                         text: &message.content,
                     }],
                 })
@@ -393,6 +399,10 @@ mod tests {
         assert_eq!(request.body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(request.body["input"][0]["content"][0]["text"], "first");
         assert_eq!(request.body["input"][1]["role"], "assistant");
+        assert_eq!(
+            request.body["input"][1]["content"][0]["type"],
+            "output_text"
+        );
         assert_eq!(request.body["input"][1]["content"][0]["text"], "second");
     }
 
