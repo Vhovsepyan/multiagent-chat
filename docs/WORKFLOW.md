@@ -141,9 +141,13 @@ Use this workflow when the user already has an approved Markdown
 specification. Validate it against the specification-format contract before
 creating a task. The imported document is the authoritative approved
 specification and is recorded as `user_provided`; do not start proposer or
-debate/specification-generation calls. Create the isolated new-project
-workspace and continue through the ordinary frozen critic/worker milestone,
-verification, critic/fix, result, evidence, persistence, and Git safeguards.
+debate/specification-generation calls. With no project selected, create an
+isolated new-project workspace and require a technology/output selection. With
+a registered Project selected, clone and inspect that repository using the same
+safe existing-project workspace path, retain its source revision/baseline, and
+use its detected profile. Both targets continue through the ordinary frozen
+critic/worker milestone, verification, critic/fix, result, evidence,
+persistence, and Git safeguards.
 
 ---
 

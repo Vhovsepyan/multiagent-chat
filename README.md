@@ -8,7 +8,7 @@ Multiagent Chat supports four task kinds:
 
 - New Project for a selected technology stack.
 - Take-home Assignment for a persistent, evidence-backed evaluation project.
-- Implement Existing Specification for a validated user-provided specification without a proposer debate.
+- Implement Existing Specification for a validated user-provided specification without a proposer debate, targeting either a selected stack for a new project or a registered repository.
 - Feature for a registered repository.
 - Bug Fix for a registered repository.
 
@@ -58,8 +58,8 @@ In the web UI:
 
 1. Register a public GitHub repository using `owner/repository` or its HTTPS URL when working on existing code.
 2. Create a New Project, Take-home Assignment, Implement Existing Specification, Feature, or Bug Fix task.
-3. Watch repository inspection and the proposer/critic debate through SSE.
-4. Review or edit the generated specification.
+3. Watch repository inspection and the proposer/critic debate through SSE, or direct specification implementation when that mode is selected.
+4. Review or edit a generated specification; direct specifications are already approved after validation.
 5. Approve implementation.
 6. Review implementation output, technology-aware verification, and the resulting working-tree diff/status.
 7. Select **Export Evidence** at any point to download the run's redacted evidence package.

@@ -110,7 +110,10 @@ impl RepositoryInspection {
 }
 
 pub fn requires_repository_inspection(kind: TaskKind) -> bool {
-    matches!(kind, TaskKind::Feature | TaskKind::BugFix)
+    matches!(
+        kind,
+        TaskKind::Feature | TaskKind::BugFix | TaskKind::ImplementExistingSpecification
+    )
 }
 
 pub fn inspect(root: &Path, request: InspectionRequest<'_>) -> Result<RepositoryInspection> {
@@ -512,5 +515,8 @@ mod tests {
         ));
         assert!(requires_repository_inspection(TaskKind::Feature));
         assert!(requires_repository_inspection(TaskKind::BugFix));
+        assert!(requires_repository_inspection(
+            TaskKind::ImplementExistingSpecification
+        ));
     }
 }

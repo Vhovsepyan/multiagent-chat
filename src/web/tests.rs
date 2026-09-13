@@ -425,6 +425,41 @@ async fn user_provided_specification_skips_the_approval_gate_and_is_audited() {
 }
 
 #[tokio::test]
+async fn user_provided_specification_can_target_a_registered_project() {
+    let (state, root) = test_state("existing-specification-project");
+    let project = state
+        .projects
+        .register(
+            Project::new(
+                "Existing service",
+                ProjectSource::github("openai/existing-service").unwrap(),
+                "main",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "implement_existing_specification",
+                "title": "Change existing service",
+                "project_id": project.id,
+                "specification": "# Specification\n\n## Goal\n\nChange it.\n\n## Requirements\n\n- Preserve behavior.\n\n## Acceptance Criteria\n\n- The change works.\n\n## Steps\n\n1. Implement the change\n\n## Verification\n\n- cargo test\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let task = body_json(response).await;
+    assert_eq!(task["project_id"], project.id.to_string());
+    assert!(task["technology"].is_null());
+    assert!(task["output"].is_null());
+    assert_eq!(task["specification_source"], "user_provided");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn malformed_user_provided_specification_is_rejected_before_task_creation() {
     let (state, root) = test_state("invalid-existing-specification");
     let response = router(state.clone())
@@ -2335,6 +2370,7 @@ fn task_creation_form_exposes_existing_specification_without_a_proposer_selector
     let form = include_str!("static/index.html");
     assert!(form.contains("value=\"implement_existing_specification\""));
     assert!(form.contains("name=\"specification\""));
+    assert!(form.contains("id=\"direct_target\""));
     assert!(form.contains("data-proposer-row"));
     assert!(form.contains("isExistingSpec"));
 }

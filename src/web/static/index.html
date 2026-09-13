@@ -37,6 +37,14 @@
         <option value="bug_fix">Bug Fix</option>
       </select>
 
+      <div id="direct-target-field" hidden>
+        <label for="direct_target">Specification target</label>
+        <select id="direct_target" onchange="syncTaskFields()">
+          <option value="new">New project</option>
+          <option value="existing">Registered project</option>
+        </select>
+      </div>
+
       <div id="existing-fields" hidden>
         <label for="project_id">Registered project</label>
         <select id="project_id" name="project_id" disabled
@@ -125,12 +133,15 @@
       const isNew = kind === 'new_project';
       const isTakeHome = kind === 'take_home_assignment';
       const isExistingSpec = kind === 'implement_existing_specification';
-      const createsProject = isNew || isTakeHome || isExistingSpec;
+      const directExisting = isExistingSpec && document.getElementById('direct_target').value === 'existing';
+      const createsProject = isNew || isTakeHome || (isExistingSpec && !directExisting);
+      const usesRegisteredProject = !createsProject || directExisting;
       const existing = document.getElementById('existing-fields');
       const fresh = document.getElementById('new-fields');
-      existing.hidden = createsProject;
+      document.getElementById('direct-target-field').hidden = !isExistingSpec;
+      existing.hidden = !usesRegisteredProject;
       fresh.hidden = !createsProject;
-      document.getElementById('project_id').disabled = createsProject;
+      document.getElementById('project_id').disabled = !usesRegisteredProject;
       document.getElementById('technology').disabled = !createsProject;
       document.getElementById('output').disabled = !createsProject;
       document.getElementById('specification-field').hidden = !isExistingSpec;
@@ -158,7 +169,8 @@
     // the request free of a field the server would have to reject.
     function syncOutputFields() {
       const kind = document.getElementById('kind').value;
-      const createsProject = kind === 'new_project' || kind === 'take_home_assignment' || kind === 'implement_existing_specification';
+      const directExisting = kind === 'implement_existing_specification' && document.getElementById('direct_target').value === 'existing';
+      const createsProject = kind === 'new_project' || kind === 'take_home_assignment' || (kind === 'implement_existing_specification' && !directExisting);
       const isTakeHome = kind === 'take_home_assignment';
       const persistent = document.getElementById('output').value === 'persistent_local_project';
       const field = document.getElementById('destination-field');

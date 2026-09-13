@@ -285,6 +285,7 @@ async fn run(
         None => None,
     };
 
+    let targets_new_project = task.kind.creates_new_project() && task.project_id.is_none();
     let (profile, repository_context) = if retry {
         *workspace = Some(reopen_workspace(state, &task).await?);
         let profile = task
@@ -293,52 +294,48 @@ async fn run(
             .ok_or_else(|| anyhow::anyhow!("retained task has no inspected project profile"))?;
         (profile, "Retained workspace from a failed approved build. Inspect existing partial work before making changes.".into())
     } else {
-        match task.kind {
-            TaskKind::NewProject
-            | TaskKind::TakeHomeAssignment
-            | TaskKind::ImplementExistingSpecification => {
-                let technology = task.technology.clone().ok_or_else(|| {
-                    anyhow::anyhow!("new project task has no selected technology")
-                })?;
-                (
-                    ProjectProfile::selected(technology),
-                    "New empty project".into(),
+        if targets_new_project {
+            let technology = task
+                .technology
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("new project task has no selected technology"))?;
+            (
+                ProjectProfile::selected(technology),
+                "New empty project".into(),
+            )
+        } else {
+            let project = project
+                .as_ref()
+                .expect("validated existing task has project");
+            *workspace = Some(prepare_existing(state, id, project).await?);
+            let prepared = workspace.as_ref().expect("workspace was prepared");
+            let path = prepared.path.clone();
+            let title = task.title.clone();
+            let description = task.description.clone();
+            let kind = task.kind;
+            let inspection = tokio::task::spawn_blocking(move || {
+                inspect(
+                    &path,
+                    InspectionRequest {
+                        kind,
+                        title: &title,
+                        description: &description,
+                    },
                 )
-            }
-            TaskKind::Feature | TaskKind::BugFix => {
-                let project = project
-                    .as_ref()
-                    .expect("validated existing task has project");
-                *workspace = Some(prepare_existing(state, id, project).await?);
-                let prepared = workspace.as_ref().expect("workspace was prepared");
-                let path = prepared.path.clone();
-                let title = task.title.clone();
-                let description = task.description.clone();
-                let kind = task.kind;
-                let inspection = tokio::task::spawn_blocking(move || {
-                    inspect(
-                        &path,
-                        InspectionRequest {
-                            kind,
-                            title: &title,
-                            description: &description,
-                        },
-                    )
-                })
-                .await??;
-                let profile = inspection.profile.clone();
-                state.projects.set_profile(project.id, profile.clone());
-                let context = inspection.prompt_context();
-                emitter.emit(TaskEvent::Inspection {
-                    profile: profile.clone(),
-                    source_revision: prepared.revision.clone(),
-                });
-                (profile, context)
-            }
+            })
+            .await??;
+            let profile = inspection.profile.clone();
+            state.projects.set_profile(project.id, profile.clone());
+            let context = inspection.prompt_context();
+            emitter.emit(TaskEvent::Inspection {
+                profile: profile.clone(),
+                source_revision: prepared.revision.clone(),
+            });
+            (profile, context)
         }
     };
 
-    if !retry && task.kind.creates_new_project() {
+    if !retry && targets_new_project {
         emitter.emit(TaskEvent::Inspection {
             profile: profile.clone(),
             source_revision: None,
@@ -577,11 +574,10 @@ async fn run(
         let (verification_profile, commands) = tokio::task::spawn_blocking({
             let root = workspace_ref.path.clone();
             let profile = profile.clone();
-            let kind = task.kind;
-            move || verification_plan_after_implementation(kind, &profile, &root)
+            move || verification_plan_after_implementation(targets_new_project, &profile, &root)
         })
         .await??;
-        if task.kind.creates_new_project() && verification_profile != profile {
+        if targets_new_project && verification_profile != profile {
             emitter.emit(TaskEvent::Inspection {
                 profile: verification_profile.clone(),
                 source_revision: None,
@@ -1212,11 +1208,11 @@ impl Acceptance<'_> {
 /// milestone plan is created. Re-detect after worker output exists, while
 /// preserving the requested stack if no concrete project metadata appears.
 fn verification_plan_after_implementation(
-    kind: TaskKind,
+    targets_new_project: bool,
     selected_profile: &ProjectProfile,
     root: &std::path::Path,
 ) -> Result<(ProjectProfile, Vec<VerificationCommand>)> {
-    let profile = if kind.creates_new_project() {
+    let profile = if targets_new_project {
         let detected = crate::technology::detect(root)?;
         if detected.build_tool == crate::technology::BuildTool::Custom {
             selected_profile.clone()
@@ -3846,8 +3842,7 @@ mod review_loop_tests {
             std::fs::create_dir(&root).unwrap();
             let requested = ProjectProfile::selected(crate::technology::TechStack::TypeScriptNode);
             let (_, before) =
-                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
-                    .unwrap();
+                verification_plan_after_implementation(true, &requested, &root).unwrap();
             assert!(before.is_empty());
 
             // This metadata is created by the worker, after the task's initial
@@ -3858,8 +3853,7 @@ mod review_loop_tests {
             )
             .unwrap();
             let (profile, commands) =
-                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
-                    .unwrap();
+                verification_plan_after_implementation(true, &requested, &root).unwrap();
             assert_eq!(profile.build_tool, crate::technology::BuildTool::Npm);
             assert_eq!(
                 commands
@@ -3877,8 +3871,7 @@ mod review_loop_tests {
             .unwrap();
             std::fs::create_dir(root.join("tests")).unwrap();
             let (profile, commands) =
-                verification_plan_after_implementation(TaskKind::NewProject, &requested, &root)
-                    .unwrap();
+                verification_plan_after_implementation(true, &requested, &root).unwrap();
             assert_eq!(profile.build_tool, crate::technology::BuildTool::Python);
             assert_eq!(
                 commands

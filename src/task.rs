@@ -186,9 +186,7 @@ impl TaskRequest {
             return Err("description cannot be empty".into());
         }
         match self.kind {
-            TaskKind::NewProject
-            | TaskKind::TakeHomeAssignment
-            | TaskKind::ImplementExistingSpecification => {
+            TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
                 if self.project_id.is_some() {
                     return Err(format!(
                         "{} must not reference an existing project",
@@ -226,14 +224,47 @@ impl TaskRequest {
                 {
                     return Err("take-home assignment requires persistent output".into());
                 }
-                if self.kind.uses_existing_specification() {
-                    let specification = self.specification.as_deref().unwrap_or_default();
-                    crate::spec::validate_format(specification)
-                        .map_err(|error| format!("invalid existing specification: {error:#}"))?;
-                } else if self.specification.is_some() {
+                if self.specification.is_some() {
                     return Err(
                         "only implement existing specification accepts a specification".into(),
                     );
+                }
+            }
+            TaskKind::ImplementExistingSpecification => {
+                let specification = self.specification.as_deref().unwrap_or_default().trim();
+                crate::spec::validate_format(specification)
+                    .map_err(|error| format!("invalid existing specification: {error:#}"))?;
+                if self.project_id.is_some() {
+                    if self.technology.is_some()
+                        || self.output.is_some()
+                        || self.destination.is_some()
+                    {
+                        return Err("an existing-project specification uses the registered project's technology and output".into());
+                    }
+                } else {
+                    if self.technology.is_none() {
+                        return Err("implement existing specification requires a technology for a new project".into());
+                    }
+                    match self.effective_output() {
+                        None => {
+                            return Err(
+                                "implement existing specification requires output configuration"
+                                    .into(),
+                            );
+                        }
+                        Some(OutputTarget::PersistentLocalProject) => {
+                            crate::persistence::validate_name(
+                                self.destination.as_deref().unwrap_or_default(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        }
+                        Some(OutputTarget::ReviewableResult) if self.destination.is_some() => {
+                            return Err(
+                                "a temporary review result has no destination folder".into()
+                            );
+                        }
+                        Some(OutputTarget::ReviewableResult) => {}
+                    }
                 }
             }
             TaskKind::Feature | TaskKind::BugFix => {
@@ -3732,6 +3763,85 @@ mod tests {
                 .unwrap_err()
                 .contains("invalid existing specification")
         );
+    }
+
+    #[test]
+    fn existing_specification_can_target_a_registered_project_without_new_project_fields() {
+        let specification = "\n# Specification\n\n## Goal\n\nChange it.\n\n## Requirements\n\n- Preserve it.\n\n## Acceptance Criteria\n\n- It works.\n\n## Steps\n\n1. Implement the change\n\n## Verification\n\n- cargo test\n";
+        let request = TaskRequest {
+            kind: TaskKind::ImplementExistingSpecification,
+            title: "Change registered project".into(),
+            description: String::new(),
+            specification: Some(specification.into()),
+            project_id: Some(Uuid::new_v4()),
+            technology: None,
+            output: None,
+            destination: None,
+            agents: None,
+            git_mode: None,
+        };
+        assert!(request.validate().is_ok());
+        let task = Task::from_request(request, AgentSelection::compiled_defaults()).unwrap();
+        assert_eq!(task.spec.as_deref(), Some(specification));
+        assert!(task.project_id.is_some());
+        assert!(task.technology.is_none());
+
+        let invalid = TaskRequest {
+            technology: Some(TechStack::Rust),
+            ..TaskRequest {
+                kind: TaskKind::ImplementExistingSpecification,
+                title: "Invalid registered target".into(),
+                description: String::new(),
+                specification: Some(specification.into()),
+                project_id: Some(Uuid::new_v4()),
+                technology: None,
+                output: None,
+                destination: None,
+                agents: None,
+                git_mode: None,
+            }
+        };
+        assert!(invalid.validate().unwrap_err().contains("existing-project"));
+    }
+
+    #[test]
+    fn failed_existing_project_specification_keeps_the_same_approved_document_for_rebuild() {
+        let specification = "# Specification\n\n## Goal\n\nChange it.\n\n## Requirements\n\n- Preserve it.\n\n## Acceptance Criteria\n\n- It works.\n\n## Steps\n\n1. Implement the change\n\n## Verification\n\n- cargo test\n";
+        let manager = TaskManager::new();
+        let task = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::ImplementExistingSpecification,
+                    title: "Rebuild existing project".into(),
+                    description: String::new(),
+                    specification: Some(specification.into()),
+                    project_id: Some(Uuid::new_v4()),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap();
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::Inspection {
+            profile: ProjectProfile::selected(TechStack::Rust),
+            source_revision: Some("source-revision".into()),
+        });
+        emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
+        emitter.emit(TaskEvent::TaskFailed {
+            error: "worker failed".into(),
+        });
+        let stored = manager.get(task.id).unwrap();
+        assert!(stored.rebuild_eligible_state());
+        assert_eq!(stored.spec.as_deref(), Some(specification));
+        assert!(stored.history.iter().any(|recorded| matches!(
+            &recorded.event,
+            TaskEvent::Inspection { source_revision: Some(revision), .. } if revision == "source-revision"
+        )));
+        assert_eq!(manager.begin_rebuild(task.id), Ok(1));
     }
 }
 #[cfg(test)]
