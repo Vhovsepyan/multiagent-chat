@@ -2959,7 +2959,32 @@ mod existing_specification_pipeline_tests {
                 revision: None,
             })
             .unwrap();
+        std::fs::write(workspace.path.join("baseline.txt"), "original source\n").unwrap();
+        ExistingProjectWorkspace::git(
+            &workspace.path,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        ExistingProjectWorkspace::git(&workspace.path, &["config", "user.name", "Test User"]);
+        ExistingProjectWorkspace::git(&workspace.path, &["add", "baseline.txt"]);
+        ExistingProjectWorkspace::git(&workspace.path, &["commit", "-m", "source baseline"]);
+        let baseline = crate::process_environment::command("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&workspace.path)
+            .output()
+            .unwrap();
+        assert!(baseline.status.success());
+        let baseline = String::from_utf8(baseline.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
         let emitter = state.manager.emitter(task.id);
+        emitter.emit(TaskEvent::Result {
+            result: TaskResult {
+                source_revision: Some(baseline),
+                verification: Vec::new(),
+                diff: "No working-tree changes.".into(),
+            },
+        });
         emitter.emit(TaskEvent::MilestonePlanCreated {
             milestones: vec![
                 Milestone {

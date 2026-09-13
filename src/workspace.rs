@@ -130,6 +130,31 @@ impl LocalWorkspaceProvider {
         }
         Ok(())
     }
+
+    fn validate_retained_layout(&self, root: &Path, path: &Path) -> Result<()> {
+        let managed_root =
+            fs::canonicalize(&self.root).context("could not resolve the managed workspace root")?;
+        let retained_root =
+            fs::canonicalize(root).context("could not resolve the retained task workspace")?;
+        if retained_root.parent() != Some(managed_root.as_path()) {
+            bail!("retained task workspace resolves outside the managed workspace root");
+        }
+
+        let repository = fs::canonicalize(path)
+            .context("could not resolve the retained repository workspace")?;
+        let artifacts = fs::canonicalize(root.join("artifacts"))
+            .context("could not resolve the retained artifact workspace")?;
+        let git_directory = fs::canonicalize(path.join(".git"))
+            .context("could not resolve retained repository Git metadata")?;
+        if repository.parent() != Some(retained_root.as_path())
+            || artifacts.parent() != Some(retained_root.as_path())
+            || git_directory.parent() != Some(repository.as_path())
+            || !git_directory.is_dir()
+        {
+            bail!("retained task workspace contains substituted or linked paths");
+        }
+        Ok(())
+    }
 }
 
 impl WorkspaceProvider for LocalWorkspaceProvider {
@@ -219,9 +244,40 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
         if !root.is_dir() || !path.is_dir() || !root.join("artifacts").is_dir() {
             bail!("retained task workspace is no longer available");
         }
+        self.validate_retained_layout(&root, &path)?;
         let git = git_command(&path, &["rev-parse", "--is-inside-work-tree"], &self.limits)?;
         if !git.status.success() || String::from_utf8_lossy(&git.stdout).trim() != "true" {
             bail!("retained task workspace is not a Git working tree");
+        }
+        let remotes = git_command(&path, &["remote"], &self.limits)?;
+        if !remotes.status.success() {
+            bail!("could not inspect retained workspace Git remotes");
+        }
+        if !String::from_utf8_lossy(&remotes.stdout).trim().is_empty() {
+            bail!("retained workspace has a worker-accessible Git remote");
+        }
+        if request.source.is_some() {
+            let revision = request.revision.ok_or_else(|| {
+                anyhow::anyhow!("retained existing-project workspace has no source revision")
+            })?;
+            if !matches!(revision.len(), 40 | 64)
+                || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("retained existing-project workspace has an invalid source revision");
+            }
+            let revision_commit = format!("{revision}^{{commit}}");
+            let exists = git_command(&path, &["cat-file", "-e", &revision_commit], &self.limits)?;
+            if !exists.status.success() {
+                bail!("retained workspace does not contain the expected source revision");
+            }
+            let ancestor = git_command(
+                &path,
+                &["merge-base", "--is-ancestor", revision, "HEAD"],
+                &self.limits,
+            )?;
+            if !ancestor.status.success() {
+                bail!("retained workspace HEAD is not based on the expected source revision");
+            }
         }
         Ok(TaskWorkspace {
             root,
@@ -782,6 +838,116 @@ mod tests {
         );
         assert!(reopened.path.join(".git").exists());
         provider.cleanup(&reopened).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn retained_existing_workspace_requires_its_baseline_and_no_remotes() {
+        let root = std::env::temp_dir().join(format!("mac-reopen-existing-{}", Uuid::new_v4()));
+        let provider = LocalWorkspaceProvider::new(root.clone()).unwrap();
+        let task_id = Uuid::new_v4();
+        let workspace = provider
+            .prepare(WorkspaceRequest {
+                task_id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        git(
+            &workspace.path,
+            &["config", "user.email", "tests@example.com"],
+        );
+        git(&workspace.path, &["config", "user.name", "Tests"]);
+        fs::write(workspace.path.join("tracked.txt"), "baseline\n").unwrap();
+        git(&workspace.path, &["add", "tracked.txt"]);
+        git(&workspace.path, &["commit", "--quiet", "-m", "baseline"]);
+        let baseline = git_text(&workspace.path, &["rev-parse", "HEAD"]);
+        let source = ProjectSource::github("owner/repository").unwrap();
+
+        provider
+            .reopen(WorkspaceRequest {
+                task_id,
+                source: Some(&source),
+                revision: Some(&baseline),
+            })
+            .unwrap();
+
+        let missing = provider
+            .reopen(WorkspaceRequest {
+                task_id,
+                source: Some(&source),
+                revision: None,
+            })
+            .unwrap_err();
+        assert!(missing.to_string().contains("no source revision"));
+
+        git(
+            &workspace.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repository.git",
+            ],
+        );
+        let remote = provider
+            .reopen(WorkspaceRequest {
+                task_id,
+                source: Some(&source),
+                revision: Some(&baseline),
+            })
+            .unwrap_err();
+        assert!(remote.to_string().contains("worker-accessible Git remote"));
+
+        provider.cleanup(&workspace).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn retained_existing_workspace_rejects_a_different_history() {
+        let root = std::env::temp_dir().join(format!("mac-reopen-history-{}", Uuid::new_v4()));
+        let provider = LocalWorkspaceProvider::new(root.clone()).unwrap();
+        let task_id = Uuid::new_v4();
+        let workspace = provider
+            .prepare(WorkspaceRequest {
+                task_id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        git(
+            &workspace.path,
+            &["config", "user.email", "tests@example.com"],
+        );
+        git(&workspace.path, &["config", "user.name", "Tests"]);
+        fs::write(workspace.path.join("tracked.txt"), "baseline\n").unwrap();
+        git(&workspace.path, &["add", "tracked.txt"]);
+        git(&workspace.path, &["commit", "--quiet", "-m", "baseline"]);
+        let baseline = git_text(&workspace.path, &["rev-parse", "HEAD"]);
+        git(
+            &workspace.path,
+            &["checkout", "--quiet", "--orphan", "replacement"],
+        );
+        git(&workspace.path, &["rm", "--quiet", "-rf", "."]);
+        fs::write(workspace.path.join("other.txt"), "different repository\n").unwrap();
+        git(&workspace.path, &["add", "other.txt"]);
+        git(&workspace.path, &["commit", "--quiet", "-m", "replacement"]);
+        let source = ProjectSource::github("owner/repository").unwrap();
+
+        let error = provider
+            .reopen(WorkspaceRequest {
+                task_id,
+                source: Some(&source),
+                revision: Some(&baseline),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not based on the expected source revision")
+        );
+
+        provider.cleanup(&workspace).unwrap();
         fs::remove_dir_all(root).ok();
     }
 
