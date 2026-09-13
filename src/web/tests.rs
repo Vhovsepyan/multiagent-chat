@@ -260,6 +260,7 @@ async fn failed_approved_build_exposes_rebuild_but_preapproval_failure_does_not(
     emitter.emit(TaskEvent::TaskFailed {
         error: "worker failed".into(),
     });
+    emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
 
     let retry_page = router(state.clone())
         .oneshot(get(&format!("/task/{}", retryable.id)))
@@ -268,6 +269,16 @@ async fn failed_approved_build_exposes_rebuild_but_preapproval_failure_does_not(
     let retry_html = body_text(retry_page).await;
     assert!(retry_html.contains("Approve and build"), "{retry_html}");
     assert!(retry_html.contains(&format!("/ui/tasks/{}/rebuild", retryable.id)));
+
+    state.workspaces.cleanup(&workspace).unwrap();
+    let cleaned_page = router(state.clone())
+        .oneshot(get(&format!("/task/{}", retryable.id)))
+        .await
+        .unwrap();
+    assert!(
+        !body_text(cleaned_page).await.contains("Approve and build"),
+        "a missing retained workspace must not be presented as rebuildable"
+    );
 
     let failed_before_approval = state.manager.create("no retry", "description", "legacy");
     state
@@ -281,7 +292,6 @@ async fn failed_approved_build_exposes_rebuild_but_preapproval_failure_does_not(
         .await
         .unwrap();
     assert!(!body_text(page).await.contains("Approve and build"));
-    state.workspaces.cleanup(&workspace).unwrap();
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -113,13 +113,17 @@ fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode) -> String
 }
 
 fn actions_html(task: &Task) -> String {
+    actions_html_with_rebuild(task, task.rebuild_eligible_state())
+}
+
+fn actions_html_with_rebuild(task: &Task, rebuild_eligible: bool) -> String {
     format!(
         r#"<div id="task-actions">{}</div>"#,
         action_controls_html(
             task.id,
             task.persistence.as_ref(),
             task.github_publication.as_ref(),
-            task.rebuild_eligible_state(),
+            rebuild_eligible,
         )
     )
 }
@@ -728,6 +732,10 @@ fn event_html(
             format!(
                 r#"<div class="notice">Build retry started · milestone {resume_milestone}</div>"#
             ),
+        )),
+        TaskEvent::WorkspaceRetainedForRebuild => Some((
+            "build",
+            r#"<div class="notice">Workspace retained for approved build recovery</div>"#.into(),
         )),
         TaskEvent::MilestonePlanCreated { milestones } => Some((
             "build",
@@ -1376,6 +1384,8 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     let Some(task) = state.manager.get(id) else {
         return (StatusCode::NOT_FOUND, Html("<h1>No such task</h1>")).into_response();
     };
+    let rebuild_eligible = task.rebuild_eligible_state()
+        && crate::web::pipeline::rebuild_workspace_available(&state, &task).await;
     let mut debate = String::new();
     let mut spec = String::new();
     let mut build = if task.discarded_log_events > 0 {
@@ -1418,6 +1428,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
     };
     Html(page_html(
         &task,
+        &actions_html_with_rebuild(&task, rebuild_eligible),
         &project_name,
         &agents,
         &acceptance,
@@ -1441,6 +1452,7 @@ fn spec_readonly_html(spec: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 fn page_html(
     task: &Task,
+    actions: &str,
     project: &str,
     agents: &str,
     acceptance: &str,
@@ -1450,7 +1462,6 @@ fn page_html(
     build: &str,
     done: &str,
 ) -> String {
-    let actions = actions_html(task);
     let milestones = milestones_html(task);
     format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} — multiagent-chat</title><link rel="stylesheet" href="/static/style.css"><script src="/static/vendor/htmx.min.js"></script><script src="/static/vendor/sse.js"></script></head><body><div class="wrap" hx-ext="sse" sse-connect="/ui/tasks/{id}/stream"><header class="top"><h1>{title}</h1><span class="sub"><a href="/">&larr; new task</a> · {kind} · <code>{project}</code></span></header><div id="timeline" sse-swap="status" hx-swap="innerHTML">{timeline}</div><div id="done" sse-swap="done" hx-swap="innerHTML">{done}</div>{agents}{output}{actions}{milestones}{acceptance}<div id="spec" sse-swap="spec" hx-swap="innerHTML">{spec}</div><h2 class="section">Debate</h2><div id="debate" sse-swap="debate" hx-swap="beforeend">{debate}</div><h2 class="section">Implementation / Verification / Result</h2><div id="terminal" class="terminal" sse-swap="build" hx-swap="beforeend">{build}</div></div></body></html>"##,

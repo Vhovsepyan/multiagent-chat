@@ -117,16 +117,26 @@ fn finish_run(
             }
         }
     }
+    // Approval is the boundary between debate and build. Once it has been
+    // accepted, a workspace may exist even before the pipeline records
+    // `Implementing` (for example while writing the approved artifact or
+    // planning milestones). Those setup failures are rebuildable only when we
+    // retain that exact provider-owned workspace.
     let retain_for_rebuild = result.is_err()
+        && workspace.is_some()
+        && !state.manager.is_cancelled(id)
         && state.manager.get(id).is_some_and(|task| {
-            task.status == TaskStatus::Implementing
-                && task
-                    .decision
-                    .as_ref()
-                    .is_some_and(|decision| decision.approve)
+            task.decision
+                .as_ref()
+                .is_some_and(|decision| decision.approve)
+                && (task.milestones.is_empty()
+                    || task.milestones.iter().any(|milestone| {
+                        milestone.status != crate::milestone::MilestoneStatus::Passed
+                    }))
         });
     if retain_for_rebuild {
         may_cleanup = false;
+        emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
         emitter.notice("build failed after approval; workspace retained so the approved build can be continued");
     }
     if may_cleanup
@@ -1675,6 +1685,12 @@ async fn reopen_workspace(state: &AppState, task: &Task) -> Result<TaskWorkspace
     .await?
 }
 
+/// Read-only page rendering checks the retained provider-owned workspace too,
+/// so an out-of-band cleanup cannot leave a misleading rebuild button behind.
+pub async fn rebuild_workspace_available(state: &AppState, task: &Task) -> bool {
+    reopen_workspace(state, task).await.is_ok()
+}
+
 /// The handler calls this before changing a Failed task back to Implementing.
 pub async fn validate_rebuild_workspace(state: &AppState, id: TaskId) -> Result<()> {
     let task = state
@@ -1970,6 +1986,56 @@ mod tests {
             .position(|event| matches!(event.event, TaskEvent::Finished { .. }))
             .unwrap();
         assert!(result_index < finished_index);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn approved_setup_failure_before_implementing_retains_a_genuine_rebuild_workspace() {
+        let (state, root) = crate::web::tests::test_state("approved-setup-rebuild");
+        let task = state.manager.create("task", "description", "legacy");
+        let emitter = state.manager.emitter(task.id);
+        emitter.emit(TaskEvent::Spec {
+            markdown: "approved specification".into(),
+            path: "artifacts/approved-spec.md".into(),
+        });
+        emitter.status(TaskStatus::WaitingForApproval);
+        state
+            .manager
+            .decide_checked(
+                task.id,
+                crate::task::Decision {
+                    approve: true,
+                    spec: None,
+                },
+            )
+            .unwrap();
+        let workspace = state
+            .workspaces
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+
+        // This models a failure while the approved artifact is written or the
+        // initial build plan is prepared, before `Implementing` is recorded.
+        finish_run(
+            &state,
+            task.id,
+            &emitter,
+            Some(&workspace),
+            Err(anyhow::anyhow!("approved build setup failed")),
+        );
+
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert!(stored.rebuild_workspace_retained);
+        assert!(workspace.path.exists());
+        assert!(stored.rebuild_eligible_state());
+        validate_rebuild_workspace(&state, task.id).await.unwrap();
+        assert_eq!(state.manager.begin_rebuild(task.id), Ok(1));
+        state.workspaces.cleanup(&workspace).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -911,6 +911,10 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             "Build retry started".into(),
             vec![format!("Resume milestone: {resume_milestone}")],
         ),
+        TaskEvent::WorkspaceRetainedForRebuild => (
+            "Workspace retained for rebuild".into(),
+            vec!["The managed workspace was retained after approved build failure.".into()],
+        ),
         TaskEvent::TaskCancelled => ("Task cancelled".into(), vec![]),
         TaskEvent::EvidenceExported { artifact } => (
             "Evidence exported".into(),

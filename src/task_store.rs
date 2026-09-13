@@ -577,6 +577,9 @@ mod tests {
                 spec: None
             }
         ));
+        manager
+            .emitter(task.id)
+            .emit(TaskEvent::WorkspaceRetainedForRebuild);
         manager.emitter(task.id).emit(TaskEvent::TaskFailed {
             error: "worker failed".into(),
         });

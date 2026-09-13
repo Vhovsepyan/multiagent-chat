@@ -490,6 +490,9 @@ pub enum TaskEvent {
     BuildRetryStarted {
         resume_milestone: u32,
     },
+    /// The provider-owned task workspace was retained after an approved build
+    /// failure and is required before the task may be rebuilt.
+    WorkspaceRetainedForRebuild,
     MilestoneStarted {
         id: String,
         order: u32,
@@ -1004,6 +1007,7 @@ impl TaskEvent {
             | Self::VerificationStarted { .. }
             | Self::VerificationCompleted { .. }
             | Self::BuildRetryStarted { .. }
+            | Self::WorkspaceRetainedForRebuild
             | Self::TaskCompleted
             | Self::TaskCancelled => {}
         }
@@ -1225,6 +1229,11 @@ pub struct Task {
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
     pub decision: Option<Decision>,
+    /// Set only by the retention event after an approved build failure. This
+    /// durable marker prevents state-only UI eligibility from promising a
+    /// rebuild after the workspace was intentionally cleaned.
+    #[serde(default)]
+    pub rebuild_workspace_retained: bool,
     /// Ordered approved-spec execution plan and live milestone state.
     pub milestones: Vec<Milestone>,
     /// What this run must satisfy, and how far each criterion has got (0012).
@@ -1247,6 +1256,7 @@ fn default_next_event_sequence() -> u64 {
 impl Task {
     pub fn rebuild_eligible_state(&self) -> bool {
         self.status == TaskStatus::Failed
+            && self.rebuild_workspace_retained
             && self
                 .decision
                 .as_ref()
@@ -1293,6 +1303,7 @@ impl Task {
             spec: None,
             error: None,
             decision: None,
+            rebuild_workspace_retained: false,
             milestones: Vec::new(),
             acceptance: Vec::new(),
             git_mode: GitMode::None,
@@ -1348,6 +1359,7 @@ impl Task {
             spec: None,
             error: None,
             decision: None,
+            rebuild_workspace_retained: false,
             milestones: Vec::new(),
             acceptance: Vec::new(),
             completion_checklist,
@@ -1513,6 +1525,7 @@ impl Task {
             TaskEvent::TaskCompleted => {
                 self.status = TaskStatus::Completed;
                 self.error = None;
+                self.rebuild_workspace_retained = false;
             }
             TaskEvent::TaskFailed { ref error } => {
                 self.status = TaskStatus::Failed;
@@ -1528,7 +1541,9 @@ impl Task {
                         milestone.completed_at = Some(timestamp);
                     }
                 }
+                self.rebuild_workspace_retained = false;
             }
+            TaskEvent::WorkspaceRetainedForRebuild => self.rebuild_workspace_retained = true,
             TaskEvent::MilestonePlanCreated { ref milestones } => {
                 self.milestones = milestones.clone();
             }
@@ -2762,6 +2777,7 @@ mod tests {
             worker_result_summary: None,
             error: "worker failed".into(),
         });
+        emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
         emitter.emit(TaskEvent::TaskFailed {
             error: "worker failed".into(),
         });
