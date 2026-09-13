@@ -610,6 +610,12 @@ mod tests {
                 Some(TaskRepositorySource::from_project(&project)),
             )
             .unwrap();
+        manager.emitter(task.id).emit(TaskEvent::Inspection {
+            profile: crate::technology::ProjectProfile::selected(
+                crate::technology::TechStack::Rust,
+            ),
+            source_revision: Some("0123456789012345678901234567890123456789".into()),
+        });
         let persisted = fs::read_to_string(task_directory(&root, task.id).join(SNAPSHOT)).unwrap();
         assert!(persisted.contains("owner/original"));
         assert!(persisted.contains("https://github.com/owner/original.git"));
@@ -620,6 +626,11 @@ mod tests {
         // instance has no ProjectStore registration to consult.
         let restored = new_manager(&root);
         let task = restored.get(task.id).unwrap();
+        assert!(task.result.is_none());
+        assert_eq!(
+            task.source_revision.as_deref(),
+            Some("0123456789012345678901234567890123456789")
+        );
         assert_eq!(
             task.repository_source,
             Some(TaskRepositorySource {

@@ -1726,10 +1726,11 @@ async fn reopen_workspace(state: &AppState, task: &Task) -> Result<TaskWorkspace
                 .map_err(|error| anyhow::anyhow!("invalid durable repository source: {error}"))?,
         )
     };
-    let baseline = task
-        .result
-        .as_ref()
-        .and_then(|result| result.source_revision.clone());
+    let baseline = task.source_revision.clone().or_else(|| {
+        task.result
+            .as_ref()
+            .and_then(|result| result.source_revision.clone())
+    });
     let provider = state.workspaces.clone();
     let id = task.id;
     let limits = state.config.execution.clone();
@@ -2978,12 +2979,9 @@ mod existing_specification_pipeline_tests {
             .trim()
             .to_owned();
         let emitter = state.manager.emitter(task.id);
-        emitter.emit(TaskEvent::Result {
-            result: TaskResult {
-                source_revision: Some(baseline),
-                verification: Vec::new(),
-                diff: "No working-tree changes.".into(),
-            },
+        emitter.emit(TaskEvent::Inspection {
+            profile: ProjectProfile::selected(crate::technology::TechStack::Rust),
+            source_revision: Some(baseline.clone()),
         });
         emitter.emit(TaskEvent::MilestonePlanCreated {
             milestones: vec![
@@ -3030,6 +3028,8 @@ mod existing_specification_pipeline_tests {
         let restarted = AppState::with_workspace(config, fixture.clone());
         let restored = restarted.manager.get(task.id).unwrap();
         assert!(restarted.projects.list().is_empty());
+        assert!(restored.result.is_none());
+        assert_eq!(restored.source_revision.as_deref(), Some(baseline.as_str()));
         assert!(rebuild_workspace_available(&restarted, &restored).await);
         validate_rebuild_workspace(&restarted, task.id)
             .await

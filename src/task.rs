@@ -1335,6 +1335,11 @@ pub struct Task {
     /// only as a compatibility fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_source: Option<TaskRepositorySource>,
+    /// Immutable checkout baseline captured during existing-project
+    /// inspection. Keeping it independently from `result` makes rebuild
+    /// safety survive a failure while the result diff itself is being made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     pub technology: Option<TechStack>,
     pub output: Option<OutputTarget>,
     /// The persistent destination folder name this run asked for (task 0010).
@@ -1438,6 +1443,7 @@ impl Task {
             kind: TaskKind::NewProject,
             project_id: None,
             repository_source: None,
+            source_revision: None,
             technology: Some(TechStack::Rust),
             output: Some(OutputTarget::ReviewableResult),
             destination: None,
@@ -1493,6 +1499,7 @@ impl Task {
             kind: request.kind,
             project_id: request.project_id,
             repository_source: None,
+            source_revision: None,
             technology: request.technology,
             output,
             destination: request
@@ -1685,8 +1692,21 @@ impl Task {
                 self.spec = Some(markdown.clone());
                 self.specification_source = Some(source);
             }
-            TaskEvent::Inspection { ref profile, .. } => self.profile = Some(profile.clone()),
-            TaskEvent::Result { ref result } => self.result = Some(result.clone()),
+            TaskEvent::Inspection {
+                ref profile,
+                ref source_revision,
+            } => {
+                self.profile = Some(profile.clone());
+                if source_revision.is_some() {
+                    self.source_revision = source_revision.clone();
+                }
+            }
+            TaskEvent::Result { ref result } => {
+                if result.source_revision.is_some() {
+                    self.source_revision = result.source_revision.clone();
+                }
+                self.result = Some(result.clone());
+            }
             TaskEvent::Finished { status, ref error } => {
                 self.status = status;
                 self.error = error.clone();
@@ -1939,6 +1959,9 @@ impl Task {
         }
         if let Some(destination) = &mut self.destination {
             clean(destination);
+        }
+        if let Some(source_revision) = &mut self.source_revision {
+            clean(source_revision);
         }
         if let Some(persistence) = &mut self.persistence {
             clean(&mut persistence.destination);
@@ -3916,6 +3939,7 @@ mod tests {
             &recorded.event,
             TaskEvent::Inspection { source_revision: Some(revision), .. } if revision == "source-revision"
         )));
+        assert_eq!(stored.source_revision.as_deref(), Some("source-revision"));
         assert_eq!(manager.begin_rebuild(task.id), Ok(1));
     }
 }
