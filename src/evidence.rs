@@ -1963,7 +1963,7 @@ mod tests {
     /// that an export happened.
     fn export_once(manager: &crate::task::TaskManager, id: crate::task::TaskId) -> EvidencePackage {
         let package = export(&manager.evidence_snapshot(id).unwrap()).unwrap();
-        manager.record_evidence_export(id);
+        manager.record_evidence_export(id).unwrap();
         package
     }
 

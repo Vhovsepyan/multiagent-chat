@@ -701,6 +701,158 @@ mod tests {
     }
 
     #[test]
+    fn event_persistence_failure_fails_only_that_task_without_poisoning_the_registry() {
+        let root = root("event-write-failure");
+        let manager = new_manager(&root);
+        let task = manager.create("durable", "event", "legacy");
+        let events = task_directory(&root, task.id).join(EVENTS);
+        fs::remove_file(&events).unwrap();
+        fs::create_dir(&events).unwrap();
+
+        manager.emitter(task.id).notice("cannot be committed");
+
+        let failed = manager.get(task.id).expect("registry remains readable");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("event persistence failed"))
+        );
+        let other = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::NewProject,
+                    title: "Independent task".into(),
+                    description: "still works".into(),
+                    specification: None,
+                    project_id: None,
+                    technology: Some(crate::technology::TechStack::Rust),
+                    output: Some(OutputTarget::ReviewableResult),
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap();
+        assert!(manager.get(other.id).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_creation_persistence_failure_is_returned_without_inserting_a_task() {
+        let root = root("creation-write-failure");
+        let manager = new_manager(&root);
+        fs::remove_dir(root.join(TASKS_DIRECTORY)).unwrap();
+        fs::write(root.join(TASKS_DIRECTORY), "block task storage").unwrap();
+
+        let error = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::NewProject,
+                    title: "Cannot persist".into(),
+                    description: "Return the error".into(),
+                    specification: None,
+                    project_id: None,
+                    technology: Some(crate::technology::TechStack::Rust),
+                    output: Some(OutputTarget::ReviewableResult),
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap_err();
+        assert!(error.contains("could not persist new task"));
+        assert!(manager.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approval_persistence_failure_is_returned_without_approving_the_task() {
+        let root = root("approval-write-failure");
+        let manager = new_manager(&root);
+        let task = manager.create("approval", "durable", "legacy");
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::Spec {
+            markdown: "# approved".into(),
+            path: "artifacts/SPEC.md".into(),
+        });
+        emitter.emit(TaskEvent::Status {
+            status: TaskStatus::WaitingForApproval,
+        });
+        let events = task_directory(&root, task.id).join(EVENTS);
+        fs::remove_file(&events).unwrap();
+        fs::create_dir(&events).unwrap();
+
+        let error = manager
+            .decide_checked(
+                task.id,
+                crate::task::Decision {
+                    approve: true,
+                    spec: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, crate::task::DecisionError::Persistence(_)));
+        let failed = manager.get(task.id).expect("registry remains readable");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert!(failed.decision.is_none());
+        assert!(
+            failed
+                .history
+                .iter()
+                .all(|recorded| !matches!(recorded.event, TaskEvent::SpecApproved { .. }))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebuild_persistence_failure_is_returned_without_advancing_the_task() {
+        let root = root("rebuild-write-failure");
+        let manager = new_manager(&root);
+        let task = manager.create("retry", "durable", "legacy");
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::Spec {
+            markdown: "# approved".into(),
+            path: "artifacts/SPEC.md".into(),
+        });
+        emitter.emit(TaskEvent::Status {
+            status: TaskStatus::WaitingForApproval,
+        });
+        manager
+            .decide_checked(
+                task.id,
+                crate::task::Decision {
+                    approve: true,
+                    spec: None,
+                },
+            )
+            .unwrap();
+        emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
+        emitter.emit(TaskEvent::TaskFailed {
+            error: "worker failed".into(),
+        });
+        let events = task_directory(&root, task.id).join(EVENTS);
+        fs::remove_file(&events).unwrap();
+        fs::create_dir(&events).unwrap();
+
+        let error = manager.begin_rebuild(task.id).unwrap_err();
+        assert!(matches!(error, crate::task::RebuildError::Persistence(_)));
+        let failed = manager.get(task.id).expect("registry remains readable");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert!(failed.rebuild_workspace_retained);
+        assert!(
+            failed
+                .history
+                .iter()
+                .all(|recorded| !matches!(recorded.event, TaskEvent::BuildRetryStarted { .. }))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn preserves_waiting_gate_and_safely_fails_interrupted_execution() {
         let root = root("recovery");
         let manager = new_manager(&root);

@@ -1301,35 +1301,41 @@ pub struct Decision {
     pub spec: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionError {
     NotFound,
     NotWaiting,
     InvalidSpec,
+    Persistence(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildError {
     NotFound,
     NotEligible,
+    Persistence(String),
 }
 
 impl std::fmt::Display for RebuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotFound => "unknown task",
-            Self::NotEligible => "task is not eligible to rebuild its approved specification",
-        })
+        match self {
+            Self::NotFound => f.write_str("unknown task"),
+            Self::NotEligible => {
+                f.write_str("task is not eligible to rebuild its approved specification")
+            }
+            Self::Persistence(error) => write!(f, "could not persist rebuild state: {error}"),
+        }
     }
 }
 
 impl std::fmt::Display for DecisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotFound => "unknown task",
-            Self::NotWaiting => "task is not waiting for an unanswered approval",
-            Self::InvalidSpec => "approval requires a non-empty specification",
-        })
+        match self {
+            Self::NotFound => f.write_str("unknown task"),
+            Self::NotWaiting => f.write_str("task is not waiting for an unanswered approval"),
+            Self::InvalidSpec => f.write_str("approval requires a non-empty specification"),
+            Self::Persistence(error) => write!(f, "could not persist approval: {error}"),
+        }
     }
 }
 
@@ -1386,6 +1392,11 @@ pub struct Task {
     next_event_sequence: u64,
     #[serde(skip, default)]
     worker_output_truncated: bool,
+    /// Runtime circuit breaker set after a durable write fails. Further
+    /// pipeline events are refused so volatile state cannot keep advancing
+    /// beyond the last committed snapshot.
+    #[serde(skip, default)]
+    persistence_failed: bool,
     pub spec: Option<String>,
     /// How `spec` became authoritative. Older snapshots default to `None` and
     /// legacy `Spec` journal events restore the generated source on replay.
@@ -1419,6 +1430,15 @@ fn default_next_event_sequence() -> u64 {
 }
 
 impl Task {
+    fn mark_persistence_failure(&mut self, operation: &str, error: &anyhow::Error) {
+        self.persistence_failed = true;
+        self.cancelled = true;
+        self.status = TaskStatus::Failed;
+        self.error = Some(format!(
+            "durable task {operation} persistence failed: {error:#}"
+        ));
+    }
+
     /// Whether this task targets a fresh project workspace. Direct
     /// specifications are new-project work only when no registered project
     /// was selected; the task target, rather than its kind alone, determines
@@ -1475,6 +1495,7 @@ impl Task {
             history_limits: HistoryLimits::default(),
             next_event_sequence: 1,
             worker_output_truncated: false,
+            persistence_failed: false,
             spec: None,
             specification_source: None,
             error: None,
@@ -1534,6 +1555,7 @@ impl Task {
             history_limits: HistoryLimits::default(),
             next_event_sequence: 1,
             worker_output_truncated: false,
+            persistence_failed: false,
             spec: request.specification.clone(),
             specification_source: request
                 .kind
@@ -2222,9 +2244,17 @@ impl Inner {
     fn record_and_publish(&self, id: TaskId, event: TaskEvent) {
         let mut tasks = self.tasks.write().expect("task registry lock poisoned");
         if let Some(task) = tasks.get_mut(&id) {
+            if task.persistence_failed {
+                return;
+            }
+            let previous = task.clone();
             let event = event.sanitized(&self.redactor).bounded(self.history_limits);
             let recorded = task.record_event(event);
-            self.persist_event(task, &recorded);
+            if let Err(error) = self.persist_event(task, &recorded) {
+                *task = previous;
+                task.mark_persistence_failure("event", &error);
+                return;
+            }
             let _ = self.tx.send((id, recorded));
         }
     }
@@ -2232,25 +2262,30 @@ impl Inner {
     fn record_evidence(&self, id: TaskId, payload: EvidencePayload) {
         let mut tasks = self.tasks.write().expect("task registry lock poisoned");
         if let Some(task) = tasks.get_mut(&id) {
+            if task.persistence_failed {
+                return;
+            }
+            let previous = task.clone();
             let recorded = task.record_evidence(payload, &self.redactor);
-            self.persist_evidence(task, &recorded);
+            if let Err(error) = self.persist_evidence(task, &recorded) {
+                *task = previous;
+                task.mark_persistence_failure("evidence", &error);
+            }
         }
     }
 
-    fn persist_event(&self, task: &Task, event: &RecordedEvent) {
+    fn persist_event(&self, task: &Task, event: &RecordedEvent) -> anyhow::Result<()> {
         if let Some(store) = &self.store {
-            store
-                .persist_event(task, event)
-                .expect("durable task event persistence failed");
+            store.persist_event(task, event)?;
         }
+        Ok(())
     }
 
-    fn persist_evidence(&self, task: &Task, evidence: &EvidenceRecord) {
+    fn persist_evidence(&self, task: &Task, evidence: &EvidenceRecord) -> anyhow::Result<()> {
         if let Some(store) = &self.store {
-            store
-                .persist_evidence(task, evidence)
-                .expect("durable task evidence persistence failed");
+            store.persist_evidence(task, evidence)?;
         }
+        Ok(())
     }
 }
 
@@ -2326,8 +2361,9 @@ impl TaskManager {
         }
     }
 
-    /// Legacy helper retained for internal v2 tests and CLI-era call sites.
-    /// Production handlers use `create_from_request` and never accept paths.
+    /// Legacy convenience helper retained for tests. Production creation uses
+    /// the fallible request methods below so storage errors reach the caller.
+    #[cfg(test)]
     pub fn create(
         &self,
         title: impl Into<String>,
@@ -2356,6 +2392,7 @@ impl TaskManager {
         )
         .expect("legacy task input is valid");
         self.insert(task)
+            .expect("in-memory legacy task creation cannot fail")
     }
 
     /// `agents` comes from `AgentCatalogue::resolve`, so the stored task is
@@ -2366,7 +2403,7 @@ impl TaskManager {
         agents: AgentSelection,
     ) -> Result<Task, String> {
         let task = Task::from_request(request, agents)?;
-        Ok(self.insert(task))
+        self.insert(task)
     }
 
     /// Create a task while freezing the registered project's immutable source
@@ -2385,10 +2422,10 @@ impl TaskManager {
                 .transpose()
                 .map_err(|error| format!("invalid task repository source: {error}"))?;
         }
-        Ok(self.insert(task))
+        self.insert(task)
     }
 
-    fn insert(&self, mut task: Task) -> Task {
+    fn insert(&self, mut task: Task) -> Result<Task, String> {
         task.history_limits = self.inner.history_limits;
         let created = TaskEvent::TaskCreated {
             kind: task.kind,
@@ -2422,7 +2459,7 @@ impl TaskManager {
         if let Some(store) = &self.inner.store {
             store
                 .persist_new_task(&task)
-                .expect("durable task creation persistence failed");
+                .map_err(|error| format!("could not persist new task: {error:#}"))?;
         }
         let mut tasks = self
             .inner
@@ -2430,7 +2467,7 @@ impl TaskManager {
             .write()
             .expect("task registry lock poisoned");
         tasks.insert(task.id, task.clone());
-        task
+        Ok(task)
     }
 
     /// A snapshot of one task. Cloned, so the caller never holds the lock.
@@ -2467,31 +2504,36 @@ impl TaskManager {
     /// the NEXT export, never in the one that produced it.
     ///
     /// Returns whether this call was the one that recorded the event.
-    pub fn record_evidence_export(&self, id: TaskId) -> bool {
+    pub fn record_evidence_export(&self, id: TaskId) -> Result<bool, String> {
         let mut tasks = self
             .inner
             .tasks
             .write()
             .expect("task registry lock poisoned");
         let Some(task) = tasks.get_mut(&id) else {
-            return false;
+            return Ok(false);
         };
         if task
             .history
             .iter()
             .any(|recorded| matches!(recorded.event, TaskEvent::EvidenceExported { .. }))
         {
-            return false;
+            return Ok(false);
         }
         let event = TaskEvent::EvidenceExported {
             artifact: crate::evidence::archive_filename(id),
         }
         .sanitized(&self.inner.redactor)
         .bounded(self.inner.history_limits);
+        let previous = task.clone();
         let recorded = task.record_event(event);
-        self.inner.persist_event(task, &recorded);
+        if let Err(error) = self.inner.persist_event(task, &recorded) {
+            *task = previous;
+            task.mark_persistence_failure("evidence-export event", &error);
+            return Err(format!("could not persist evidence export: {error:#}"));
+        }
         let _ = self.inner.tx.send((id, recorded));
-        true
+        Ok(true)
     }
 
     /// Snapshots of every task.
@@ -2543,9 +2585,17 @@ impl TaskManager {
                 .expect("task registry lock poisoned");
             match tasks.get_mut(&id) {
                 Some(task) => {
+                    if task.persistence_failed {
+                        return Err(DecisionError::Persistence(
+                            task.error
+                                .clone()
+                                .unwrap_or_else(|| "a previous durable task write failed".into()),
+                        ));
+                    }
                     if task.status != TaskStatus::WaitingForApproval || task.decision.is_some() {
                         return Err(DecisionError::NotWaiting);
                     }
+                    let previous = task.clone();
                     let mut events = Vec::new();
                     if decision.approve {
                         let previous_spec = task.spec.clone();
@@ -2573,10 +2623,12 @@ impl TaskManager {
                         events.push(task.record_event(TaskEvent::SpecRejected));
                     }
                     task.decision = Some(decision);
-                    if let Some(store) = &self.inner.store {
-                        store
-                            .persist_events(task, &events)
-                            .expect("durable task decision persistence failed");
+                    if let Some(store) = &self.inner.store
+                        && let Err(error) = store.persist_events(task, &events)
+                    {
+                        *task = previous;
+                        task.mark_persistence_failure("decision", &error);
+                        return Err(DecisionError::Persistence(format!("{error:#}")));
                     }
                     for event in &events {
                         let _ = self.inner.tx.send((id, event.clone()));
@@ -2627,6 +2679,13 @@ impl TaskManager {
             .write()
             .expect("task registry lock poisoned");
         let task = tasks.get_mut(&id).ok_or(RebuildError::NotFound)?;
+        if task.persistence_failed {
+            return Err(RebuildError::Persistence(
+                task.error
+                    .clone()
+                    .unwrap_or_else(|| "a previous durable task write failed".into()),
+            ));
+        }
         let approved = task.rebuild_eligible_state();
         let resume_milestone = task
             .milestones
@@ -2637,6 +2696,7 @@ impl TaskManager {
         if !approved {
             return Err(RebuildError::NotEligible);
         }
+        let previous = task.clone();
         let previous_error = task.error.clone().unwrap_or_else(|| "build failed".into());
         let requested = task.record_event(TaskEvent::BuildRetryRequested {
             previous_error,
@@ -2647,10 +2707,12 @@ impl TaskManager {
             status: TaskStatus::Implementing,
         });
         let events = [requested, started, status];
-        if let Some(store) = &self.inner.store {
-            store
-                .persist_events(task, &events)
-                .expect("durable task rebuild persistence failed");
+        if let Some(store) = &self.inner.store
+            && let Err(error) = store.persist_events(task, &events)
+        {
+            *task = previous;
+            task.mark_persistence_failure("rebuild", &error);
+            return Err(RebuildError::Persistence(format!("{error:#}")));
         }
         for event in &events {
             let _ = self.inner.tx.send((id, event.clone()));
@@ -2665,14 +2727,19 @@ impl TaskManager {
             .write()
             .expect("task registry lock poisoned");
         let cancelled = if let Some(task) = tasks.get_mut(&id) {
-            if task.status.is_terminal() {
+            if task.status.is_terminal() || task.persistence_failed {
                 false
             } else {
+                let previous = task.clone();
                 let event = TaskEvent::TaskCancelled
                     .sanitized(&self.inner.redactor)
                     .bounded(self.inner.history_limits);
                 let recorded = task.record_event(event);
-                self.inner.persist_event(task, &recorded);
+                if let Err(error) = self.inner.persist_event(task, &recorded) {
+                    *task = previous;
+                    task.mark_persistence_failure("cancellation", &error);
+                    return false;
+                }
                 let _ = self.inner.tx.send((id, recorded));
                 true
             }
@@ -3635,7 +3702,7 @@ mod tests {
         )
         .unwrap();
         let manager = TaskManager::new();
-        let task = manager.insert(task);
+        let task = manager.insert(task).unwrap();
         let emitter = manager.emitter(task.id);
         let milestone = Milestone {
             id: "m1".into(),

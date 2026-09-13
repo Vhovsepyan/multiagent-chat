@@ -1578,6 +1578,7 @@ pub async fn approve(
             crate::task::DecisionError::NotFound => StatusCode::NOT_FOUND,
             crate::task::DecisionError::NotWaiting => StatusCode::CONFLICT,
             crate::task::DecisionError::InvalidSpec => StatusCode::BAD_REQUEST,
+            crate::task::DecisionError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         return (status, Html(esc(&error.to_string()))).into_response();
     }
@@ -1601,6 +1602,7 @@ pub async fn rebuild(State(state): State<AppState>, Path(id): Path<TaskId>) -> R
         let status = match error {
             crate::task::RebuildError::NotFound => StatusCode::NOT_FOUND,
             crate::task::RebuildError::NotEligible => StatusCode::CONFLICT,
+            crate::task::RebuildError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         return (status, Html(esc(&error.to_string()))).into_response();
     }

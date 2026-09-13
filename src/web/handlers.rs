@@ -291,7 +291,10 @@ pub async fn export_evidence(
         .map_err(|error| ApiError::internal(format!("could not export evidence: {error:#}")))?;
     // Only a generated archive is an export: recording earlier would leave a
     // successful-looking audit event behind a failed download.
-    state.manager.record_evidence_export(id);
+    state
+        .manager
+        .record_evidence_export(id)
+        .map_err(ApiError::internal)?;
     let disposition =
         HeaderValue::from_str(&format!("attachment; filename=\"{}\"", package.filename))
             .map_err(|_| ApiError::internal("could not create evidence download filename"))?;
@@ -381,6 +384,7 @@ pub async fn approve_task(
             crate::task::DecisionError::NotFound => ApiError::not_found(error.to_string()),
             crate::task::DecisionError::NotWaiting => ApiError::conflict(error.to_string()),
             crate::task::DecisionError::InvalidSpec => ApiError::bad_request(error.to_string()),
+            crate::task::DecisionError::Persistence(_) => ApiError::internal(error.to_string()),
         })?;
 
     let updated = state
@@ -406,6 +410,7 @@ pub async fn rebuild_task(
         .map_err(|error| match error {
             crate::task::RebuildError::NotFound => ApiError::not_found(error.to_string()),
             crate::task::RebuildError::NotEligible => ApiError::conflict(error.to_string()),
+            crate::task::RebuildError::Persistence(_) => ApiError::internal(error.to_string()),
         })?;
     pipeline::spawn_rebuild(state.clone(), id);
     state
