@@ -82,7 +82,7 @@ fn timeline_html(status: TaskStatus) -> String {
 
 /// Requirement 11: what this task actually runs, read from the task itself
 /// rather than from the current global defaults.
-fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode) -> String {
+fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode, kind: TaskKind) -> String {
     let row = |role: &str, who: &str, model: &str| {
         format!(
             r#"<div class="agent"><span class="role">{role}</span><span class="who">{}</span><code>{}</code></div>"#,
@@ -94,13 +94,18 @@ fn agents_html(agents: &AgentSelection, git_mode: crate::git::GitMode) -> String
         r#"<div class="agent"><span class="role">Git</span><span class="who">{}</span></div>"#,
         esc(git_mode.label())
     );
-    format!(
-        r#"<div class="card"><h2 class="section">Agents</h2><div class="agents">{}{}{}{}</div></div>"#,
+    let proposer = if kind.uses_existing_specification() {
+        String::new()
+    } else {
         row(
             "Proposer",
             agents.proposer.provider.label(),
-            &agents.proposer.model
-        ),
+            &agents.proposer.model,
+        )
+    };
+    format!(
+        r#"<div class="card"><h2 class="section">Agents</h2><div class="agents">{}{}{}{}</div></div>"#,
+        proposer,
         row(
             "Critic",
             agents.critic.provider.label(),
@@ -606,6 +611,13 @@ fn event_html(
             ))
         }
         TaskEvent::Spec { markdown, .. } => Some(("spec", gate_html(id, markdown))),
+        TaskEvent::SpecificationImported { markdown, .. } => Some((
+            "spec",
+            format!(
+                r#"<div class="card"><h2 class="section">Specification</h2><div class="spec-body">{}</div></div>"#,
+                esc(markdown)
+            ),
+        )),
         TaskEvent::SpecApproved { markdown } => Some((
             "spec",
             format!(
@@ -644,6 +656,14 @@ fn event_html(
                     agents.worker.tool.label(),
                     agents.worker.model
                 ))
+            ),
+        )),
+        TaskEvent::ImplementationAgentsSelected { critic, worker } => Some((
+            "debate",
+            format!(
+                r#"<div class="notice">Agents Â· Critic {} Â· Worker {}</div>"#,
+                esc(&format!("{} {}", critic.provider.label(), critic.model)),
+                esc(&format!("{} {}", worker.tool.label(), worker.model))
             ),
         )),
         TaskEvent::Inspection {
@@ -1238,6 +1258,8 @@ pub struct CreateForm {
     pub title: String,
     pub description: String,
     #[serde(default)]
+    pub specification: Option<String>,
+    #[serde(default)]
     pub project_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub technology: Option<TechStack>,
@@ -1337,6 +1359,7 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         kind: form.kind,
         title: form.title,
         description: form.description,
+        specification: chosen(&form.specification).map(str::to_string),
         project_id: form.project_id,
         technology: form.technology,
         output: form.output,
@@ -1352,7 +1375,10 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
     {
         return error_fragment("Select a registered project.");
     }
-    let agents = match state.catalogue.resolve(request.agents.as_ref()) {
+    let agents = match state
+        .catalogue
+        .resolve_for_task(request.kind, request.agents.as_ref())
+    {
         Ok(agents) => agents,
         Err(error) => return error_fragment(&error),
     };
@@ -1419,7 +1445,7 @@ pub async fn task_page(State(state): State<AppState>, Path(id): Path<TaskId>) ->
         .and_then(|project_id| state.projects.get(project_id))
         .map(|project| project.name)
         .unwrap_or_else(|| "New project".into());
-    let agents = agents_html(&task.agents, task.git_mode);
+    let agents = agents_html(&task.agents, task.git_mode, task.kind);
     let acceptance = format!("{}{}", acceptance_html(&task), completion_html(&task));
     let output = if task.output.is_some() {
         output_html(&task)

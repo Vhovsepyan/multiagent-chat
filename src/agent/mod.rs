@@ -39,7 +39,7 @@ use crate::implementer::ClaudeCodeAgent;
 
 /// The three live agents of one run.
 pub struct ResolvedAgents {
-    pub proposer: Box<dyn ChatAgent>,
+    pub proposer: Option<Box<dyn ChatAgent>>,
     pub critic: Box<dyn ChatAgent>,
     pub worker: Box<dyn CodingAgent>,
 }
@@ -51,8 +51,26 @@ pub struct ResolvedAgents {
 /// quietly swapped for one that works (task 0005, requirement 14).
 pub fn resolve(selection: &AgentSelection, config: &Config) -> Result<ResolvedAgents> {
     Ok(ResolvedAgents {
-        proposer: chat_agent(&selection.proposer, config)
-            .context("the selected proposer agent could not be started")?,
+        proposer: Some(
+            chat_agent(&selection.proposer, config)
+                .context("the selected proposer agent could not be started")?,
+        ),
+        critic: chat_agent(&selection.critic, config)
+            .context("the selected critic agent could not be started")?,
+        worker: coding_agent(&selection.worker, config)
+            .context("the selected worker agent could not be started")?,
+    })
+}
+
+/// Resolve the roles used after a direct user-provided specification enters the
+/// pipeline. There is intentionally no proposer construction, credential
+/// lookup, or provider call on this path.
+pub fn resolve_implementation(
+    selection: &AgentSelection,
+    config: &Config,
+) -> Result<ResolvedAgents> {
+    Ok(ResolvedAgents {
+        proposer: None,
         critic: chat_agent(&selection.critic, config)
             .context("the selected critic agent could not be started")?,
         worker: coding_agent(&selection.worker, config)
@@ -121,7 +139,10 @@ mod tests {
 
         let agents = resolve(&selection, &config).unwrap();
 
-        assert_eq!(agents.proposer.provider(), ChatProvider::Gemini);
+        assert_eq!(
+            agents.proposer.as_ref().unwrap().provider(),
+            ChatProvider::Gemini
+        );
         assert_eq!(agents.critic.provider(), ChatProvider::Anthropic);
         assert_eq!(agents.worker.tool(), CodingTool::ClaudeCode);
     }
@@ -144,8 +165,11 @@ mod tests {
 
         let agents = resolve(&selection, &config).unwrap();
 
-        assert_eq!(agents.proposer.provider(), ChatProvider::Anthropic);
-        assert_eq!(agents.proposer.model(), "claude-extra");
+        assert_eq!(
+            agents.proposer.as_ref().unwrap().provider(),
+            ChatProvider::Anthropic
+        );
+        assert_eq!(agents.proposer.as_ref().unwrap().model(), "claude-extra");
         assert_eq!(agents.critic.model(), "critic-model");
         assert_eq!(agents.worker.model(), "worker-model");
     }
@@ -163,9 +187,23 @@ mod tests {
 
         let agents = resolve(&selection, &config).unwrap();
 
-        assert_eq!(agents.proposer.model(), "gemini-fast");
+        assert_eq!(agents.proposer.as_ref().unwrap().model(), "gemini-fast");
         assert_eq!(agents.critic.provider(), ChatProvider::Gemini);
         assert_eq!(agents.critic.model(), "proposer-model");
+    }
+
+    #[test]
+    fn direct_implementation_does_not_construct_a_proposer() {
+        let mut config = test_config();
+        config.gemini_api_key = None;
+        let selection = AgentSelection {
+            proposer: ChatAgentConfig::new(ChatProvider::Gemini, "proposer-model"),
+            critic: ChatAgentConfig::new(ChatProvider::Anthropic, "critic-model"),
+            worker: CodingAgentConfig::new(CodingTool::ClaudeCode, "worker-model"),
+        };
+        let agents = resolve_implementation(&selection, &config).unwrap();
+        assert!(agents.proposer.is_none());
+        assert_eq!(agents.critic.provider(), ChatProvider::Anthropic);
     }
 
     #[test]

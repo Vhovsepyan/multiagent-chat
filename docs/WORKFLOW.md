@@ -12,7 +12,7 @@ Register/connect project source
 Create task
   ↓
 Task type
-  New Project / Take-home Assignment / Feature / Bug Fix
+  New Project / Take-home Assignment / Implement Existing Specification / Feature / Bug Fix
   ↓
 Prepare isolated task workspace
   ↓
@@ -132,6 +132,18 @@ there is no separate orchestration engine.
 - Default to a commit after each successfully verified milestone; never push.
 - Present the actual selected agents, output mode, Git mode, and an
   evidence-derived completion checklist to the user.
+
+---
+
+# 1b. Implement Existing Specification
+
+Use this workflow when the user already has an approved Markdown
+specification. Validate it against the specification-format contract before
+creating a task. The imported document is the authoritative approved
+specification and is recorded as `user_provided`; do not start proposer or
+debate/specification-generation calls. Create the isolated new-project
+workspace and continue through the ordinary frozen critic/worker milestone,
+verification, critic/fix, result, evidence, persistence, and Git safeguards.
 
 ---
 

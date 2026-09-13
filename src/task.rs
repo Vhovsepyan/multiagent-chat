@@ -45,6 +45,7 @@ pub type TaskId = Uuid;
 pub enum TaskKind {
     NewProject,
     TakeHomeAssignment,
+    ImplementExistingSpecification,
     Feature,
     BugFix,
 }
@@ -54,6 +55,7 @@ impl TaskKind {
         match self {
             Self::NewProject => "new project",
             Self::TakeHomeAssignment => "take-home assignment",
+            Self::ImplementExistingSpecification => "implement existing specification",
             Self::Feature => "feature",
             Self::BugFix => "bug fix",
         }
@@ -62,11 +64,20 @@ impl TaskKind {
     /// Both of these kinds create an application in a fresh task workspace.
     /// Take-home work deliberately reuses the New Project execution path.
     pub fn creates_new_project(self) -> bool {
-        matches!(self, Self::NewProject | Self::TakeHomeAssignment)
+        matches!(
+            self,
+            Self::NewProject | Self::TakeHomeAssignment | Self::ImplementExistingSpecification
+        )
     }
 
     pub fn is_take_home_assignment(self) -> bool {
         matches!(self, Self::TakeHomeAssignment)
+    }
+
+    /// This mode starts after specification approval: its supplied document is
+    /// already the authoritative approved specification.
+    pub fn uses_existing_specification(self) -> bool {
+        matches!(self, Self::ImplementExistingSpecification)
     }
 }
 
@@ -118,7 +129,13 @@ impl OutputTarget {
 pub struct TaskRequest {
     pub kind: TaskKind,
     pub title: String,
+    #[serde(default)]
     pub description: String,
+    /// An already-authored specification for `implement_existing_specification`.
+    /// It is validated before a task is created and never treated as a prompt
+    /// for the proposer/debate path.
+    #[serde(default)]
+    pub specification: Option<String>,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
     #[serde(default)]
@@ -165,11 +182,13 @@ impl TaskRequest {
         if self.title.trim().is_empty() {
             return Err("title cannot be empty".into());
         }
-        if self.description.trim().is_empty() {
+        if self.description.trim().is_empty() && !self.kind.uses_existing_specification() {
             return Err("description cannot be empty".into());
         }
         match self.kind {
-            TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
+            TaskKind::NewProject
+            | TaskKind::TakeHomeAssignment
+            | TaskKind::ImplementExistingSpecification => {
                 if self.project_id.is_some() {
                     return Err(format!(
                         "{} must not reference an existing project",
@@ -207,6 +226,15 @@ impl TaskRequest {
                 {
                     return Err("take-home assignment requires persistent output".into());
                 }
+                if self.kind.uses_existing_specification() {
+                    let specification = self.specification.as_deref().unwrap_or_default();
+                    crate::spec::validate_format(specification)
+                        .map_err(|error| format!("invalid existing specification: {error:#}"))?;
+                } else if self.specification.is_some() {
+                    return Err(
+                        "only implement existing specification accepts a specification".into(),
+                    );
+                }
             }
             TaskKind::Feature | TaskKind::BugFix => {
                 if self.project_id.is_none() {
@@ -214,6 +242,11 @@ impl TaskRequest {
                         "{} requires a registered project",
                         self.kind.label()
                     ));
+                }
+                if self.specification.is_some() {
+                    return Err(
+                        "only implement existing specification accepts a specification".into(),
+                    );
                 }
                 if self.technology.is_some() || self.output.is_some() || self.destination.is_some()
                 {
@@ -372,6 +405,25 @@ pub enum AgentStage {
     ImplementationReview,
 }
 
+/// Where the authoritative specification came from. This is durable audit
+/// state, so recovery and evidence exports do not have to infer it from a
+/// missing debate transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecificationSource {
+    GeneratedByAgents,
+    UserProvided,
+}
+
+impl SpecificationSource {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::GeneratedByAgents => "generated_by_agents",
+            Self::UserProvided => "user_provided",
+        }
+    }
+}
+
 /// Everything worth telling a watcher about, as it happens.
 ///
 /// `#[serde(tag = "type")]` puts a discriminator in the JSON, so the browser
@@ -463,6 +515,13 @@ pub enum TaskEvent {
         markdown: String,
         path: String,
     },
+    /// A format-validated document supplied by the user at task creation.
+    /// It deliberately has no associated proposer or debate activity.
+    SpecificationImported {
+        markdown: String,
+        path: String,
+        source: SpecificationSource,
+    },
 
     /// The exact specification accepted at Gate 2. This becomes the task's
     /// authoritative specification for the UI, implementation, and replay.
@@ -477,6 +536,11 @@ pub enum TaskEvent {
     /// so the event stream carries role/provider/model too (task 0005).
     AgentsSelected {
         agents: AgentSelection,
+    },
+    /// Direct-specification tasks freeze only the two roles they can use.
+    ImplementationAgentsSelected {
+        critic: crate::agent::ChatAgentConfig,
+        worker: crate::agent::CodingAgentConfig,
     },
 
     MilestonePlanCreated {
@@ -754,7 +818,7 @@ impl TaskEvent {
                     clean(reason);
                 }
             }
-            Self::Spec { markdown, path } => {
+            Self::Spec { markdown, path } | Self::SpecificationImported { markdown, path, .. } => {
                 clean(markdown);
                 clean(path);
             }
@@ -997,6 +1061,10 @@ impl TaskEvent {
                 clean(&mut agents.critic.model);
                 clean(&mut agents.worker.model);
             }
+            Self::ImplementationAgentsSelected { critic, worker } => {
+                clean(&mut critic.model);
+                clean(&mut worker.model);
+            }
             Self::TaskCreated { .. }
             | Self::TaskStarted
             | Self::Status { .. }
@@ -1226,6 +1294,10 @@ pub struct Task {
     #[serde(skip, default)]
     worker_output_truncated: bool,
     pub spec: Option<String>,
+    /// How `spec` became authoritative. Older snapshots default to `None` and
+    /// legacy `Spec` journal events restore the generated source on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specification_source: Option<SpecificationSource>,
     pub error: Option<String>,
     /// Set once the human answers Gate 2 (DP-11).
     pub decision: Option<Decision>,
@@ -1301,6 +1373,7 @@ impl Task {
             next_event_sequence: 1,
             worker_output_truncated: false,
             spec: None,
+            specification_source: None,
             error: None,
             decision: None,
             rebuild_workspace_retained: false,
@@ -1356,7 +1429,11 @@ impl Task {
             history_limits: HistoryLimits::default(),
             next_event_sequence: 1,
             worker_output_truncated: false,
-            spec: None,
+            spec: request.specification.clone(),
+            specification_source: request
+                .kind
+                .uses_existing_specification()
+                .then_some(SpecificationSource::UserProvided),
             error: None,
             decision: None,
             rebuild_workspace_retained: false,
@@ -1515,6 +1592,15 @@ impl Task {
             TaskEvent::Status { status } => self.status = status,
             TaskEvent::Spec { ref markdown, .. } | TaskEvent::SpecApproved { ref markdown } => {
                 self.spec = Some(markdown.clone());
+                self.specification_source = Some(SpecificationSource::GeneratedByAgents);
+            }
+            TaskEvent::SpecificationImported {
+                ref markdown,
+                source,
+                ..
+            } => {
+                self.spec = Some(markdown.clone());
+                self.specification_source = Some(source);
             }
             TaskEvent::Inspection { ref profile, .. } => self.profile = Some(profile.clone()),
             TaskEvent::Result { ref result } => self.result = Some(result.clone()),
@@ -2134,6 +2220,7 @@ impl TaskManager {
                 } else {
                     description
                 },
+                specification: None,
                 project_id: None,
                 technology: Some(TechStack::Rust),
                 output: Some(OutputTarget::ReviewableResult),
@@ -2168,6 +2255,27 @@ impl TaskManager {
         .sanitized(&self.inner.redactor)
         .bounded(self.inner.history_limits);
         task.record_event(created);
+        if task.kind.uses_existing_specification() {
+            let markdown = task
+                .spec
+                .clone()
+                .expect("validated existing-specification task has a specification");
+            let imported = TaskEvent::SpecificationImported {
+                markdown,
+                path: format!("artifacts/{}", crate::spec::APPROVED_SPEC_FILENAME),
+                source: SpecificationSource::UserProvided,
+            }
+            .sanitized(&self.inner.redactor)
+            .bounded(self.inner.history_limits);
+            task.record_event(imported);
+            // Direct entry is explicitly user-approved at creation; it skips
+            // the separate debate/spec approval gate but uses the identical
+            // approved-spec state consumed by the build pipeline.
+            task.decision = Some(Decision {
+                approve: true,
+                spec: task.spec.clone(),
+            });
+        }
         if let Some(store) = &self.inner.store {
             store
                 .persist_new_task(&task)
@@ -3290,6 +3398,7 @@ mod tests {
             kind: TaskKind::NewProject,
             title: "Service".into(),
             description: "Build a service".into(),
+            specification: None,
             project_id: None,
             technology: Some(TechStack::Python),
             output: Some(OutputTarget::ReviewableResult),
@@ -3317,6 +3426,7 @@ mod tests {
             kind: TaskKind::TakeHomeAssignment,
             title: "Candidate portal".into(),
             description: "Build the requested assignment".into(),
+            specification: None,
             project_id: None,
             technology: Some(TechStack::TypeScriptNode),
             // The browser may omit these defaults; the domain is authoritative.
@@ -3341,6 +3451,7 @@ mod tests {
             kind: TaskKind::TakeHomeAssignment,
             title: "Candidate portal".into(),
             description: "Build the requested assignment".into(),
+            specification: None,
             project_id: None,
             technology: Some(TechStack::Python),
             output: None,
@@ -3369,6 +3480,7 @@ mod tests {
                 kind: TaskKind::TakeHomeAssignment,
                 title: "Candidate portal".into(),
                 description: "Build the requested assignment".into(),
+                specification: None,
                 project_id: None,
                 technology: Some(TechStack::Rust),
                 output: None,
@@ -3478,6 +3590,7 @@ mod tests {
                 kind: TaskKind::TakeHomeAssignment,
                 title: "Candidate portal".into(),
                 description: "Build the requested assignment".into(),
+                specification: None,
                 project_id: None,
                 technology: Some(TechStack::Rust),
                 output: None,
@@ -3514,6 +3627,7 @@ mod tests {
                 kind,
                 title: "Change".into(),
                 description: "Make the requested change".into(),
+                specification: None,
                 project_id: Some(Uuid::new_v4()),
                 technology: None,
                 output: None,
@@ -3538,6 +3652,7 @@ mod tests {
             kind: TaskKind::NewProject,
             title: "".into(),
             description: "".into(),
+            specification: None,
             project_id: None,
             technology: Some(TechStack::Custom),
             output: Some(OutputTarget::ReviewableResult),
@@ -3551,6 +3666,72 @@ mod tests {
             ..request
         };
         assert!(request.validate().unwrap_err().contains("description"));
+    }
+
+    #[test]
+    fn existing_specification_is_validated_and_recorded_as_user_provided() {
+        let specification = "# Specification\n\n## Goal\n\nBuild it.\n\n## Requirements\n\n- It works.\n\n## Acceptance Criteria\n\n- The behavior works.\n\n## Steps\n\n1. Implement the behavior\n\n## Verification\n\n- cargo test\n";
+        let request = TaskRequest {
+            kind: TaskKind::ImplementExistingSpecification,
+            title: "Implement supplied design".into(),
+            description: String::new(),
+            specification: Some(specification.into()),
+            project_id: None,
+            technology: Some(TechStack::Rust),
+            output: Some(OutputTarget::ReviewableResult),
+            destination: None,
+            agents: None,
+            git_mode: None,
+        };
+        let manager = TaskManager::new();
+        let task = manager
+            .create_from_request(request, AgentSelection::compiled_defaults())
+            .unwrap();
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.spec.as_deref(), Some(specification));
+        assert_eq!(
+            stored.specification_source,
+            Some(SpecificationSource::UserProvided)
+        );
+        assert!(
+            stored
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.approve)
+        );
+        assert!(stored.history.iter().any(|event| matches!(
+            event.event,
+            TaskEvent::SpecificationImported {
+                source: SpecificationSource::UserProvided,
+                ..
+            }
+        )));
+        assert!(!stored.history.iter().any(|event| matches!(
+            event.event,
+            TaskEvent::Proposal { .. } | TaskEvent::Critique { .. } | TaskEvent::SpecGenerated
+        )));
+    }
+
+    #[test]
+    fn existing_specification_rejects_invalid_format_before_creation() {
+        let request = TaskRequest {
+            kind: TaskKind::ImplementExistingSpecification,
+            title: "Bad supplied design".into(),
+            description: String::new(),
+            specification: Some("not a specification".into()),
+            project_id: None,
+            technology: Some(TechStack::Rust),
+            output: Some(OutputTarget::ReviewableResult),
+            destination: None,
+            agents: None,
+            git_mode: None,
+        };
+        assert!(
+            request
+                .validate()
+                .unwrap_err()
+                .contains("invalid existing specification")
+        );
     }
 }
 #[cfg(test)]

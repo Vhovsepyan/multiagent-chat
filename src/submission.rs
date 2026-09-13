@@ -905,6 +905,7 @@ mod tests {
                     kind: crate::task::TaskKind::NewProject,
                     title: "Event service".into(),
                     description: "Manage events and remind attendees.".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(TechStack::Rust),
                     output: Some(crate::task::OutputTarget::ReviewableResult),

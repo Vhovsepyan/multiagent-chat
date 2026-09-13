@@ -32,6 +32,7 @@
       <select id="kind" name="kind" onchange="syncTaskFields()">
         <option value="new_project">New Project</option>
         <option value="take_home_assignment">Take-home Assignment</option>
+        <option value="implement_existing_specification">Implement Existing Specification</option>
         <option value="feature">Feature</option>
         <option value="bug_fix">Bug Fix</option>
       </select>
@@ -71,12 +72,17 @@
       <label for="description">Description</label>
       <textarea id="description" name="description" required
                 placeholder="Describe the required behavior, constraints, and acceptance expectations."></textarea>
+      <div id="specification-field" hidden>
+        <label for="specification">Approved specification</label>
+        <textarea id="specification" name="specification" disabled placeholder="Paste the complete approved Markdown specification."></textarea>
+        <div class="hint">The specification must satisfy the format contract. It is used directly; no proposer debate or specification generation runs.</div>
+      </div>
 
       <!-- Agent selection (task 0005). The options come from /api/agents, so no
            model name is hard-coded here. -->
       <h3 class="section agents-title">Agents</h3>
       <div id="agent-selection" class="agents-form">
-        <div class="agent-row">
+        <div class="agent-row" data-proposer-row>
           <label for="proposer_provider">Proposer</label>
           <div class="row">
             <select id="proposer_provider" name="proposer_provider" data-role="proposer"></select>
@@ -118,7 +124,8 @@
       const kind = document.getElementById('kind').value;
       const isNew = kind === 'new_project';
       const isTakeHome = kind === 'take_home_assignment';
-      const createsProject = isNew || isTakeHome;
+      const isExistingSpec = kind === 'implement_existing_specification';
+      const createsProject = isNew || isTakeHome || isExistingSpec;
       const existing = document.getElementById('existing-fields');
       const fresh = document.getElementById('new-fields');
       existing.hidden = createsProject;
@@ -126,6 +133,13 @@
       document.getElementById('project_id').disabled = createsProject;
       document.getElementById('technology').disabled = !createsProject;
       document.getElementById('output').disabled = !createsProject;
+      document.getElementById('specification-field').hidden = !isExistingSpec;
+      document.getElementById('specification').disabled = !isExistingSpec;
+      document.getElementById('specification').required = isExistingSpec;
+      document.getElementById('description').required = !isExistingSpec;
+      document.querySelector('[data-proposer-row]').hidden = isExistingSpec;
+      document.getElementById('proposer_provider').disabled = isExistingSpec;
+      document.getElementById('proposer_model').disabled = isExistingSpec;
       if (isTakeHome) {
         document.getElementById('output').value = 'persistent_local_project';
         document.getElementById('git_mode').value = 'commit_per_milestone';
@@ -144,7 +158,7 @@
     // the request free of a field the server would have to reject.
     function syncOutputFields() {
       const kind = document.getElementById('kind').value;
-      const createsProject = kind === 'new_project' || kind === 'take_home_assignment';
+      const createsProject = kind === 'new_project' || kind === 'take_home_assignment' || kind === 'implement_existing_specification';
       const isTakeHome = kind === 'take_home_assignment';
       const persistent = document.getElementById('output').value === 'persistent_local_project';
       const field = document.getElementById('destination-field');
@@ -220,6 +234,7 @@
     }
 
     function renderAgents() {
+      const isExistingSpec = document.getElementById('kind').value === 'implement_existing_specification';
       AGENT_ROLES.forEach(function (config) {
         const providerSelect = document.getElementById(config.selector);
         const modelSelect = document.getElementById(config.models);
@@ -236,6 +251,9 @@
         }
         providerSelect.onchange = function () { syncModels(config, true); };
       });
+      document.querySelector('[data-proposer-row]').hidden = isExistingSpec;
+      document.getElementById('proposer_provider').disabled = isExistingSpec;
+      document.getElementById('proposer_model').disabled = isExistingSpec;
       if (agentOptions.unavailable) {
         document.getElementById('agent-hint').textContent = agentOptions.unavailable;
       }

@@ -249,10 +249,21 @@ async fn run(
     // Task 0005: the run uses the selection frozen on the task, and it is
     // resolved BEFORE any workspace or API work so an unavailable provider
     // fails immediately instead of half-way through a build.
-    let agents = crate::agent::resolve(&task.agents, &state.config)?;
-    emitter.emit(TaskEvent::AgentsSelected {
-        agents: task.agents.clone(),
-    });
+    let agents = if task.kind.uses_existing_specification() {
+        crate::agent::resolve_implementation(&task.agents, &state.config)?
+    } else {
+        crate::agent::resolve(&task.agents, &state.config)?
+    };
+    if task.kind.uses_existing_specification() {
+        emitter.emit(TaskEvent::ImplementationAgentsSelected {
+            critic: task.agents.critic.clone(),
+            worker: task.agents.worker.clone(),
+        });
+    } else {
+        emitter.emit(TaskEvent::AgentsSelected {
+            agents: task.agents.clone(),
+        });
+    }
 
     // Task 0010: an unusable persistent destination is reported here, before any
     // agent or workspace work, rather than after a whole run has been paid for.
@@ -283,7 +294,9 @@ async fn run(
         (profile, "Retained workspace from a failed approved build. Inspect existing partial work before making changes.".into())
     } else {
         match task.kind {
-            TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
+            TaskKind::NewProject
+            | TaskKind::TakeHomeAssignment
+            | TaskKind::ImplementExistingSpecification => {
                 let technology = task.technology.clone().ok_or_else(|| {
                     anyhow::anyhow!("new project task has no selected technology")
                 })?;
@@ -332,7 +345,7 @@ async fn run(
         });
     }
 
-    if !retry {
+    if !retry && !task.kind.uses_existing_specification() {
         let topic = format!(
             "{}\n\n{}",
             task.topic(),
@@ -340,7 +353,7 @@ async fn run(
         );
         emitter.status(TaskStatus::Debating);
         let outcome = crate::debate::run(
-            agents.proposer.as_ref(),
+            agents.proposer.as_deref().expect("debate has a proposer"),
             agents.critic.as_ref(),
             &topic,
             state.config.max_rounds,
@@ -350,7 +363,10 @@ async fn run(
 
         emitter.status(TaskStatus::GeneratingSpec);
         let document = spec::build(
-            agents.proposer.as_ref(),
+            agents
+                .proposer
+                .as_deref()
+                .expect("specification generation has a proposer"),
             agents.critic.as_ref(),
             &outcome.transcript,
             outcome.approved,
@@ -386,6 +402,21 @@ async fn run(
                 .await??,
             );
         }
+    } else if !retry && workspace.is_none() {
+        // The direct specification was validated and marked approved during
+        // creation. It enters the ordinary build path at the same workspace
+        // boundary used after a human approves a generated document.
+        let provider = state.workspaces.clone();
+        *workspace = Some(
+            tokio::task::spawn_blocking(move || {
+                provider.prepare(WorkspaceRequest {
+                    task_id: id,
+                    source: None,
+                    revision: None,
+                })
+            })
+            .await??,
+        );
     }
     let workspace_ref = workspace.as_ref().expect("workspace was prepared");
     let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
@@ -2293,6 +2324,7 @@ mod persistent_output_tests {
                     kind: TaskKind::NewProject,
                     title: "Invoice tool".into(),
                     description: "Generate invoices from a CSV file".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(TechStack::Rust),
                     output: Some(output),
@@ -2313,6 +2345,7 @@ mod persistent_output_tests {
                     kind: TaskKind::TakeHomeAssignment,
                     title: "Candidate portal".into(),
                     description: "Build the requested assignment".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(TechStack::Rust),
                     output: None,
@@ -2799,6 +2832,7 @@ mod review_loop_tests {
                         kind: TaskKind::Feature,
                         title: "Invoice module".into(),
                         description: "Add invoices".into(),
+                        specification: None,
                         project_id: Some(uuid::Uuid::new_v4()),
                         technology: None,
                         output: None,

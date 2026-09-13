@@ -48,7 +48,13 @@ impl TaskStore {
     }
 
     pub(crate) fn persist_new_task(&self, task: &Task) -> Result<()> {
-        self.append_json(&self.events_path(task.id), &task.history[0])?;
+        // Creation can include more than the initial TaskCreated audit record:
+        // a validated user-provided specification is authoritative before the
+        // task is inserted. Persist the full initial prefix before checkpointing
+        // the snapshot so its committed sequence is recoverable.
+        for event in &task.history {
+            self.append_json(&self.events_path(task.id), event)?;
+        }
         self.write_snapshot(task)
     }
 
@@ -500,6 +506,7 @@ mod tests {
                     kind: TaskKind::NewProject,
                     title: "OpenAI durable selection".into(),
                     description: "Keep the resolved provider and model".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(crate::technology::TechStack::Rust),
                     output: Some(OutputTarget::ReviewableResult),
@@ -525,6 +532,50 @@ mod tests {
             ChatProvider::Anthropic
         );
         assert_eq!(restored_task.agents.worker.tool, CodingTool::Codex);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restores_user_provided_specification_and_approved_build_state() {
+        let root = root("existing-specification");
+        let manager = new_manager(&root);
+        let specification = "# Specification\n\n## Goal\n\nBuild it.\n\n## Requirements\n\n- It works.\n\n## Acceptance Criteria\n\n- It works.\n\n## Steps\n\n1. Implement it\n\n## Verification\n\n- cargo test\n";
+        let task = manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::ImplementExistingSpecification,
+                    title: "Durable existing specification".into(),
+                    description: String::new(),
+                    specification: Some(specification.into()),
+                    project_id: None,
+                    technology: Some(crate::technology::TechStack::Rust),
+                    output: Some(OutputTarget::ReviewableResult),
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap();
+        drop(manager);
+
+        let restored = new_manager(&root);
+        let task = restored.get(task.id).unwrap();
+        assert_eq!(task.spec.as_deref(), Some(specification));
+        assert_eq!(
+            task.specification_source,
+            Some(crate::task::SpecificationSource::UserProvided)
+        );
+        assert!(
+            task.decision
+                .as_ref()
+                .is_some_and(|decision| decision.approve)
+        );
+        assert!(
+            task.history
+                .iter()
+                .any(|recorded| matches!(recorded.event, TaskEvent::SpecificationImported { .. }))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

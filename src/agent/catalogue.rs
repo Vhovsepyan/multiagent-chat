@@ -17,6 +17,7 @@ use crate::agent::selection::{
     CodingAgentConfig, CodingAgentRequest, CodingTool,
 };
 use crate::config::Config;
+use crate::task::TaskKind;
 
 /// The models configured for one provider or tool, and which is preselected.
 ///
@@ -200,6 +201,30 @@ impl AgentCatalogue {
         })
     }
 
+    /// Direct-specification tasks never call a proposer. Resolve just the
+    /// critic and worker so a missing Gemini/proposer credential cannot block
+    /// a path that has no debate or spec-generation stage. `AgentSelection`
+    /// remains backwards-compatible; its unused proposer slot mirrors the
+    /// frozen critic and is never instantiated by this mode.
+    pub fn resolve_for_task(
+        &self,
+        kind: TaskKind,
+        request: Option<&AgentSelectionRequest>,
+    ) -> Result<AgentSelection, String> {
+        if !kind.uses_existing_specification() {
+            return self.resolve(request);
+        }
+        let empty = AgentSelectionRequest::default();
+        let request = request.unwrap_or(&empty);
+        let critic =
+            self.resolve_chat("critic", request.critic.as_ref(), ChatProvider::Anthropic)?;
+        Ok(AgentSelection {
+            proposer: critic.clone(),
+            critic,
+            worker: self.resolve_worker(request.worker.as_ref())?,
+        })
+    }
+
     fn resolve_chat(
         &self,
         role: &str,
@@ -295,6 +320,21 @@ mod tests {
         assert_eq!(resolved.critic.model, "critic-model");
         assert_eq!(resolved.worker.tool, CodingTool::ClaudeCode);
         assert_eq!(resolved.worker.model, "worker-model");
+    }
+
+    #[test]
+    fn existing_specification_does_not_require_a_proposer_provider() {
+        let mut config = configured();
+        config.gemini_api_key = None;
+        let catalogue = AgentCatalogue::from_config(&config);
+        let resolved = catalogue
+            .resolve_for_task(TaskKind::ImplementExistingSpecification, None)
+            .unwrap();
+
+        assert_eq!(resolved.critic.provider, ChatProvider::Anthropic);
+        assert_eq!(resolved.worker.tool, CodingTool::ClaudeCode);
+        // The compatibility slot is never invoked by the direct-spec pipeline.
+        assert_eq!(resolved.proposer, resolved.critic);
     }
 
     /// The configured default is always offered, even if the model list left

@@ -1,6 +1,6 @@
 # multiagent-chat
 
-A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace.
+A Rust web application for repository-backed, multi-agent software engineering. A proposer agent designs a solution, a critic agent reviews it, the application produces an editable specification, and a worker agent implements the user-approved result in an isolated task workspace. A user can also supply a format-valid approved specification directly; that path skips proposal, debate, and specification generation while retaining milestone execution, verification, implementation review, and evidence.
 
 The proposer, critic, and worker are selected per task. Proposer and critic each use a configured chat provider and one of its configured models (Gemini, Anthropic, or OpenAI); the worker uses a configured coding tool and model (Claude Code or Codex). The resolved choice is stored on the task, so a run is not affected by later configuration changes. With no explicit choice, a task uses the existing defaults — proposer Gemini, critic Anthropic, worker Claude Code. See [Agent selection](#agent-selection).
 
@@ -8,6 +8,7 @@ Multiagent Chat supports four task kinds:
 
 - New Project for a selected technology stack.
 - Take-home Assignment for a persistent, evidence-backed evaluation project.
+- Implement Existing Specification for a validated user-provided specification without a proposer debate.
 - Feature for a registered repository.
 - Bug Fix for a registered repository.
 
@@ -56,7 +57,7 @@ cargo run -- --help
 In the web UI:
 
 1. Register a public GitHub repository using `owner/repository` or its HTTPS URL when working on existing code.
-2. Create a New Project, Take-home Assignment, Feature, or Bug Fix task.
+2. Create a New Project, Take-home Assignment, Implement Existing Specification, Feature, or Bug Fix task.
 3. Watch repository inspection and the proposer/critic debate through SSE.
 4. Review or edit the generated specification.
 5. Approve implementation.

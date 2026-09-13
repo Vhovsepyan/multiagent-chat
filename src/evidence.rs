@@ -475,6 +475,10 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             (format!("Critique recorded (round {round})"), details)
         }
         TaskEvent::Spec { .. } => ("Specification stored".into(), vec![]),
+        TaskEvent::SpecificationImported { source, .. } => (
+            "User-provided specification imported".into(),
+            vec![format!("Specification source: {}", source.id())],
+        ),
         TaskEvent::SpecApproved { .. } => ("Specification approved".into(), vec![]),
         TaskEvent::SpecGenerated => ("Specification generated".into(), vec![]),
         TaskEvent::SpecUpdated => ("Specification edited by user".into(), vec![]),
@@ -493,6 +497,21 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
                     )
                 })
                 .collect(),
+        ),
+        TaskEvent::ImplementationAgentsSelected { critic, worker } => (
+            "Implementation agent selection recorded".into(),
+            vec![
+                format!(
+                    "Critic: {} / {}",
+                    critic.provider.label(),
+                    markdown_inline(&critic.model)
+                ),
+                format!(
+                    "Worker: {} / {}",
+                    worker.tool.label(),
+                    markdown_inline(&worker.model)
+                ),
+            ],
         ),
         TaskEvent::Inspection {
             source_revision, ..
@@ -1429,9 +1448,9 @@ fn event_contains_truncation(event: &TaskEvent) -> bool {
         TaskEvent::Proposal { text, .. } | TaskEvent::Critique { text, .. } => {
             text.contains(TRUNCATED)
         }
-        TaskEvent::Spec { markdown, .. } | TaskEvent::SpecApproved { markdown } => {
-            markdown.contains(TRUNCATED)
-        }
+        TaskEvent::Spec { markdown, .. }
+        | TaskEvent::SpecificationImported { markdown, .. }
+        | TaskEvent::SpecApproved { markdown } => markdown.contains(TRUNCATED),
         TaskEvent::Verification { result } => result.output.contains(TRUNCATED),
         TaskEvent::Result { result } => {
             result.diff.contains(TRUNCATED)
@@ -1563,6 +1582,7 @@ mod tests {
                     kind: TaskKind::NewProject,
                     title: "Evidence task".into(),
                     description: "Review the actual run".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(TechStack::Rust),
                     output: Some(OutputTarget::ReviewableResult),
@@ -1684,6 +1704,7 @@ mod tests {
                     kind: TaskKind::TakeHomeAssignment,
                     title: "Candidate portal".into(),
                     description: "Build the requested assignment".into(),
+                    specification: None,
                     project_id: None,
                     technology: Some(TechStack::Python),
                     output: None,

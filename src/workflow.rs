@@ -106,6 +106,9 @@ fn kind_instruction(kind: TaskKind) -> &'static str {
         TaskKind::TakeHomeAssignment => {
             "Design a complete take-home assignment from the stated requirements and selected stack. Make the implementation demonstrable, testable, and ready for the required persistent handoff; do not assume Rust or add unrelated infrastructure."
         }
+        TaskKind::ImplementExistingSpecification => {
+            "The user supplied the approved implementation specification. Do not generate, debate, or alter its scope."
+        }
         TaskKind::Feature => {
             "Inspect the existing architecture and task-relevant code. Propose the smallest compatible feature change and regression coverage; do not recreate the application."
         }

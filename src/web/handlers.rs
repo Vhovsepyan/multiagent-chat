@@ -240,7 +240,7 @@ pub async fn create_task(
     // so an invalid combination is a 400 rather than a task that fails later.
     let agents = state
         .catalogue
-        .resolve(request.agents.as_ref())
+        .resolve_for_task(request.kind, request.agents.as_ref())
         .map_err(ApiError::bad_request)?;
 
     let task = state

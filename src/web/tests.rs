@@ -391,6 +391,68 @@ async fn creating_a_new_project_task_returns_typed_task_without_user_path() {
 }
 
 #[tokio::test]
+async fn user_provided_specification_skips_the_approval_gate_and_is_audited() {
+    let (state, root) = test_state("existing-specification");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "implement_existing_specification",
+                "title": "Build supplied design",
+                "description": "",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "specification": "# Specification\n\n## Goal\n\nBuild it.\n\n## Requirements\n\n- It works.\n\n## Acceptance Criteria\n\n- The behavior works.\n\n## Steps\n\n1. Implement the behavior\n\n## Verification\n\n- cargo test\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(body["specification_source"], "user_provided");
+    assert_eq!(body["decision"]["approve"], true);
+    assert!(
+        body["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["event"]["type"] == "specification_imported" })
+    );
+    assert!(!body["history"].as_array().unwrap().iter().any(|event| {
+        event["event"]["type"] == "proposal" || event["event"]["type"] == "critique"
+    }));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn malformed_user_provided_specification_is_rejected_before_task_creation() {
+    let (state, root) = test_state("invalid-existing-specification");
+    let response = router(state.clone())
+        .oneshot(post(
+            "/api/tasks",
+            json!({
+                "kind": "implement_existing_specification",
+                "title": "Bad design",
+                "description": "",
+                "technology": "rust",
+                "output": "reviewable_result",
+                "specification": "not markdown contract"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid existing specification")
+    );
+    assert_eq!(state.manager.len(), 0);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn creating_a_task_rejects_an_empty_title() {
     let (state, root) = test_state("empty-title");
 
@@ -2222,6 +2284,7 @@ async fn take_home_task_page_shows_an_evidence_based_completion_checklist() {
                 kind: crate::task::TaskKind::TakeHomeAssignment,
                 title: "Candidate portal".into(),
                 description: "Build the requested assignment".into(),
+                specification: None,
                 project_id: None,
                 technology: Some(crate::technology::TechStack::Rust),
                 output: None,
@@ -2265,6 +2328,15 @@ fn task_creation_form_exposes_take_home_configuration() {
         form.contains("persistent_local_project") && form.contains("commit_per_milestone"),
         "take-home defaults are not visible in the form"
     );
+}
+
+#[test]
+fn task_creation_form_exposes_existing_specification_without_a_proposer_selector() {
+    let form = include_str!("static/index.html");
+    assert!(form.contains("value=\"implement_existing_specification\""));
+    assert!(form.contains("name=\"specification\""));
+    assert!(form.contains("data-proposer-row"));
+    assert!(form.contains("isExistingSpec"));
 }
 
 /// The form carries the same choice, and an unknown value is refused.
