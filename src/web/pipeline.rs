@@ -13,7 +13,8 @@ use crate::project::Project;
 use crate::review::{MilestoneReview, Review, ReviewRequest};
 use crate::spec;
 use crate::task::{
-    AgentStage, Emitter, Task, TaskEvent, TaskId, TaskKind, TaskManager, TaskResult, TaskStatus,
+    AgentStage, Emitter, Task, TaskEvent, TaskId, TaskKind, TaskManager, TaskRepositorySource,
+    TaskResult, TaskStatus,
 };
 use crate::technology::ProjectProfile;
 use crate::verification::{VerificationCommand, VerificationResult};
@@ -275,14 +276,13 @@ async fn run(
         ));
     }
 
-    let project = match task.project_id {
-        Some(project_id) => Some(
-            state
-                .projects
-                .get(project_id)
-                .ok_or_else(|| anyhow::anyhow!("registered project no longer exists"))?,
-        ),
-        None => None,
+    let project = task
+        .project_id
+        .and_then(|project_id| state.projects.get(project_id));
+    let repository_source = if task.targets_new_project() {
+        None
+    } else {
+        Some(resolve_repository_source(&task, project.as_ref())?)
     };
 
     let targets_new_project = task.targets_new_project();
@@ -304,10 +304,10 @@ async fn run(
                 "New empty project".into(),
             )
         } else {
-            let project = project
+            let source = repository_source
                 .as_ref()
-                .expect("validated existing task has project");
-            *workspace = Some(prepare_existing(state, id, project).await?);
+                .expect("validated existing task has repository source");
+            *workspace = Some(prepare_existing(state, id, source).await?);
             let prepared = workspace.as_ref().expect("workspace was prepared");
             let path = prepared.path.clone();
             let title = task.title.clone();
@@ -325,7 +325,9 @@ async fn run(
             })
             .await??;
             let profile = inspection.profile.clone();
-            state.projects.set_profile(project.id, profile.clone());
+            if let Some(project) = project.as_ref() {
+                state.projects.set_profile(project.id, profile.clone());
+            }
             let context = inspection.prompt_context();
             emitter.emit(TaskEvent::Inspection {
                 profile: profile.clone(),
@@ -1671,28 +1673,59 @@ impl ReviewLoop<'_> {
 async fn prepare_existing(
     state: &AppState,
     id: TaskId,
-    project: &Project,
+    source: &TaskRepositorySource,
 ) -> Result<TaskWorkspace> {
+    let project_source = source
+        .source()
+        .map_err(|error| anyhow::anyhow!("invalid durable repository source: {error}"))?;
+    let revision = source.default_branch.clone();
     let provider = state.workspaces.clone();
-    let project = project.clone();
     tokio::task::spawn_blocking(move || {
         provider.prepare(WorkspaceRequest {
             task_id: id,
-            source: Some(&project.source),
-            revision: Some(&project.default_branch),
+            source: Some(&project_source),
+            revision: Some(&revision),
         })
     })
     .await?
+}
+
+/// Resolve immutable source metadata from the task first. Legacy tasks created
+/// before 0026 may fall back to a still-registered project, but a missing
+/// registry entry never permits a guessed repository.
+fn resolve_repository_source(
+    task: &Task,
+    registered: Option<&Project>,
+) -> Result<TaskRepositorySource> {
+    if let Some(source) = &task.repository_source {
+        source
+            .source()
+            .map_err(|error| anyhow::anyhow!("invalid durable repository source: {error}"))?;
+        return Ok(source.clone());
+    }
+    registered
+        .map(TaskRepositorySource::from_project)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "historical repository identity is unavailable; re-register the original project before rebuilding this legacy task"
+            )
+        })
 }
 
 /// Reopen and validate a workspace retained after a failed approved build.
 /// The provider derives the path from its managed root and task id; callers
 /// never supply a filesystem path from task state or the browser.
 async fn reopen_workspace(state: &AppState, task: &Task) -> Result<TaskWorkspace> {
-    let source = task
-        .project_id
-        .and_then(|id| state.projects.get(id))
-        .map(|project| project.source);
+    let registered = task.project_id.and_then(|id| state.projects.get(id));
+    let source = if task.targets_new_project() {
+        None
+    } else {
+        Some(
+            resolve_repository_source(task, registered.as_ref())?
+                .source()
+                .map_err(|error| anyhow::anyhow!("invalid durable repository source: {error}"))?,
+        )
+    };
     let baseline = task
         .result
         .as_ref()
@@ -2718,7 +2751,8 @@ mod persistent_output_tests {
 mod existing_specification_pipeline_tests {
     use super::*;
     use crate::agent::AgentSelection;
-    use crate::project::{Project, ProjectSource};
+    use crate::milestone::MilestoneStatus;
+    use crate::project::{Project, ProjectSource, ProjectStore};
     use crate::task::{TaskKind, TaskRequest};
     use crate::workspace::{LocalWorkspaceProvider, WorkspaceProvider};
     use std::path::Path;
@@ -2729,6 +2763,7 @@ mod existing_specification_pipeline_tests {
     struct ExistingProjectWorkspace {
         provider: LocalWorkspaceProvider,
         prepared_source: Mutex<Option<(String, String)>>,
+        reopened_source: Mutex<Option<String>>,
     }
 
     impl ExistingProjectWorkspace {
@@ -2791,6 +2826,9 @@ mod existing_specification_pipeline_tests {
         }
 
         fn reopen(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+            *self.reopened_source.lock().unwrap() = request
+                .source
+                .map(|source| source.repository_identity().to_owned());
             self.provider.reopen(request)
         }
 
@@ -2805,6 +2843,7 @@ mod existing_specification_pipeline_tests {
         let fixture = std::sync::Arc::new(ExistingProjectWorkspace {
             provider: LocalWorkspaceProvider::new(root.join("fixture-workspaces")).unwrap(),
             prepared_source: Mutex::new(None),
+            reopened_source: Mutex::new(None),
         });
         state.workspaces = fixture.clone();
         let project = state
@@ -2820,7 +2859,7 @@ mod existing_specification_pipeline_tests {
             .unwrap();
         let task = state
             .manager
-            .create_from_request(
+            .create_from_request_with_source(
                 TaskRequest {
                     kind: TaskKind::ImplementExistingSpecification,
                     title: "Update existing service".into(),
@@ -2834,8 +2873,13 @@ mod existing_specification_pipeline_tests {
                     git_mode: None,
                 },
                 AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&project)),
             )
             .unwrap();
+        // Simulate a restarted application whose ProjectStore has not been
+        // repopulated. The frozen task source must be sufficient to prepare
+        // and inspect the repository.
+        state.projects = ProjectStore::default();
         let emitter = state.manager.emitter(task.id);
         let mut workspace = None;
 
@@ -2870,6 +2914,200 @@ mod existing_specification_pipeline_tests {
             "direct specification must not invoke proposer/debate/spec generation"
         );
         fixture.cleanup(&workspace).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn restart_rebuild_uses_frozen_source_without_project_registry() {
+        let (mut state, root) = crate::web::tests::test_state("restart-frozen-source");
+        let fixture = std::sync::Arc::new(ExistingProjectWorkspace {
+            provider: LocalWorkspaceProvider::new(root.join("fixture-workspaces")).unwrap(),
+            prepared_source: Mutex::new(None),
+            reopened_source: Mutex::new(None),
+        });
+        state.workspaces = fixture.clone();
+        let project = Project::new(
+            "Restart project",
+            ProjectSource::github("owner/restart-project").unwrap(),
+            "main",
+        )
+        .unwrap();
+        let task = state
+            .manager
+            .create_from_request_with_source(
+                TaskRequest {
+                    kind: TaskKind::ImplementExistingSpecification,
+                    title: "Resume existing project".into(),
+                    description: String::new(),
+                    specification: Some(SPECIFICATION.into()),
+                    project_id: Some(project.id),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&project)),
+            )
+            .unwrap();
+        let workspace = fixture
+            .provider
+            .prepare(WorkspaceRequest {
+                task_id: task.id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        let emitter = state.manager.emitter(task.id);
+        emitter.emit(TaskEvent::MilestonePlanCreated {
+            milestones: vec![
+                Milestone {
+                    id: "m1".into(),
+                    order: 1,
+                    title: "Already passed".into(),
+                    objective: "keep progress".into(),
+                    verification_instructions: vec!["cargo test".into()],
+                    status: crate::milestone::MilestoneStatus::Passed,
+                    started_at: None,
+                    completed_at: None,
+                    worker_result_summary: None,
+                    commit: None,
+                    review: None,
+                    criteria: Vec::new(),
+                },
+                Milestone {
+                    id: "m2".into(),
+                    order: 2,
+                    title: "Resume here".into(),
+                    objective: "continue progress".into(),
+                    verification_instructions: vec!["cargo test".into()],
+                    status: crate::milestone::MilestoneStatus::Pending,
+                    started_at: None,
+                    completed_at: None,
+                    worker_result_summary: None,
+                    commit: None,
+                    review: None,
+                    criteria: Vec::new(),
+                },
+            ],
+        });
+        emitter.emit(TaskEvent::WorkspaceRetainedForRebuild);
+        emitter.emit(TaskEvent::TaskFailed {
+            error: "worker failed".into(),
+        });
+        let config = (*state.config).clone();
+        drop(state);
+
+        // Reconstruct the application with the durable task store and an
+        // empty ProjectStore. The retained workspace and frozen task source
+        // are sufficient to validate and begin the same rebuild.
+        let restarted = AppState::with_workspace(config, fixture.clone());
+        let restored = restarted.manager.get(task.id).unwrap();
+        assert!(restarted.projects.list().is_empty());
+        assert!(rebuild_workspace_available(&restarted, &restored).await);
+        validate_rebuild_workspace(&restarted, task.id)
+            .await
+            .unwrap();
+        assert_eq!(restarted.manager.begin_rebuild(task.id), Ok(2));
+        assert_eq!(
+            fixture.reopened_source.lock().unwrap().as_deref(),
+            Some("owner/restart-project")
+        );
+        let rebuilt = restarted.manager.get(task.id).unwrap();
+        assert_eq!(rebuilt.milestones[0].status, MilestoneStatus::Passed);
+        assert_eq!(
+            rebuilt
+                .history
+                .iter()
+                .filter_map(|recorded| match recorded.event {
+                    TaskEvent::BuildRetryStarted { resume_milestone } => Some(resume_milestone),
+                    _ => None,
+                })
+                .next_back(),
+            Some(2)
+        );
+        assert!(
+            rebuilt
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.approve)
+        );
+        fixture.cleanup(&workspace).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_source_wins_over_later_project_registration() {
+        let (state, root) = crate::web::tests::test_state("durable-source-wins");
+        let original = Project::new(
+            "Original",
+            ProjectSource::github("owner/original").unwrap(),
+            "main",
+        )
+        .unwrap();
+        let task = state
+            .manager
+            .create_from_request_with_source(
+                TaskRequest {
+                    kind: TaskKind::Feature,
+                    title: "Use original source".into(),
+                    description: "change it".into(),
+                    specification: None,
+                    project_id: Some(original.id),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&original)),
+            )
+            .unwrap();
+        let changed = Project::new(
+            "Changed",
+            ProjectSource::github("owner/changed").unwrap(),
+            "develop",
+        )
+        .unwrap();
+        let source = resolve_repository_source(&task, Some(&changed)).unwrap();
+        assert_eq!(source.repository, "owner/original");
+        assert_eq!(source.default_branch, "main");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_source_falls_back_to_registry_or_fails_actionably() {
+        let (state, root) = crate::web::tests::test_state("legacy-source-fallback");
+        let project = Project::new(
+            "Legacy",
+            ProjectSource::github("owner/legacy").unwrap(),
+            "main",
+        )
+        .unwrap();
+        let task = state
+            .manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::Feature,
+                    title: "Legacy task".into(),
+                    description: "change it".into(),
+                    specification: None,
+                    project_id: Some(project.id),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap();
+        let source = resolve_repository_source(&task, Some(&project)).unwrap();
+        assert_eq!(source.repository, "owner/legacy");
+        let error = resolve_repository_source(&task, None).unwrap_err();
+        assert!(error.to_string().contains("historical repository identity"));
         std::fs::remove_dir_all(root).ok();
     }
 }

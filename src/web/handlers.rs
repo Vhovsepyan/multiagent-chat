@@ -16,7 +16,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::agent::{AgentSelection, ModelOptions};
 use crate::project::{Project, ProjectSource};
-use crate::task::{Decision, Task, TaskId, TaskRequest, TaskStatus};
+use crate::task::{Decision, Task, TaskId, TaskRepositorySource, TaskRequest, TaskStatus};
 use crate::web::{AppState, pipeline};
 
 // ---------------------------------------------------------------------------
@@ -230,11 +230,15 @@ pub async fn create_task(
     ValidJson(request): ValidJson<TaskRequest>,
 ) -> ApiResult<(StatusCode, Json<Task>)> {
     request.validate().map_err(ApiError::bad_request)?;
-    if let Some(project_id) = request.project_id
-        && state.projects.get(project_id).is_none()
-    {
-        return Err(ApiError::bad_request("project is not registered"));
-    }
+    let project = if let Some(project_id) = request.project_id {
+        let project = state.projects.get(project_id);
+        if project.is_none() {
+            return Err(ApiError::bad_request("project is not registered"));
+        }
+        project
+    } else {
+        None
+    };
 
     // Task 0005: resolve and freeze the agent selection before the task exists,
     // so an invalid combination is a 400 rather than a task that fails later.
@@ -245,7 +249,11 @@ pub async fn create_task(
 
     let task = state
         .manager
-        .create_from_request(request, agents)
+        .create_from_request_with_source(
+            request,
+            agents,
+            project.as_ref().map(TaskRepositorySource::from_project),
+        )
         .map_err(ApiError::bad_request)?;
 
     pipeline::spawn(state.clone(), task.id);

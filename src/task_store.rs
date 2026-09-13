@@ -361,8 +361,10 @@ mod tests {
     use crate::evidence::{EvidencePayload, EvidenceStatus, WorkerRole, WorkerStage};
     use crate::git::RepositoryStatus;
     use crate::milestone::{Milestone, MilestoneStatus};
+    use crate::project::{Project, ProjectSource};
     use crate::task::{
-        GitHubPublication, OutputTarget, TaskEvent, TaskKind, TaskManager, TaskRequest, TaskStatus,
+        GitHubPublication, OutputTarget, TaskEvent, TaskKind, TaskManager, TaskRepositorySource,
+        TaskRequest, TaskStatus,
     };
 
     fn root(name: &str) -> PathBuf {
@@ -575,6 +577,57 @@ mod tests {
             task.history
                 .iter()
                 .any(|recorded| matches!(recorded.event, TaskEvent::SpecificationImported { .. }))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_project_source_survives_restart_without_project_store() {
+        let root = root("frozen-project-source");
+        let manager = new_manager(&root);
+        let project = Project::new(
+            "Original project",
+            ProjectSource::github("owner/original").unwrap(),
+            "main",
+        )
+        .unwrap();
+        let specification = "# Specification\n\n## Goal\n\nKeep it.\n\n## Requirements\n\n- Keep it.\n\n## Acceptance Criteria\n\n- It works.\n\n## Steps\n\n1. Keep it\n\n## Verification\n\n- cargo test\n";
+        let task = manager
+            .create_from_request_with_source(
+                TaskRequest {
+                    kind: TaskKind::ImplementExistingSpecification,
+                    title: "Frozen source".into(),
+                    description: String::new(),
+                    specification: Some(specification.into()),
+                    project_id: Some(project.id),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&project)),
+            )
+            .unwrap();
+        let persisted = fs::read_to_string(task_directory(&root, task.id).join(SNAPSHOT)).unwrap();
+        assert!(persisted.contains("owner/original"));
+        assert!(persisted.contains("https://github.com/owner/original.git"));
+        assert!(!persisted.contains("token") && !persisted.contains("password"));
+        drop(manager);
+
+        // A restored task carries the source even though the new application
+        // instance has no ProjectStore registration to consult.
+        let restored = new_manager(&root);
+        let task = restored.get(task.id).unwrap();
+        assert_eq!(
+            task.repository_source,
+            Some(TaskRepositorySource {
+                repository: "owner/original".into(),
+                clone_url: "https://github.com/owner/original.git".into(),
+                default_branch: "main".into(),
+                project_name: "Original project".into(),
+            })
         );
         fs::remove_dir_all(root).unwrap();
     }

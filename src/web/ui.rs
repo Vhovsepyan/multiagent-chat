@@ -20,7 +20,8 @@ use crate::milestone::MilestoneStatus;
 use crate::project::{Project, ProjectSource};
 use crate::task::{
     CompletionChecklist, Decision, OutputTarget, PersistenceStatus, ProjectPersistence,
-    RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRequest, TaskStatus,
+    RecordedEvent, Task, TaskEvent, TaskId, TaskKind, TaskRepositorySource, TaskRequest,
+    TaskStatus,
 };
 use crate::technology::TechStack;
 use crate::web::{AppState, pipeline};
@@ -1381,11 +1382,15 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
     if let Err(error) = request.validate() {
         return error_fragment(&error);
     }
-    if let Some(project_id) = request.project_id
-        && state.projects.get(project_id).is_none()
-    {
-        return error_fragment("Select a registered project.");
-    }
+    let project = if let Some(project_id) = request.project_id {
+        let project = state.projects.get(project_id);
+        if project.is_none() {
+            return error_fragment("Select a registered project.");
+        }
+        project
+    } else {
+        None
+    };
     let agents = match state
         .catalogue
         .resolve_for_task(request.kind, request.agents.as_ref())
@@ -1393,7 +1398,11 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         Ok(agents) => agents,
         Err(error) => return error_fragment(&error),
     };
-    let task = match state.manager.create_from_request(request, agents) {
+    let task = match state.manager.create_from_request_with_source(
+        request,
+        agents,
+        project.as_ref().map(TaskRepositorySource::from_project),
+    ) {
         Ok(task) => task,
         Err(error) => return error_fragment(&error),
     };

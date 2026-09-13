@@ -456,6 +456,15 @@ async fn user_provided_specification_can_target_a_registered_project() {
     assert!(task["technology"].is_null());
     assert!(task["output"].is_null());
     assert_eq!(task["specification_source"], "user_provided");
+    assert_eq!(
+        task["repository_source"]["repository"],
+        "openai/existing-service"
+    );
+    assert_eq!(
+        task["repository_source"]["clone_url"],
+        "https://github.com/openai/existing-service.git"
+    );
+    assert_eq!(task["repository_source"]["default_branch"], "main");
     std::fs::remove_dir_all(root).ok();
 }
 

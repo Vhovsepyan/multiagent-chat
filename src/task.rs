@@ -25,7 +25,7 @@ use crate::evidence::{EvidencePayload, EvidenceRecord};
 use crate::execution_limits::{HistoryLimits, bounded_text};
 use crate::git::{GitMode, MilestoneCommit};
 use crate::milestone::{Milestone, MilestoneStatus};
-use crate::project::ProjectId;
+use crate::project::{Project, ProjectId, ProjectSource};
 use crate::task_store::TaskStore;
 use crate::technology::{ProjectProfile, TechStack};
 use crate::verification::VerificationResult;
@@ -39,6 +39,43 @@ pub const EVENT_BUFFER: usize = 256;
 
 /// Identifies one task. `Uuid` so the browser can hold it in a URL.
 pub type TaskId = Uuid;
+
+/// Immutable, credential-free repository execution inputs frozen into an
+/// existing-project task. The ProjectStore remains a registration/catalogue;
+/// task execution does not depend on it after creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRepositorySource {
+    pub repository: String,
+    pub clone_url: String,
+    pub default_branch: String,
+    pub project_name: String,
+}
+
+impl TaskRepositorySource {
+    pub fn from_project(project: &Project) -> Self {
+        Self {
+            repository: project.source.repository_identity().to_owned(),
+            clone_url: project.source.clone_url(),
+            default_branch: project.default_branch.clone(),
+            project_name: project.name.clone(),
+        }
+    }
+
+    /// Revalidate persisted source metadata before handing it to Git. This
+    /// rejects tampered or credential-bearing URLs rather than guessing.
+    pub fn source(&self) -> Result<ProjectSource, String> {
+        let source = ProjectSource::github(&self.repository).map_err(|error| error.to_string())?;
+        if source.clone_url() != self.clone_url {
+            return Err(
+                "durable repository source URL does not match its normalized identity".into(),
+            );
+        }
+        if self.default_branch.trim().is_empty() {
+            return Err("durable repository source has no default branch".into());
+        }
+        Ok(source)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1293,6 +1330,11 @@ pub struct Task {
     pub description: String,
     pub kind: TaskKind,
     pub project_id: Option<ProjectId>,
+    /// Frozen non-secret source metadata for existing-project execution.
+    /// Older durable tasks omit this field and use a live ProjectStore entry
+    /// only as a compatibility fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_source: Option<TaskRepositorySource>,
     pub technology: Option<TechStack>,
     pub output: Option<OutputTarget>,
     /// The persistent destination folder name this run asked for (task 0010).
@@ -1395,6 +1437,7 @@ impl Task {
             description: description.into(),
             kind: TaskKind::NewProject,
             project_id: None,
+            repository_source: None,
             technology: Some(TechStack::Rust),
             output: Some(OutputTarget::ReviewableResult),
             destination: None,
@@ -1449,6 +1492,7 @@ impl Task {
             description: request.description.trim().to_string(),
             kind: request.kind,
             project_id: request.project_id,
+            repository_source: None,
             technology: request.technology,
             output,
             destination: request
@@ -2281,6 +2325,27 @@ impl TaskManager {
         agents: AgentSelection,
     ) -> Result<Task, String> {
         let task = Task::from_request(request, agents)?;
+        Ok(self.insert(task))
+    }
+
+    /// Create a task while freezing the registered project's immutable source
+    /// inputs. The source is supplied by the web boundary after it validates
+    /// the project id; it is never accepted from the browser request.
+    pub fn create_from_request_with_source(
+        &self,
+        request: TaskRequest,
+        agents: AgentSelection,
+        source: Option<TaskRepositorySource>,
+    ) -> Result<Task, String> {
+        let mut task = Task::from_request(request, agents)?;
+        if task.project_id.is_some() {
+            if let Some(source) = source.as_ref() {
+                source
+                    .source()
+                    .map_err(|error| format!("invalid task repository source: {error}"))?;
+            }
+            task.repository_source = source;
+        }
         Ok(self.insert(task))
     }
 
