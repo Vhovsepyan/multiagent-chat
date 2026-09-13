@@ -92,6 +92,9 @@ impl ChangeSet {
 
 pub trait WorkspaceProvider: Send + Sync {
     fn prepare(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace>;
+    /// Reopen a retained task workspace. Implementations must derive the path
+    /// from their own managed root, never from task-supplied path data.
+    fn reopen(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace>;
     fn cleanup(&self, workspace: &TaskWorkspace) -> Result<()>;
 }
 
@@ -207,6 +210,29 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
             })?;
         }
         Ok(())
+    }
+
+    fn reopen(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+        let root = self.task_path(request.task_id);
+        self.ensure_owned(&root)?;
+        let path = root.join("repo");
+        if !root.is_dir() || !path.is_dir() || !root.join("artifacts").is_dir() {
+            bail!("retained task workspace is no longer available");
+        }
+        let git = git_command(&path, &["rev-parse", "--is-inside-work-tree"], &self.limits)?;
+        if !git.status.success() || String::from_utf8_lossy(&git.stdout).trim() != "true" {
+            bail!("retained task workspace is not a Git working tree");
+        }
+        Ok(TaskWorkspace {
+            root,
+            path,
+            // The original source revision is retained in task result state;
+            // do not replace it with the current HEAD after milestone commits.
+            revision: request.revision.map(str::to_owned),
+            source_repository: request
+                .source
+                .map(|source| source.repository_identity().to_owned()),
+        })
     }
 }
 
@@ -727,6 +753,36 @@ mod tests {
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_workspace_reopens_without_discarding_partial_changes() {
+        let root = std::env::temp_dir().join(format!("mac-reopen-workspace-{}", Uuid::new_v4()));
+        let provider = LocalWorkspaceProvider::new(root.clone()).unwrap();
+        let task_id = Uuid::new_v4();
+        let workspace = provider
+            .prepare(WorkspaceRequest {
+                task_id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        fs::write(workspace.path.join("partial.rs"), "fn partial() {}\n").unwrap();
+
+        let reopened = provider
+            .reopen(WorkspaceRequest {
+                task_id,
+                source: None,
+                revision: None,
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(reopened.path.join("partial.rs")).unwrap(),
+            "fn partial() {}\n"
+        );
+        assert!(reopened.path.join(".git").exists());
+        provider.cleanup(&reopened).unwrap();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

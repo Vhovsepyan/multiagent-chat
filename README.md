@@ -108,11 +108,13 @@ Cross-origin browser requests and unrecognized Host headers are rejected;
 native clients may omit Origin. This origin boundary does not replace future
 user authentication or an execution sandbox.
 
-If implementation or verification fails, available changes are captured in the
-task result before workspace cleanup. If result capture itself fails, cleanup
-is delayed and the server retains the UUID-named task workspace for manual
-recovery until the configured recovery deadline (24 hours by default). Cleanup
-failures also schedule a retry. Recover needed files before this deadline.
+If an approved build fails, available changes are captured and its managed
+workspace is retained. The task page offers **Approve and build** again when
+the repository has no unresolved merge, rebase, or conflict state; it resumes
+at the first incomplete milestone using the same approved specification and
+frozen agent selections. Earlier successful milestones are not rerun and no
+changes are reset or cleaned. Other recovery failures retain the UUID-named
+workspace until the configured recovery deadline (24 hours by default).
 Results otherwise remain in memory until persistence is implemented.
 
 Inspection skips linked repository files, including instructions and metadata.
@@ -609,6 +611,8 @@ Detection uses repository evidence such as `Cargo.toml`, `pom.xml`, Gradle build
   `destination` folder name for the persistent mode.
 - `GET /api/tasks/{id}` — task snapshot, append-only audit `history`, and the
   bounded `log_tail`; every entry has sequence/timestamp/event fields.
+- `POST /api/tasks/{id}/rebuild` — continue an eligible failed approved build
+  from its retained workspace; it accepts no replacement specification.
 - `GET /api/tasks/{id}/events` — live JSON SSE recorded-event envelopes.
 - `GET /api/tasks/{id}/evidence` — download the redacted five-file evidence ZIP.
 - `POST /api/tasks/{id}/approve` — approve/reject the specification, optionally with edits.

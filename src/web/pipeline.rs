@@ -24,8 +24,31 @@ pub fn spawn(state: AppState, id: TaskId) {
     tokio::spawn(async move {
         let emitter = state.manager.emitter(id);
         let mut workspace = None;
-        let result = run(&state, id, &emitter, &mut workspace).await;
+        let result = run(&state, id, &emitter, &mut workspace, false).await;
 
+        let report = emitter.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            finish_run(&state, id, &emitter, workspace.as_ref(), result);
+        })
+        .await
+        {
+            let error = format!(
+                "task finalization failed: {error}; manual workspace recovery may be required"
+            );
+            report.emit(TaskEvent::Finished {
+                status: TaskStatus::Failed,
+                error: Some(error.clone()),
+            });
+            report.emit(TaskEvent::TaskFailed { error });
+        }
+    });
+}
+
+pub fn spawn_rebuild(state: AppState, id: TaskId) {
+    tokio::spawn(async move {
+        let emitter = state.manager.emitter(id);
+        let mut workspace = None;
+        let result = run(&state, id, &emitter, &mut workspace, true).await;
         let report = emitter.clone();
         if let Err(error) = tokio::task::spawn_blocking(move || {
             finish_run(&state, id, &emitter, workspace.as_ref(), result);
@@ -94,6 +117,18 @@ fn finish_run(
             }
         }
     }
+    let retain_for_rebuild = result.is_err()
+        && state.manager.get(id).is_some_and(|task| {
+            task.status == TaskStatus::Implementing
+                && task
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.approve)
+        });
+    if retain_for_rebuild {
+        may_cleanup = false;
+        emitter.notice("build failed after approval; workspace retained so the approved build can be continued");
+    }
     if may_cleanup
         && let Some(workspace) = workspace
         && let Err(error) = state.workspaces.cleanup(workspace)
@@ -101,7 +136,10 @@ fn finish_run(
         emitter.warn(format!("workspace cleanup failed: {error}"));
         may_cleanup = false;
     }
-    if !may_cleanup && let Some(workspace) = workspace {
+    if !may_cleanup
+        && !retain_for_rebuild
+        && let Some(workspace) = workspace
+    {
         schedule_recovery_cleanup(state, workspace, emitter);
     }
     let cancelled = state.manager.is_cancelled(id);
@@ -190,6 +228,7 @@ async fn run(
     id: TaskId,
     emitter: &Emitter,
     workspace: &mut Option<TaskWorkspace>,
+    retry: bool,
 ) -> Result<()> {
     let task = match state.manager.get(id) {
         Some(task) => task,
@@ -225,108 +264,118 @@ async fn run(
         None => None,
     };
 
-    let (profile, repository_context) = match task.kind {
-        TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
-            let technology = task
-                .technology
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("new project task has no selected technology"))?;
-            (
-                ProjectProfile::selected(technology),
-                "New empty project".into(),
-            )
-        }
-        TaskKind::Feature | TaskKind::BugFix => {
-            let project = project
-                .as_ref()
-                .expect("validated existing task has project");
-            *workspace = Some(prepare_existing(state, id, project).await?);
-            let prepared = workspace.as_ref().expect("workspace was prepared");
-            let path = prepared.path.clone();
-            let title = task.title.clone();
-            let description = task.description.clone();
-            let kind = task.kind;
-            let inspection = tokio::task::spawn_blocking(move || {
-                inspect(
-                    &path,
-                    InspectionRequest {
-                        kind,
-                        title: &title,
-                        description: &description,
-                    },
+    let (profile, repository_context) = if retry {
+        *workspace = Some(reopen_workspace(state, &task).await?);
+        let profile = task
+            .profile
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("retained task has no inspected project profile"))?;
+        (profile, "Retained workspace from a failed approved build. Inspect existing partial work before making changes.".into())
+    } else {
+        match task.kind {
+            TaskKind::NewProject | TaskKind::TakeHomeAssignment => {
+                let technology = task.technology.clone().ok_or_else(|| {
+                    anyhow::anyhow!("new project task has no selected technology")
+                })?;
+                (
+                    ProjectProfile::selected(technology),
+                    "New empty project".into(),
                 )
-            })
-            .await??;
-            let profile = inspection.profile.clone();
-            state.projects.set_profile(project.id, profile.clone());
-            let context = inspection.prompt_context();
-            emitter.emit(TaskEvent::Inspection {
-                profile: profile.clone(),
-                source_revision: prepared.revision.clone(),
-            });
-            (profile, context)
+            }
+            TaskKind::Feature | TaskKind::BugFix => {
+                let project = project
+                    .as_ref()
+                    .expect("validated existing task has project");
+                *workspace = Some(prepare_existing(state, id, project).await?);
+                let prepared = workspace.as_ref().expect("workspace was prepared");
+                let path = prepared.path.clone();
+                let title = task.title.clone();
+                let description = task.description.clone();
+                let kind = task.kind;
+                let inspection = tokio::task::spawn_blocking(move || {
+                    inspect(
+                        &path,
+                        InspectionRequest {
+                            kind,
+                            title: &title,
+                            description: &description,
+                        },
+                    )
+                })
+                .await??;
+                let profile = inspection.profile.clone();
+                state.projects.set_profile(project.id, profile.clone());
+                let context = inspection.prompt_context();
+                emitter.emit(TaskEvent::Inspection {
+                    profile: profile.clone(),
+                    source_revision: prepared.revision.clone(),
+                });
+                (profile, context)
+            }
         }
     };
 
-    if task.kind.creates_new_project() {
+    if !retry && task.kind.creates_new_project() {
         emitter.emit(TaskEvent::Inspection {
             profile: profile.clone(),
             source_revision: None,
         });
     }
 
-    let topic = format!(
-        "{}\n\n{}",
-        task.topic(),
-        crate::workflow::design_context(task.kind, &profile, &repository_context)
-    );
-    emitter.status(TaskStatus::Debating);
-    let outcome = crate::debate::run(
-        agents.proposer.as_ref(),
-        agents.critic.as_ref(),
-        &topic,
-        state.config.max_rounds,
-        emitter,
-    )
-    .await?;
-
-    emitter.status(TaskStatus::GeneratingSpec);
-    let document = spec::build(
-        agents.proposer.as_ref(),
-        agents.critic.as_ref(),
-        &outcome.transcript,
-        outcome.approved,
-        emitter,
-    )
-    .await?;
-    emitter.emit(TaskEvent::Spec {
-        markdown: document,
-        path: format!("artifacts/{}", spec::APPROVED_SPEC_FILENAME),
-    });
-    emitter.emit(TaskEvent::SpecGenerated);
-
-    emitter.status(TaskStatus::WaitingForApproval);
-    let Some(decision) = state.manager.await_decision(id).await else {
-        return Ok(());
-    };
-    if !decision.approve {
-        emitter.notice("rejected; no repository changes were published");
-        emitter.status(TaskStatus::Rejected);
-        return Ok(());
-    }
-
-    if workspace.is_none() {
-        let provider = state.workspaces.clone();
-        *workspace = Some(
-            tokio::task::spawn_blocking(move || {
-                provider.prepare(WorkspaceRequest {
-                    task_id: id,
-                    source: None,
-                    revision: None,
-                })
-            })
-            .await??,
+    if !retry {
+        let topic = format!(
+            "{}\n\n{}",
+            task.topic(),
+            crate::workflow::design_context(task.kind, &profile, &repository_context)
         );
+        emitter.status(TaskStatus::Debating);
+        let outcome = crate::debate::run(
+            agents.proposer.as_ref(),
+            agents.critic.as_ref(),
+            &topic,
+            state.config.max_rounds,
+            emitter,
+        )
+        .await?;
+
+        emitter.status(TaskStatus::GeneratingSpec);
+        let document = spec::build(
+            agents.proposer.as_ref(),
+            agents.critic.as_ref(),
+            &outcome.transcript,
+            outcome.approved,
+            emitter,
+        )
+        .await?;
+        emitter.emit(TaskEvent::Spec {
+            markdown: document,
+            path: format!("artifacts/{}", spec::APPROVED_SPEC_FILENAME),
+        });
+        emitter.emit(TaskEvent::SpecGenerated);
+
+        emitter.status(TaskStatus::WaitingForApproval);
+        let Some(decision) = state.manager.await_decision(id).await else {
+            return Ok(());
+        };
+        if !decision.approve {
+            emitter.notice("rejected; no repository changes were published");
+            emitter.status(TaskStatus::Rejected);
+            return Ok(());
+        }
+
+        if workspace.is_none() {
+            let provider = state.workspaces.clone();
+            *workspace = Some(
+                tokio::task::spawn_blocking(move || {
+                    provider.prepare(WorkspaceRequest {
+                        task_id: id,
+                        source: None,
+                        revision: None,
+                    })
+                })
+                .await??,
+            );
+        }
     }
     let workspace_ref = workspace.as_ref().expect("workspace was prepared");
     let spec_path = write_approved_spec(&state.manager, id, workspace_ref)?;
@@ -337,12 +386,18 @@ async fn run(
         .manager
         .approved_spec(id)
         .ok_or_else(|| anyhow::anyhow!("approved specification is missing from task state"))?;
-    let milestones =
+    let planned_milestones =
         plan_from_spec(&approved_spec, &planned_commands).map_err(anyhow::Error::msg)?;
     // Task 0009: when the run commits, the workspace repository must be in a
     // state where an isolated commit is obviously safe. Checking once, before
     // any worker starts, means a problem is reported instead of repaired.
-    if task.git_mode.commits_enabled() {
+    if retry {
+        let repo = workspace_ref.path.clone();
+        let limits = state.config.execution.clone();
+        tokio::task::spawn_blocking(move || crate::git::ensure_retry_ready(&repo, &limits))
+            .await??;
+        emitter.notice("continuing retained workspace; existing partial changes were preserved");
+    } else if task.git_mode.commits_enabled() {
         let repo = workspace_ref.path.clone();
         let limits = state.config.execution.clone();
         tokio::task::spawn_blocking(move || crate::git::ensure_commit_ready(&repo, &limits))
@@ -351,15 +406,26 @@ async fn run(
     }
     // Task 0012: what the run must satisfy, derived from the approved
     // specification and mapped onto the plan before anything executes.
-    let mut milestones = milestones;
-    let criteria =
-        crate::acceptance::plan(&approved_spec, &mut milestones).map_err(anyhow::Error::msg)?;
-    emitter.emit(TaskEvent::MilestonePlanCreated {
-        milestones: milestones.clone(),
-    });
-    emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
-        criteria: criteria.clone(),
-    });
+    let mut milestones = if retry && !task.milestones.is_empty() {
+        task.milestones.clone()
+    } else {
+        planned_milestones
+    };
+    let criteria = if retry && !task.acceptance.is_empty() {
+        task.acceptance.clone()
+    } else {
+        crate::acceptance::plan(&approved_spec, &mut milestones).map_err(anyhow::Error::msg)?
+    };
+    if !retry || task.milestones.is_empty() {
+        emitter.emit(TaskEvent::MilestonePlanCreated {
+            milestones: milestones.clone(),
+        });
+    }
+    if !retry || task.acceptance.is_empty() {
+        emitter.emit(TaskEvent::AcceptanceCriteriaGenerated {
+            criteria: criteria.clone(),
+        });
+    }
     let deferred = criteria
         .iter()
         .filter(|criterion| criterion.status == CriterionStatus::Deferred)
@@ -377,6 +443,9 @@ async fn run(
     let total = milestones.len();
     let mut all_verification = Vec::new();
     for milestone in milestones {
+        if retry && milestone.status == crate::milestone::MilestoneStatus::Passed {
+            continue;
+        }
         if state.manager.is_cancelled(id) {
             emitter.emit(TaskEvent::MilestoneCancelled {
                 id: milestone.id,
@@ -420,13 +489,16 @@ async fn run(
         };
         // One authoritative instruction per milestone (task 0008): scope lives
         // here, not in the common worker prompt.
-        let instructions = crate::workflow::milestone_prompt(
+        let mut instructions = crate::workflow::milestone_prompt(
             task.kind,
             &profile,
             &milestone,
             total,
             &repository_context,
         );
+        if retry {
+            instructions.push_str("\n\nA previous build attempt may have left partial changes in this workspace. Inspect the current Git status and existing files before continuing this milestone. Preserve useful work; do not reset, clean, or discard changes.\n");
+        }
         if let Err(error) = execute_worker_for_milestone(
             agents.worker.as_ref(),
             &task.agents.worker,
@@ -1576,6 +1648,46 @@ async fn prepare_existing(
     .await?
 }
 
+/// Reopen and validate a workspace retained after a failed approved build.
+/// The provider derives the path from its managed root and task id; callers
+/// never supply a filesystem path from task state or the browser.
+async fn reopen_workspace(state: &AppState, task: &Task) -> Result<TaskWorkspace> {
+    let source = task
+        .project_id
+        .and_then(|id| state.projects.get(id))
+        .map(|project| project.source);
+    let baseline = task
+        .result
+        .as_ref()
+        .and_then(|result| result.source_revision.clone());
+    let provider = state.workspaces.clone();
+    let id = task.id;
+    let limits = state.config.execution.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = provider.reopen(WorkspaceRequest {
+            task_id: id,
+            source: source.as_ref(),
+            revision: baseline.as_deref(),
+        })?;
+        crate::git::ensure_retry_ready(&workspace.path, &limits)?;
+        Ok(workspace)
+    })
+    .await?
+}
+
+/// The handler calls this before changing a Failed task back to Implementing.
+pub async fn validate_rebuild_workspace(state: &AppState, id: TaskId) -> Result<()> {
+    let task = state
+        .manager
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("unknown task"))?;
+    if !task.rebuild_eligible_state() {
+        bail!("task is not eligible to rebuild its approved specification");
+    }
+    let _ = reopen_workspace(state, &task).await?;
+    Ok(())
+}
+
 fn write_approved_spec(
     manager: &TaskManager,
     id: TaskId,
@@ -1627,6 +1739,9 @@ mod tests {
         impl WorkspaceProvider for RetryCleanup {
             fn prepare(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
                 self.provider.prepare(request)
+            }
+            fn reopen(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+                self.provider.reopen(request)
             }
             fn cleanup(&self, workspace: &TaskWorkspace) -> Result<()> {
                 if !self

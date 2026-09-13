@@ -114,6 +114,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks", post(handlers::create_task))
         .route("/api/tasks/{id}", get(handlers::get_task))
         .route("/api/tasks/{id}/approve", post(handlers::approve_task))
+        .route("/api/tasks/{id}/rebuild", post(handlers::rebuild_task))
         .route(
             "/api/tasks/{id}/publish",
             get(handlers::github_publish_preview).post(handlers::github_publish),
@@ -131,6 +132,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/tasks", post(ui::create))
         .route("/ui/tasks/{id}/stream", get(ui::stream))
         .route("/ui/tasks/{id}/approve", post(ui::approve))
+        .route("/ui/tasks/{id}/rebuild", post(ui::rebuild))
         .route("/ui/tasks/{id}/publish", post(ui::publish))
         .route("/ui/tasks/{id}/publish/prepare", post(ui::prepare_publish))
         // DP-13: assets come off disk, so editing style.css needs only a

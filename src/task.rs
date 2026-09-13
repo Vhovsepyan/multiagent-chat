@@ -482,6 +482,14 @@ pub enum TaskEvent {
     MilestonePlanCreated {
         milestones: Vec<Milestone>,
     },
+    /// A human requested continuation of a failed post-approval build.
+    BuildRetryRequested {
+        previous_error: String,
+        resume_milestone: u32,
+    },
+    BuildRetryStarted {
+        resume_milestone: u32,
+    },
     MilestoneStarted {
         id: String,
         order: u32,
@@ -979,6 +987,7 @@ impl TaskEvent {
                 }
             }
             Self::TaskFailed { error } => clean(error),
+            Self::BuildRetryRequested { previous_error, .. } => clean(previous_error),
             Self::EvidenceExported { artifact } => clean(artifact),
             Self::AgentsSelected { agents } => {
                 clean(&mut agents.proposer.model);
@@ -994,6 +1003,7 @@ impl TaskEvent {
             | Self::SpecRejected
             | Self::VerificationStarted { .. }
             | Self::VerificationCompleted { .. }
+            | Self::BuildRetryStarted { .. }
             | Self::TaskCompleted
             | Self::TaskCancelled => {}
         }
@@ -1143,6 +1153,21 @@ pub enum DecisionError {
     InvalidSpec,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildError {
+    NotFound,
+    NotEligible,
+}
+
+impl std::fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "unknown task",
+            Self::NotEligible => "task is not eligible to rebuild its approved specification",
+        })
+    }
+}
+
 impl std::fmt::Display for DecisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1220,6 +1245,23 @@ fn default_next_event_sequence() -> u64 {
 }
 
 impl Task {
+    pub fn rebuild_eligible_state(&self) -> bool {
+        self.status == TaskStatus::Failed
+            && self
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.approve)
+            && self
+                .spec
+                .as_ref()
+                .is_some_and(|spec| !spec.trim().is_empty())
+            && (self.milestones.is_empty()
+                || self
+                    .milestones
+                    .iter()
+                    .any(|milestone| milestone.status != MilestoneStatus::Passed))
+    }
+
     #[cfg(test)]
     fn new(
         title: impl Into<String>,
@@ -1419,11 +1461,17 @@ impl Task {
         if completed_verifications < self.milestones.len() {
             return Some("take-home correctness gate blocked completion: required verification is incomplete".into());
         }
-        if self
-            .history
-            .iter()
-            .any(|recorded| matches!(recorded.event, TaskEvent::VerificationFailed { .. }))
-        {
+        // A retry retains earlier failure evidence, but a later successful
+        // retry must be judged by its current execution rather than be made
+        // permanently impossible by that preserved history.
+        let retry_start = self.history.iter().rev().find_map(|recorded| {
+            matches!(recorded.event, TaskEvent::BuildRetryStarted { .. })
+                .then_some(recorded.sequence)
+        });
+        if self.history.iter().any(|recorded| {
+            retry_start.is_none_or(|sequence| recorded.sequence >= sequence)
+                && matches!(recorded.event, TaskEvent::VerificationFailed { .. })
+        }) {
             return Some(
                 "take-home correctness gate blocked completion: required verification failed"
                     .into(),
@@ -2302,6 +2350,48 @@ impl TaskManager {
             .and(task.spec.clone())
     }
 
+    /// Atomically move an eligible failed build back into implementation.
+    /// Workspace validation remains provider-owned and is performed by the
+    /// caller before this transition; this method guards the durable task
+    /// state and prevents duplicate clicks from starting two workers.
+    pub fn begin_rebuild(&self, id: TaskId) -> Result<u32, RebuildError> {
+        let mut tasks = self
+            .inner
+            .tasks
+            .write()
+            .expect("task registry lock poisoned");
+        let task = tasks.get_mut(&id).ok_or(RebuildError::NotFound)?;
+        let approved = task.rebuild_eligible_state();
+        let resume_milestone = task
+            .milestones
+            .iter()
+            .find(|milestone| milestone.status != MilestoneStatus::Passed)
+            .map(|milestone| milestone.order)
+            .unwrap_or(1);
+        if !approved {
+            return Err(RebuildError::NotEligible);
+        }
+        let previous_error = task.error.clone().unwrap_or_else(|| "build failed".into());
+        let requested = task.record_event(TaskEvent::BuildRetryRequested {
+            previous_error,
+            resume_milestone,
+        });
+        let started = task.record_event(TaskEvent::BuildRetryStarted { resume_milestone });
+        let status = task.record_event(TaskEvent::Status {
+            status: TaskStatus::Implementing,
+        });
+        let events = [requested, started, status];
+        if let Some(store) = &self.inner.store {
+            store
+                .persist_events(task, &events)
+                .expect("durable task rebuild persistence failed");
+        }
+        for event in &events {
+            let _ = self.inner.tx.send((id, event.clone()));
+        }
+        Ok(resume_milestone)
+    }
+
     pub fn cancel(&self, id: TaskId) -> bool {
         let mut tasks = self
             .inner
@@ -2620,6 +2710,89 @@ mod tests {
         assert!(!stored.history.iter().any(|event| matches!(
             event.event,
             TaskEvent::MilestoneStarted { ref id, .. } if id == "m2"
+        )));
+    }
+
+    #[test]
+    fn approved_failed_build_rebuilds_without_a_second_approval() {
+        let manager = TaskManager::new();
+        let task = manager.create("retry", "continue", "legacy");
+        let emitter = manager.emitter(task.id);
+        emitter.emit(TaskEvent::Spec {
+            markdown: "approved specification".into(),
+            path: "artifacts/approved-spec.md".into(),
+        });
+        emitter.status(TaskStatus::WaitingForApproval);
+        assert!(manager.decide(
+            task.id,
+            Decision {
+                approve: true,
+                spec: None
+            }
+        ));
+        let plan =
+            crate::milestone::plan_from_spec("## Steps\n1. First\n2. Retry this", &[]).unwrap();
+        emitter.emit(TaskEvent::MilestonePlanCreated { milestones: plan });
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            worker_tool: crate::agent::CodingTool::ClaudeCode,
+            worker_model: "frozen-worker".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneCompleted {
+            id: "m1".into(),
+            order: 1,
+            title: "First".into(),
+            verification: Vec::new(),
+            worker_result_summary: "done".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneStarted {
+            id: "m2".into(),
+            order: 2,
+            title: "Retry this".into(),
+            worker_tool: crate::agent::CodingTool::ClaudeCode,
+            worker_model: "frozen-worker".into(),
+        });
+        emitter.emit(TaskEvent::MilestoneFailed {
+            id: "m2".into(),
+            order: 2,
+            title: "Retry this".into(),
+            verification: Vec::new(),
+            worker_result_summary: None,
+            error: "worker failed".into(),
+        });
+        emitter.emit(TaskEvent::TaskFailed {
+            error: "worker failed".into(),
+        });
+
+        assert!(manager.get(task.id).unwrap().rebuild_eligible_state());
+        assert_eq!(manager.begin_rebuild(task.id), Ok(2));
+        let stored = manager.get(task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Implementing);
+        assert_eq!(stored.spec.as_deref(), Some("approved specification"));
+        assert_eq!(stored.milestones[0].status, MilestoneStatus::Passed);
+        assert_eq!(stored.milestones[1].status, MilestoneStatus::Failed);
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .filter(|event| matches!(event.event, TaskEvent::SpecApproved { .. }))
+                .count(),
+            1
+        );
+        assert!(stored.history.iter().any(|event| matches!(
+            event.event,
+            TaskEvent::BuildRetryRequested {
+                resume_milestone: 2,
+                ..
+            }
+        )));
+        assert!(stored.history.iter().any(|event| matches!(
+            event.event,
+            TaskEvent::BuildRetryStarted {
+                resume_milestone: 2
+            }
         )));
     }
 

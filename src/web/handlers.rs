@@ -382,6 +382,31 @@ pub async fn approve_task(
     Ok(Json(updated))
 }
 
+/// `POST /api/tasks/{id}/rebuild` — continue an approved build that failed.
+/// This is deliberately separate from Gate 2: it never accepts a specification
+/// body and cannot create a second approval event.
+pub async fn rebuild_task(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> ApiResult<Json<Task>> {
+    pipeline::validate_rebuild_workspace(&state, id)
+        .await
+        .map_err(|error| ApiError::conflict(format!("cannot rebuild: {error:#}")))?;
+    state
+        .manager
+        .begin_rebuild(id)
+        .map_err(|error| match error {
+            crate::task::RebuildError::NotFound => ApiError::not_found(error.to_string()),
+            crate::task::RebuildError::NotEligible => ApiError::conflict(error.to_string()),
+        })?;
+    pipeline::spawn_rebuild(state.clone(), id);
+    state
+        .manager
+        .get(id)
+        .map(Json)
+        .ok_or_else(|| ApiError::internal("task vanished while rebuilding"))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GithubPublishRequest {
     pub confirm: bool,

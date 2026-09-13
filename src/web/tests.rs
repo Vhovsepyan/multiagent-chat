@@ -232,6 +232,60 @@ async fn both_approval_endpoints_reject_early_terminal_and_duplicate_requests() 
 }
 
 #[tokio::test]
+async fn failed_approved_build_exposes_rebuild_but_preapproval_failure_does_not() {
+    let (state, root) = test_state("rebuild-ui");
+    let retryable = state.manager.create("retry", "description", "legacy");
+    let workspace = state
+        .workspaces
+        .prepare(crate::workspace::WorkspaceRequest {
+            task_id: retryable.id,
+            source: None,
+            revision: None,
+        })
+        .unwrap();
+    std::fs::write(workspace.path.join("partial.txt"), "keep this\n").unwrap();
+    let emitter = state.manager.emitter(retryable.id);
+    emitter.emit(TaskEvent::Spec {
+        markdown: "approved unchanged".into(),
+        path: "artifacts/approved-spec.md".into(),
+    });
+    emitter.status(TaskStatus::WaitingForApproval);
+    assert!(state.manager.decide(
+        retryable.id,
+        Decision {
+            approve: true,
+            spec: None
+        }
+    ));
+    emitter.emit(TaskEvent::TaskFailed {
+        error: "worker failed".into(),
+    });
+
+    let retry_page = router(state.clone())
+        .oneshot(get(&format!("/task/{}", retryable.id)))
+        .await
+        .unwrap();
+    let retry_html = body_text(retry_page).await;
+    assert!(retry_html.contains("Approve and build"), "{retry_html}");
+    assert!(retry_html.contains(&format!("/ui/tasks/{}/rebuild", retryable.id)));
+
+    let failed_before_approval = state.manager.create("no retry", "description", "legacy");
+    state
+        .manager
+        .emitter(failed_before_approval.id)
+        .emit(TaskEvent::TaskFailed {
+            error: "debate failed".into(),
+        });
+    let page = router(state.clone())
+        .oneshot(get(&format!("/task/{}", failed_before_approval.id)))
+        .await
+        .unwrap();
+    assert!(!body_text(page).await.contains("Approve and build"));
+    state.workspaces.cleanup(&workspace).unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn projects_lists_registered_repositories_not_workspace_directories() {
     let (state, root) = test_state("projects");
     std::fs::create_dir_all(root.join("alpha")).unwrap();

@@ -897,6 +897,20 @@ fn describe_event(recorded: &RecordedEvent) -> Option<(String, Vec<String>)> {
             "Task failed".into(),
             vec![format!("Error: {}", markdown_inline(error))],
         ),
+        TaskEvent::BuildRetryRequested {
+            previous_error,
+            resume_milestone,
+        } => (
+            "Build retry requested".into(),
+            vec![
+                format!("Previous failure: {}", markdown_inline(previous_error)),
+                format!("Resume milestone: {resume_milestone}"),
+            ],
+        ),
+        TaskEvent::BuildRetryStarted { resume_milestone } => (
+            "Build retry started".into(),
+            vec![format!("Resume milestone: {resume_milestone}")],
+        ),
         TaskEvent::TaskCancelled => ("Task cancelled".into(), vec![]),
         TaskEvent::EvidenceExported { artifact } => (
             "Evidence exported".into(),

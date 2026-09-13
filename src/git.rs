@@ -204,6 +204,34 @@ pub fn ensure_commit_ready(repo: &Path, limits: &ExecutionLimits) -> Result<()> 
     Ok(())
 }
 
+/// Validate a retained workspace before a human-requested build retry.
+///
+/// Unlike the initial commit preflight, this intentionally permits ordinary
+/// working-tree changes: a failed worker may have left useful partial work for
+/// the next worker to inspect. Repository operations that require recovery by
+/// a human (conflicts, merge, or rebase) still block the retry.
+pub fn ensure_retry_ready(repo: &Path, limits: &ExecutionLimits) -> Result<()> {
+    let inside = git(repo, &["rev-parse", "--is-inside-work-tree"], limits)?;
+    if inside.as_deref() != Some("true") {
+        bail!("retained workspace is not a Git working tree");
+    }
+    let status = git(
+        repo,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        limits,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("could not read the retained workspace repository status"))?;
+    if status.lines().any(is_conflict) {
+        bail!("retained workspace has unresolved merge conflicts; resolve them before rebuilding");
+    }
+    if repo.join(".git").join("MERGE_HEAD").exists()
+        || repo.join(".git").join("REBASE_HEAD").exists()
+    {
+        bail!("retained workspace has a merge or rebase in progress; resolve it before rebuilding");
+    }
+    Ok(())
+}
+
 /// Commit the milestone's work, when the run asked for commits and the
 /// milestone actually verified.
 ///
@@ -387,6 +415,22 @@ mod tests {
             ],
         );
         root
+    }
+
+    #[test]
+    fn retry_preflight_keeps_partial_changes_but_rejects_merge_state() {
+        let repo = repository("retry-preflight");
+        std::fs::write(repo.join("partial.rs"), "fn partial() {}\n").unwrap();
+        ensure_retry_ready(&repo, &limits()).unwrap();
+        assert!(
+            repo.join("partial.rs").exists(),
+            "retry preflight must not discard worker changes"
+        );
+
+        std::fs::write(repo.join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        let error = ensure_retry_ready(&repo, &limits()).unwrap_err();
+        assert!(error.to_string().contains("merge or rebase"));
+        std::fs::remove_dir_all(repo).ok();
     }
 
     fn run(root: &Path, args: &[&str]) -> std::process::Output {

@@ -559,6 +559,50 @@ mod tests {
     }
 
     #[test]
+    fn approved_failed_build_remains_rebuild_eligible_after_restart() {
+        let root = root("rebuild");
+        let manager = new_manager(&root);
+        let task = manager.create("retry", "durable", "legacy");
+        manager.emitter(task.id).emit(TaskEvent::Spec {
+            markdown: "approved specification".into(),
+            path: "artifacts/approved-spec.md".into(),
+        });
+        manager
+            .emitter(task.id)
+            .status(TaskStatus::WaitingForApproval);
+        assert!(manager.decide(
+            task.id,
+            crate::task::Decision {
+                approve: true,
+                spec: None
+            }
+        ));
+        manager.emitter(task.id).emit(TaskEvent::TaskFailed {
+            error: "worker failed".into(),
+        });
+        drop(manager);
+
+        let restored = new_manager(&root);
+        let task = restored.get(task.id).unwrap();
+        assert!(task.rebuild_eligible_state());
+        assert_eq!(restored.begin_rebuild(task.id), Ok(1));
+        assert!(
+            restored
+                .get(task.id)
+                .unwrap()
+                .history
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    TaskEvent::BuildRetryStarted {
+                        resume_milestone: 1
+                    }
+                ))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn corruption_is_isolated_and_secret_values_never_reach_disk() {
         let root = root("safety");
         let manager = new_manager(&root);

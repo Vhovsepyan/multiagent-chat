@@ -118,7 +118,8 @@ fn actions_html(task: &Task) -> String {
         action_controls_html(
             task.id,
             task.persistence.as_ref(),
-            task.github_publication.as_ref()
+            task.github_publication.as_ref(),
+            task.rebuild_eligible_state(),
         )
     )
 }
@@ -127,7 +128,15 @@ fn action_controls_html(
     id: TaskId,
     persistence: Option<&ProjectPersistence>,
     publication: Option<&crate::task::GitHubPublication>,
+    rebuild_eligible: bool,
 ) -> String {
+    let rebuild = if rebuild_eligible {
+        format!(
+            r##"<form hx-post="/ui/tasks/{id}/rebuild" hx-target="#task-actions" hx-swap="innerHTML"><button type="submit">Approve and build</button><div class="hint">Continues the approved build from its first incomplete milestone.</div></form>"##
+        )
+    } else {
+        String::new()
+    };
     let publish = if persistence.is_some_and(|item| item.status == PersistenceStatus::Persisted)
         && publication.is_none()
     {
@@ -146,8 +155,8 @@ fn action_controls_html(
         String::new()
     };
     format!(
-        r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{}/evidence" download>Export Evidence</a>{publish}<div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#,
-        id
+        r#"<div class="card task-actions"><h2 class="section">Task Actions</h2><a class="button-link" href="/api/tasks/{}/evidence" download>Export Evidence</a>{rebuild}{publish}<div class="hint">Downloads a redacted ZIP containing JSONL and human-readable run records.</div></div>"#,
+        id,
     )
 }
 
@@ -706,6 +715,20 @@ fn event_html(
                 esc(model)
             ),
         )),
+        TaskEvent::BuildRetryRequested {
+            resume_milestone, ..
+        } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Build retry requested · resuming at milestone {resume_milestone}</div>"#
+            ),
+        )),
+        TaskEvent::BuildRetryStarted { resume_milestone } => Some((
+            "build",
+            format!(
+                r#"<div class="notice">Build retry started · milestone {resume_milestone}</div>"#
+            ),
+        )),
         TaskEvent::MilestonePlanCreated { milestones } => Some((
             "build",
             format!(
@@ -1028,6 +1051,7 @@ struct RenderState<'a> {
     output: Option<OutputTarget>,
     persistence: Option<&'a ProjectPersistence>,
     github_publication: Option<&'a crate::task::GitHubPublication>,
+    rebuild_eligible: bool,
     completion_checklist: Option<&'a CompletionChecklist>,
 }
 
@@ -1041,6 +1065,7 @@ impl<'a> RenderState<'a> {
             output: task.output,
             persistence: task.persistence.as_ref(),
             github_publication: task.github_publication.as_ref(),
+            rebuild_eligible: task.rebuild_eligible_state(),
             completion_checklist: task.completion_checklist.as_ref(),
         }
     }
@@ -1076,7 +1101,12 @@ fn event_updates(
             ),
             (
                 "task-actions",
-                action_controls_html(id, state.persistence, state.github_publication),
+                action_controls_html(
+                    id,
+                    state.persistence,
+                    state.github_publication,
+                    state.rebuild_eligible,
+                ),
             ),
         ];
     }
@@ -1090,7 +1120,12 @@ fn event_updates(
             (name, html),
             (
                 "task-actions",
-                action_controls_html(id, state.persistence, state.github_publication),
+                action_controls_html(
+                    id,
+                    state.persistence,
+                    state.github_publication,
+                    state.rebuild_eligible,
+                ),
             ),
         ];
     }
@@ -1449,6 +1484,7 @@ pub async fn stream(
                         output: None,
                         persistence: None,
                         github_publication: None,
+                        rebuild_eligible: false,
                         completion_checklist: None,
                     },
                 };
@@ -1494,6 +1530,30 @@ pub async fn approve(
         .map(|task| spec_readonly(&task))
         .unwrap_or_default();
     Html(body).into_response()
+}
+
+pub async fn rebuild(State(state): State<AppState>, Path(id): Path<TaskId>) -> Response {
+    if let Err(error) = crate::web::pipeline::validate_rebuild_workspace(&state, id).await {
+        return (
+            StatusCode::CONFLICT,
+            Html(esc(&format!("cannot rebuild: {error:#}"))),
+        )
+            .into_response();
+    }
+    if let Err(error) = state.manager.begin_rebuild(id) {
+        let status = match error {
+            crate::task::RebuildError::NotFound => StatusCode::NOT_FOUND,
+            crate::task::RebuildError::NotEligible => StatusCode::CONFLICT,
+        };
+        return (status, Html(esc(&error.to_string()))).into_response();
+    }
+    crate::web::pipeline::spawn_rebuild(state.clone(), id);
+    state
+        .manager
+        .get(id)
+        .map(|task| actions_html(&task))
+        .unwrap_or_default()
+        .into_response()
 }
 
 pub async fn prepare_publish(State(state): State<AppState>, Path(id): Path<TaskId>) -> Response {
