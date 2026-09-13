@@ -1357,6 +1357,14 @@ fn default_next_event_sequence() -> u64 {
 }
 
 impl Task {
+    /// Whether this task targets a fresh project workspace. Direct
+    /// specifications are new-project work only when no registered project
+    /// was selected; the task target, rather than its kind alone, determines
+    /// the workspace workflow.
+    pub fn targets_new_project(&self) -> bool {
+        self.kind.creates_new_project() && self.project_id.is_none()
+    }
+
     pub fn rebuild_eligible_state(&self) -> bool {
         self.status == TaskStatus::Failed
             && self.rebuild_workspace_retained
@@ -3719,6 +3727,7 @@ mod tests {
             .create_from_request(request, AgentSelection::compiled_defaults())
             .unwrap();
         let stored = manager.get(task.id).unwrap();
+        assert!(stored.targets_new_project());
         assert_eq!(stored.spec.as_deref(), Some(specification));
         assert_eq!(
             stored.specification_source,
@@ -3785,6 +3794,7 @@ mod tests {
         assert_eq!(task.spec.as_deref(), Some(specification));
         assert!(task.project_id.is_some());
         assert!(task.technology.is_none());
+        assert!(!task.targets_new_project());
 
         let invalid = TaskRequest {
             technology: Some(TechStack::Rust),

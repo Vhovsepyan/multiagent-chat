@@ -2375,6 +2375,21 @@ fn task_creation_form_exposes_existing_specification_without_a_proposer_selector
     assert!(form.contains("isExistingSpec"));
 }
 
+#[tokio::test]
+async fn form_preserves_user_provided_specification_whitespace_verbatim() {
+    let (state, root) = test_state("direct-spec-form-whitespace");
+    let specification = "\n  # Specification\n\n## Goal\n\nBuild it.\n\n## Requirements\n\n- It works.\n\n## Acceptance Criteria\n\n- It works.\n\n## Steps\n\n1. Implement it\n\n## Verification\n\n- cargo test\n\n";
+    let body = "kind=implement_existing_specification&title=Whitespace&description=&technology=rust&output=reviewable_result&specification=%0A++%23+Specification%0A%0A%23%23+Goal%0A%0ABuild+it.%0A%0A%23%23+Requirements%0A%0A-+It+works.%0A%0A%23%23+Acceptance+Criteria%0A%0A-+It+works.%0A%0A%23%23+Steps%0A%0A1.+Implement+it%0A%0A%23%23+Verification%0A%0A-+cargo+test%0A%0A";
+    let response = router(state.clone())
+        .oneshot(post_form("/ui/tasks", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let task = state.manager.list().pop().unwrap();
+    assert_eq!(task.spec.as_deref(), Some(specification));
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// The form carries the same choice, and an unknown value is refused.
 #[tokio::test]
 async fn the_form_submits_the_git_mode() {

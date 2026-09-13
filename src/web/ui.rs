@@ -1298,6 +1298,17 @@ fn chosen(value: &Option<String>) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Specification Markdown is user-authored content. Whitespace can be
+/// significant to its rendering, code blocks, and audit fidelity, so only use
+/// a trimmed view to decide whether the field is blank; retain the original
+/// string verbatim when it is present.
+fn provided_specification(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .filter(|specification| !specification.trim().is_empty())
+        .cloned()
+}
+
 impl CreateForm {
     fn agents(&self) -> Result<Option<AgentSelectionRequest>, String> {
         let proposer_provider = parse_provider("proposer", chosen(&self.proposer_provider))?;
@@ -1359,7 +1370,7 @@ pub async fn create(State(state): State<AppState>, Form(form): Form<CreateForm>)
         kind: form.kind,
         title: form.title,
         description: form.description,
-        specification: chosen(&form.specification).map(str::to_string),
+        specification: provided_specification(&form.specification),
         project_id: form.project_id,
         technology: form.technology,
         output: form.output,

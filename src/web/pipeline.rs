@@ -285,7 +285,7 @@ async fn run(
         None => None,
     };
 
-    let targets_new_project = task.kind.creates_new_project() && task.project_id.is_none();
+    let targets_new_project = task.targets_new_project();
     let (profile, repository_context) = if retry {
         *workspace = Some(reopen_workspace(state, &task).await?);
         let profile = task
@@ -2707,6 +2707,169 @@ mod persistent_output_tests {
             !report.contains("The destination was left unchanged"),
             "the destination WAS published: {report}"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Direct specifications still use the normal existing-project preparation
+/// path. Keep this focused regression at the pipeline boundary so a future
+/// shortcut cannot accidentally skip inspection or lose the source baseline.
+#[cfg(test)]
+mod existing_specification_pipeline_tests {
+    use super::*;
+    use crate::agent::AgentSelection;
+    use crate::project::{Project, ProjectSource};
+    use crate::task::{TaskKind, TaskRequest};
+    use crate::workspace::{LocalWorkspaceProvider, WorkspaceProvider};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    const SPECIFICATION: &str = "# Specification\n\n## Goal\n\nUpdate the existing service.\n\n## Requirements\n\n- Keep the existing API.\n\n## Acceptance Criteria\n\n- Existing API remains available.\n\n## Steps\n\n1. Update the service\n\n## Verification\n\n- cargo test\n";
+
+    struct ExistingProjectWorkspace {
+        provider: LocalWorkspaceProvider,
+        prepared_source: Mutex<Option<(String, String)>>,
+    }
+
+    impl ExistingProjectWorkspace {
+        fn git(path: &Path, args: &[&str]) {
+            let output = crate::process_environment::command("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    impl WorkspaceProvider for ExistingProjectWorkspace {
+        fn prepare(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+            let source = request.source.expect("existing project source");
+            let revision = request.revision.expect("existing project revision");
+            *self.prepared_source.lock().unwrap() =
+                Some((source.repository_identity().to_owned(), revision.to_owned()));
+
+            // Build a local, committed fixture so inspection observes an
+            // existing Rust repository without making a network request.
+            let mut workspace = self.provider.prepare(WorkspaceRequest {
+                task_id: request.task_id,
+                source: None,
+                revision: None,
+            })?;
+            std::fs::write(
+                workspace.path.join("Cargo.toml"),
+                "[package]\nname = \"existing-service\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )?;
+            std::fs::create_dir(workspace.path.join("src"))?;
+            std::fs::write(workspace.path.join("src/lib.rs"), "pub fn existing() {}\n")?;
+            Self::git(
+                &workspace.path,
+                &["config", "user.email", "test@example.invalid"],
+            );
+            Self::git(&workspace.path, &["config", "user.name", "Test User"]);
+            Self::git(&workspace.path, &["add", "."]);
+            Self::git(&workspace.path, &["commit", "-m", "source baseline"]);
+            let output = crate::process_environment::command("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&workspace.path)
+                .output()?;
+            assert!(output.status.success());
+            workspace.revision = Some(String::from_utf8(output.stdout)?.trim().to_owned());
+            workspace.source_repository = Some(source.repository_identity().to_owned());
+
+            // Fail immediately after preparation and inspection, before any
+            // worker could run. A file where the artifact directory belongs
+            // makes `write_approved_spec` fail deterministically.
+            std::fs::remove_dir_all(workspace.artifacts())?;
+            std::fs::write(workspace.artifacts(), "block specification write")?;
+            Ok(workspace)
+        }
+
+        fn reopen(&self, request: WorkspaceRequest<'_>) -> Result<TaskWorkspace> {
+            self.provider.reopen(request)
+        }
+
+        fn cleanup(&self, workspace: &TaskWorkspace) -> Result<()> {
+            self.provider.cleanup(workspace)
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_specification_for_registered_project_prepares_and_inspects_without_debate() {
+        let (mut state, root) = crate::web::tests::test_state("direct-spec-existing-pipeline");
+        let fixture = std::sync::Arc::new(ExistingProjectWorkspace {
+            provider: LocalWorkspaceProvider::new(root.join("fixture-workspaces")).unwrap(),
+            prepared_source: Mutex::new(None),
+        });
+        state.workspaces = fixture.clone();
+        let project = state
+            .projects
+            .register(
+                Project::new(
+                    "Existing service",
+                    ProjectSource::github("example/existing-service").unwrap(),
+                    "main",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let task = state
+            .manager
+            .create_from_request(
+                TaskRequest {
+                    kind: TaskKind::ImplementExistingSpecification,
+                    title: "Update existing service".into(),
+                    description: String::new(),
+                    specification: Some(SPECIFICATION.into()),
+                    project_id: Some(project.id),
+                    technology: None,
+                    output: None,
+                    destination: None,
+                    agents: None,
+                    git_mode: None,
+                },
+                AgentSelection::compiled_defaults(),
+            )
+            .unwrap();
+        let emitter = state.manager.emitter(task.id);
+        let mut workspace = None;
+
+        let _error = run(&state, task.id, &emitter, &mut workspace, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            fixture.prepared_source.lock().unwrap().as_ref(),
+            Some(&(
+                String::from("example/existing-service"),
+                String::from("main")
+            )),
+            "the existing-project source and selected revision reach preparation"
+        );
+        let workspace = workspace.expect("existing workspace was prepared");
+        let source_revision = workspace.revision.clone().expect("fixture baseline commit");
+        let stored = state.manager.get(task.id).unwrap();
+        assert_eq!(
+            stored.profile.as_ref().map(|profile| &profile.stack),
+            Some(&crate::technology::TechStack::Rust)
+        );
+        assert!(stored.history.iter().any(|recorded| matches!(
+            &recorded.event,
+            TaskEvent::Inspection { source_revision: Some(revision), .. } if revision == &source_revision
+        )));
+        assert!(
+            !stored.history.iter().any(|recorded| matches!(
+                recorded.event,
+                TaskEvent::Proposal { .. } | TaskEvent::Critique { .. } | TaskEvent::SpecGenerated
+            )),
+            "direct specification must not invoke proposer/debate/spec generation"
+        );
+        fixture.cleanup(&workspace).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 }
