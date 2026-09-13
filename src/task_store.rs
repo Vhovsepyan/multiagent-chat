@@ -644,6 +644,63 @@ mod tests {
     }
 
     #[test]
+    fn frozen_repository_metadata_redacts_or_rejects_credentials_before_persistence() {
+        let root = root("frozen-project-source-secrets");
+        let manager = new_manager(&root);
+        let project = Project::new(
+            "Production durable-secret-token",
+            ProjectSource::github("owner/secure").unwrap(),
+            "main",
+        )
+        .unwrap();
+        let request = TaskRequest {
+            kind: TaskKind::Feature,
+            title: "Safe source".into(),
+            description: "Make a change".into(),
+            specification: None,
+            project_id: Some(project.id),
+            technology: None,
+            output: None,
+            destination: None,
+            agents: None,
+            git_mode: None,
+        };
+        let task = manager
+            .create_from_request_with_source(
+                request.clone(),
+                AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&project)),
+            )
+            .unwrap();
+        assert_eq!(
+            task.repository_source
+                .as_ref()
+                .map(|source| source.project_name.as_str()),
+            Some("Production [REDACTED]")
+        );
+        let persisted = fs::read_to_string(task_directory(&root, task.id).join(SNAPSHOT)).unwrap();
+        assert!(!persisted.contains("durable-secret-token"));
+
+        let unsafe_branch = Project::new(
+            "Unsafe branch",
+            ProjectSource::github("owner/secure-branch").unwrap(),
+            "release/durable-secret-token",
+        )
+        .unwrap();
+        let mut unsafe_request = request;
+        unsafe_request.project_id = Some(unsafe_branch.id);
+        let error = manager
+            .create_from_request_with_source(
+                unsafe_request,
+                AgentSelection::compiled_defaults(),
+                Some(TaskRepositorySource::from_project(&unsafe_branch)),
+            )
+            .unwrap_err();
+        assert!(error.contains("default branch contains credential-like content"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn preserves_waiting_gate_and_safely_fails_interrupted_execution() {
         let root = root("recovery");
         let manager = new_manager(&root);

@@ -75,6 +75,21 @@ impl TaskRepositorySource {
         }
         Ok(source)
     }
+
+    fn sanitized_for_storage(mut self, redactor: &AuditRedactor) -> Result<Self, String> {
+        self.source()?;
+        for (label, value) in [
+            ("repository identity", self.repository.as_str()),
+            ("repository clone URL", self.clone_url.as_str()),
+            ("default branch", self.default_branch.as_str()),
+        ] {
+            if redactor.redact(value) != value {
+                return Err(format!("{label} contains credential-like content"));
+            }
+        }
+        self.project_name = redactor.redact(&self.project_name);
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1963,6 +1978,9 @@ impl Task {
         if let Some(source_revision) = &mut self.source_revision {
             clean(source_revision);
         }
+        if let Some(repository_source) = &mut self.repository_source {
+            clean(&mut repository_source.project_name);
+        }
         if let Some(persistence) = &mut self.persistence {
             clean(&mut persistence.destination);
             if let Some(warning) = &mut persistence.git_warning {
@@ -2362,12 +2380,10 @@ impl TaskManager {
     ) -> Result<Task, String> {
         let mut task = Task::from_request(request, agents)?;
         if task.project_id.is_some() {
-            if let Some(source) = source.as_ref() {
-                source
-                    .source()
-                    .map_err(|error| format!("invalid task repository source: {error}"))?;
-            }
-            task.repository_source = source;
+            task.repository_source = source
+                .map(|source| source.sanitized_for_storage(&self.inner.redactor))
+                .transpose()
+                .map_err(|error| format!("invalid task repository source: {error}"))?;
         }
         Ok(self.insert(task))
     }
